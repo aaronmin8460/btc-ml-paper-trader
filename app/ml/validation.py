@@ -8,7 +8,14 @@ from app.data.feature_engineering import FEATURE_COLUMNS
 from app.ml.model import MLSignalModel
 
 
-def trading_metrics(df: pd.DataFrame, probabilities: np.ndarray, threshold: float = 0.58) -> dict:
+def trading_metrics(
+    df: pd.DataFrame,
+    probabilities: np.ndarray,
+    threshold: float = 0.58,
+    *,
+    take_profit_pct: float = 0.03,
+    stop_loss_pct: float = 0.015,
+) -> dict:
     trades = df.loc[probabilities >= threshold].copy()
     if trades.empty:
         return {
@@ -20,7 +27,7 @@ def trading_metrics(df: pd.DataFrame, probabilities: np.ndarray, threshold: floa
             "profit_factor": 0.0,
             "max_drawdown": 0.0,
         }
-    returns = np.where(trades["buy_quality_label"].to_numpy() == 1, 0.03, -0.015)
+    returns = np.where(trades["buy_quality_label"].to_numpy() == 1, take_profit_pct, -stop_loss_pct)
     wins = returns[returns > 0]
     losses = returns[returns < 0]
     equity = np.cumsum(returns)
@@ -45,13 +52,24 @@ def walk_forward_validate(
     min_train_rows: int,
     threshold: float = 0.58,
     folds: int = 3,
+    take_profit_pct: float = 0.03,
+    stop_loss_pct: float = 0.015,
 ) -> dict:
     if len(df) < min_train_rows:
         return {"valid": False, "reason": "not_enough_rows", "rows": len(df)}
+    class_counts = _class_counts(df["buy_quality_label"])
+    if len(class_counts) < 2:
+        return {
+            "valid": False,
+            "reason": "target_class_diversity_too_low",
+            "rows": len(df),
+            "class_counts": class_counts,
+        }
     fold_size = max(50, (len(df) - min_train_rows) // max(1, folds))
     all_y: list[int] = []
     all_p: list[float] = []
     validation_frames: list[pd.DataFrame] = []
+    skipped_folds = 0
     for fold in range(folds):
         train_end = min_train_rows + fold * fold_size
         valid_end = min(len(df), train_end + fold_size)
@@ -59,6 +77,9 @@ def walk_forward_validate(
             continue
         train = df.iloc[:train_end]
         valid = df.iloc[train_end:valid_end]
+        if len(_class_counts(train["buy_quality_label"])) < 2:
+            skipped_folds += 1
+            continue
         model = MLSignalModel(feature_columns=FEATURE_COLUMNS).train(train)
         probs = model.predict_proba(valid)
         all_y.extend(valid["buy_quality_label"].astype(int).tolist())
@@ -67,7 +88,13 @@ def walk_forward_validate(
         frame["_probability"] = probs
         validation_frames.append(frame)
     if not all_y:
-        return {"valid": False, "reason": "no_validation_folds", "rows": len(df)}
+        return {
+            "valid": False,
+            "reason": "no_trainable_validation_folds",
+            "rows": len(df),
+            "class_counts": class_counts,
+            "skipped_folds": skipped_folds,
+        }
     y = np.array(all_y)
     p = np.array(all_p)
     pred = (p >= threshold).astype(int)
@@ -78,9 +105,18 @@ def walk_forward_validate(
         "recall": float(recall_score(y, pred, zero_division=0)),
         "f1": float(f1_score(y, pred, zero_division=0)),
         "roc_auc": float(roc_auc_score(y, p)) if len(set(y.tolist())) > 1 else math.nan,
+        "skipped_folds": skipped_folds,
     }
     trade_df = pd.concat(validation_frames, ignore_index=True)
-    metrics.update(trading_metrics(trade_df, trade_df["_probability"].to_numpy(), threshold=threshold))
+    metrics.update(
+        trading_metrics(
+            trade_df,
+            trade_df["_probability"].to_numpy(),
+            threshold=threshold,
+            take_profit_pct=take_profit_pct,
+            stop_loss_pct=stop_loss_pct,
+        )
+    )
     return metrics
 
 
@@ -100,3 +136,8 @@ def promotion_decision(metrics: dict, *, min_rows: int, min_precision: float, ma
     if trades / rows > max_trade_fraction:
         return False, "too_many_trades"
     return True, "accepted"
+
+
+def _class_counts(values: pd.Series) -> dict[int, int]:
+    counts = values.astype(int).value_counts().sort_index()
+    return {int(label): int(count) for label, count in counts.items()}

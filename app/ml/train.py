@@ -16,15 +16,34 @@ def train_model_from_bars(bars: pd.DataFrame, settings: Settings | None = None) 
     settings = settings or get_settings()
     logger = get_logger()
     training_start = datetime.now(UTC).isoformat()
+    take_profit_pct = settings.scalping_take_profit_pct if settings.scalping_mode_enabled else settings.take_profit_pct
+    stop_loss_pct = settings.scalping_stop_loss_pct if settings.scalping_mode_enabled else settings.stop_loss_pct
+    threshold = settings.scalping_buy_probability_floor if settings.scalping_mode_enabled else settings.min_buy_probability
     dataset = build_training_dataset(
         bars,
-        take_profit_pct=settings.take_profit_pct,
-        stop_loss_pct=settings.stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        stop_loss_pct=stop_loss_pct,
     )
+    class_counts = {
+        int(label): int(count)
+        for label, count in dataset["buy_quality_label"].astype(int).value_counts().sort_index().items()
+    }
+    if len(class_counts) < 2:
+        metrics = {
+            "valid": False,
+            "reason": "target_class_diversity_too_low",
+            "rows": len(dataset),
+            "class_counts": class_counts,
+        }
+        logger.event("model_rejection", model_path=None, metrics=metrics, reason=metrics["reason"])
+        return {"model_path": None, "accepted": False, "reason": metrics["reason"], "metrics": metrics, "registry": None}
+
     metrics = walk_forward_validate(
         dataset,
         min_train_rows=settings.min_training_rows,
-        threshold=settings.min_buy_probability,
+        threshold=threshold,
+        take_profit_pct=take_profit_pct,
+        stop_loss_pct=stop_loss_pct,
     )
     accepted, reason = promotion_decision(
         metrics,
@@ -34,6 +53,13 @@ def train_model_from_bars(bars: pd.DataFrame, settings: Settings | None = None) 
         max_trade_fraction=settings.max_trade_fraction,
     )
     version = datetime.now(UTC).strftime("btc_model_%Y%m%dT%H%M%SZ")
+    if metrics.get("valid") is False and metrics.get("reason") in {
+        "target_class_diversity_too_low",
+        "no_trainable_validation_folds",
+    }:
+        logger.event("model_rejection", model_path=None, metrics=metrics, reason=metrics["reason"])
+        return {"model_path": None, "accepted": False, "reason": metrics["reason"], "metrics": metrics, "registry": None}
+
     tuned_params = tune_tree_params(dataset, FEATURE_COLUMNS) if settings.optuna_enabled else {}
     model = MLSignalModel(feature_columns=FEATURE_COLUMNS).train(dataset, tuned_params=tuned_params)
     model.metadata["validation_metrics"] = metrics
@@ -49,7 +75,7 @@ def train_model_from_bars(bars: pd.DataFrame, settings: Settings | None = None) 
             feature_columns=FEATURE_COLUMNS,
             metrics=metrics,
             thresholds={
-                "min_buy_probability": settings.min_buy_probability,
+                "min_buy_probability": threshold,
                 "min_sell_probability": settings.min_sell_probability,
                 "confidence_gap_required": settings.confidence_gap_required,
             },
