@@ -109,6 +109,65 @@ python scripts/run_api.py
 
 The in-process scheduler runs every `SCAN_INTERVAL_SECONDS`, catches exceptions, logs runtime errors, and calls `Trader.run_once()`.
 
+## Railway Deployment
+
+This FastAPI server can be deployed to Railway or a similar platform with the included `railway.toml`. Railway should use Nixpacks automatically and start the app with:
+
+```bash
+python scripts/run_api.py
+```
+
+The server binds to `0.0.0.0` and reads the platform-provided `PORT` environment variable. Local development still defaults to port `8000`.
+
+Local development can use the default SQLite database:
+
+```env
+DATABASE_URL=sqlite:///./data/trading.db
+```
+
+Recommended Railway steps:
+
+1. Create a new Railway project from this GitHub repository.
+2. Add the required environment variables in Railway.
+3. Deploy with one replica/instance only.
+4. Confirm the health check at `/health`.
+
+Required environment variables for deployment:
+
+```env
+APP_ENV=production
+PAPER_TRADING_ONLY=true
+TRADING_ENABLED=false
+AUTO_TRADE_ENABLED=false
+SYMBOL=BTC/USD
+API_ADMIN_TOKEN=change-me
+```
+
+Add Alpaca paper credentials only if you want the deployment to read real paper account data or submit paper orders:
+
+```env
+ALPACA_API_KEY=...
+ALPACA_SECRET_KEY=...
+ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+```
+
+For SQLite on Railway, attach a Railway Volume mounted at `/data` and use:
+
+```env
+DATABASE_URL=sqlite:////data/trading.db
+MODEL_DIR=/data/models
+LOG_DIR=/data/logs
+```
+
+Future production analytics can use PostgreSQL with SQLAlchemy's psycopg driver, for example:
+
+```env
+DATABASE_URL=postgresql+psycopg://user:password@host:5432/database
+```
+
+Keep `PAPER_TRADING_ONLY=true` and `SYMBOL=BTC/USD`. The app rejects live trading URLs, non-BTC/USD symbols, and configurations with more than one open position. Do not run more than one Railway replica/instance: automatic paper trading uses an in-process scheduler, so multiple instances could run duplicate scans.
+
 ## API
 
 - `GET /health`

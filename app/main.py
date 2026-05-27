@@ -5,8 +5,10 @@ from app.data.market_data import MarketDataClient
 from app.db.database import SessionLocal, init_db
 from app.db.repository import Repository
 from app.ml.train import train_model_from_bars
+from app.notifications.discord import DiscordNotifier
 from app.services.scheduler import TradingScheduler
 from app.services.trader import Trader
+from app.utils.time import iso_utc_now
 
 app = FastAPI(title="btc-ml-paper-trader", version="0.1.0")
 settings = get_settings()
@@ -76,6 +78,26 @@ async def auto_start() -> dict:
 async def auto_stop() -> dict:
     stopped = await scheduler.stop()
     return {"stopped": stopped, "running": scheduler.running}
+
+
+@app.post("/alerts/discord/test", dependencies=[Depends(require_admin)])
+async def test_discord_alert() -> dict:
+    notifier = DiscordNotifier(settings)
+    if not notifier.enabled:
+        return {"sent": False, "reason": "discord_disabled"}
+
+    message = "\n".join(
+        [
+            "Discord test alert",
+            "App: btc-ml-paper-trader",
+            f"Environment: {settings.app_env}",
+            f"Symbol: {settings.symbol}",
+            f"Paper trading only: {settings.paper_trading_only}",
+            f"Timestamp: {iso_utc_now()}",
+        ]
+    )
+    await notifier.send(message)
+    return {"sent": True}
 
 
 @app.post("/train", dependencies=[Depends(require_admin)])

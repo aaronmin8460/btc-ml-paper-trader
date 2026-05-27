@@ -18,6 +18,14 @@ class Settings(BaseSettings):
     auto_trade_enabled: bool = False
     api_admin_token: str = ""
 
+    discord_webhook_url: str = ""
+    discord_alerts_enabled: bool = False
+    discord_alert_on_hold: bool = False
+    discord_alert_on_signal: bool = True
+    discord_alert_on_order: bool = True
+    discord_alert_on_error: bool = True
+    discord_alert_on_model: bool = False
+
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
     alpaca_paper_base_url: str = "https://paper-api.alpaca.markets"
@@ -88,6 +96,7 @@ class Settings(BaseSettings):
         data["alpaca_api_key"] = "***" if self.alpaca_api_key else ""
         data["alpaca_secret_key"] = "***" if self.alpaca_secret_key else ""
         data["api_admin_token"] = "***" if self.api_admin_token else ""
+        data["discord_webhook_url"] = "***" if self.discord_webhook_url else ""
         return data
 
 
