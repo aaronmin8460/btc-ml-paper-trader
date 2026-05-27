@@ -6,6 +6,9 @@ from app.config import Settings
 
 
 class FakeResponse:
+    def __init__(self, status_code: int = 200) -> None:
+        self.status_code = status_code
+
     def raise_for_status(self) -> None:
         return None
 
@@ -15,6 +18,7 @@ class FakeResponse:
 
 class RecordingAsyncClient:
     requests = []
+    get_status_codes = []
 
     def __init__(self, *args, **kwargs) -> None:
         pass
@@ -29,10 +33,16 @@ class RecordingAsyncClient:
         self.requests.append({"url": url, "headers": headers, "json": json})
         return FakeResponse()
 
+    async def get(self, url, headers):
+        self.requests.append({"url": url, "headers": headers, "json": None})
+        status_code = self.get_status_codes.pop(0) if self.get_status_codes else 200
+        return FakeResponse(status_code=status_code)
+
 
 @pytest.fixture
 def recording_httpx(monkeypatch):
     RecordingAsyncClient.requests = []
+    RecordingAsyncClient.get_status_codes = []
     monkeypatch.setattr("app.broker.alpaca_client.httpx.AsyncClient", RecordingAsyncClient)
     return RecordingAsyncClient
 
@@ -170,3 +180,23 @@ async def test_missing_quote_blocks_limit_order_safely(recording_httpx):
         await client.submit_order(symbol="BTC/USD", side="buy", notional=25, quote={})
 
     assert recording_httpx.requests == []
+
+
+@pytest.mark.anyio
+async def test_get_position_url_encodes_crypto_symbol(recording_httpx):
+    client = AlpacaClient(_live_paper_settings())
+
+    await client.get_position("BTC/USD")
+
+    assert recording_httpx.requests[0]["url"].endswith("/v2/positions/BTC%2FUSD")
+
+
+@pytest.mark.anyio
+async def test_get_position_falls_back_to_legacy_crypto_symbol(recording_httpx):
+    recording_httpx.get_status_codes = [404, 200]
+    client = AlpacaClient(_live_paper_settings())
+
+    await client.get_position("BTC/USD")
+
+    assert recording_httpx.requests[0]["url"].endswith("/v2/positions/BTC%2FUSD")
+    assert recording_httpx.requests[1]["url"].endswith("/v2/positions/BTCUSD")

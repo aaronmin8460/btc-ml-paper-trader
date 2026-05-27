@@ -3,6 +3,7 @@ import math
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -45,11 +46,7 @@ class AlpacaClient:
         if not self.credentials_available():
             return None
         async with httpx.AsyncClient(timeout=15) as client:
-            await self._wait_for_alpaca(endpoint="position")
-            response = await client.get(
-                f"{self.settings.alpaca_paper_base_url}/v2/positions/{symbol}",
-                headers=self.headers,
-            )
+            response = await self._get_position_response(client, symbol)
             if response.status_code == 404:
                 self._set_position_cache(symbol, None)
                 return None
@@ -57,6 +54,25 @@ class AlpacaClient:
             position = response.json()
             self._set_position_cache(symbol, position)
             return position
+
+    async def _get_position_response(self, client: httpx.AsyncClient, symbol: str) -> httpx.Response:
+        candidates = [quote(symbol, safe="")]
+        legacy_crypto_symbol = symbol.replace("/", "")
+        if legacy_crypto_symbol != symbol:
+            candidates.append(legacy_crypto_symbol)
+
+        response: httpx.Response | None = None
+        for candidate in candidates:
+            await self._wait_for_alpaca(endpoint="position")
+            response = await client.get(
+                f"{self.settings.alpaca_paper_base_url}/v2/positions/{candidate}",
+                headers=self.headers,
+            )
+            if response.status_code != 404:
+                return response
+        if response is None:
+            raise RuntimeError("No Alpaca position lookup candidate was attempted.")
+        return response
 
     async def submit_market_order(
         self,
