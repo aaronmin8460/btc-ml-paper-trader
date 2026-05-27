@@ -1,0 +1,10 @@
+[project]
+name = "btc-ml-paper-trader"
+version = "0.1.0"
+description = "BTC/USD-only, long-only Alpaca paper trading bot with ML signals."
+requires-python = ">=3.12"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
