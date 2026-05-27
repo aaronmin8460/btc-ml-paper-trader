@@ -1,0 +1,13 @@
+services:
+  btc-bot:
+    build: .
+    container_name: btc-ml-paper-trader
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./runtime/data:/app/data
+      - ./runtime/logs:/app/logs
+      - ./runtime/models:/app/models

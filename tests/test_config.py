@@ -79,10 +79,14 @@ def test_safe_dict_masks_discord_webhook_url():
 def test_safe_config_endpoint_masks_discord_webhook_url(monkeypatch):
     from app import main
 
-    settings = Settings(_env_file=None, discord_webhook_url="https://discord.com/api/webhooks/example/secret")
+    settings = Settings(
+        _env_file=None,
+        api_admin_token="secret",
+        discord_webhook_url="https://discord.com/api/webhooks/example/secret",
+    )
     monkeypatch.setattr(main, "settings", settings)
 
-    response = TestClient(main.app).get("/config/safe")
+    response = TestClient(main.app).get("/config/safe", headers={"X-Admin-Token": "secret"})
 
     assert response.status_code == 200
     assert response.json()["discord_webhook_url"] == "***"

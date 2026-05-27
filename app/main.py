@@ -42,25 +42,25 @@ async def health() -> dict:
     return {"status": "ok", "paper_trading_only": settings.paper_trading_only, "symbol": settings.symbol}
 
 
-@app.get("/config/safe")
+@app.get("/config/safe", dependencies=[Depends(require_admin)])
 async def safe_config() -> dict:
     return settings.safe_dict()
 
 
-@app.get("/position")
+@app.get("/position", dependencies=[Depends(require_admin)])
 async def position() -> dict:
     state = await trader.get_position_state()
     return state.__dict__
 
 
-@app.get("/signals/latest")
+@app.get("/signals/latest", dependencies=[Depends(require_admin)])
 async def latest_signal() -> dict:
     with SessionLocal() as db:
         signal = Repository(db).latest_signal()
         return serialize_model(signal) if signal else {}
 
 
-@app.get("/orders")
+@app.get("/orders", dependencies=[Depends(require_admin)])
 async def orders() -> list[dict]:
     with SessionLocal() as db:
         rows = Repository(db).recent_orders()

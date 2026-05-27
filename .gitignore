@@ -10,3 +10,4 @@ models/*
 !models/registry.json
 logs/*
 !logs/.gitkeep
+runtime/

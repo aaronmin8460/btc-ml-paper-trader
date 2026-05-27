@@ -60,6 +60,23 @@ def test_stale_alpaca_bars_raise_clear_error():
     assert "bars_fetched=1" in message
 
 
+def test_stale_2022_market_data_is_rejected():
+    now = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
+    bars = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2022-12-25T16:32:00Z")],
+            "open": [16811.06],
+            "high": [16816.69],
+            "low": [16811.03],
+            "close": [16811.28],
+            "volume": [1.851083],
+        }
+    )
+
+    with pytest.raises(StaleMarketDataError):
+        validate_bars_are_fresh(bars, "1Min", now=now)
+
+
 @pytest.mark.anyio
 async def test_alpaca_fetch_uses_timeframe_window_and_returns_desired_tail(monkeypatch):
     from app.data import market_data
