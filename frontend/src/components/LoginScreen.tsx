@@ -52,7 +52,7 @@ export function LoginScreen({ onSaveToken }: LoginScreenProps) {
               value={token}
             />
           </label>
-          <Button className="w-full" disabled={!token.trim()} variant="primary">
+          <Button className="w-full" disabled={!token.trim()} type="submit" variant="primary">
             Open Dashboard
           </Button>
         </form>
