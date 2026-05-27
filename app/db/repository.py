@@ -6,7 +6,7 @@ from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
 from app.config import ALLOWED_SYMBOL
-from app.db.models import Order, Signal, Trade
+from app.db.models import ModelRun, Order, RiskEvent, Signal, Trade
 from app.risk.risk_manager import TradeFrequencyState
 from app.utils.time import utc_now
 
@@ -68,6 +68,9 @@ class Repository:
     def latest_signal(self) -> Signal | None:
         return self.db.query(Signal).order_by(desc(Signal.created_at)).first()
 
+    def recent_signals(self, limit: int = 100) -> list[Signal]:
+        return self.db.query(Signal).order_by(desc(Signal.created_at)).limit(limit).all()
+
     def recent_orders(self, limit: int = 50) -> list[Order]:
         return self.db.query(Order).order_by(desc(Order.created_at)).limit(limit).all()
 
@@ -76,6 +79,66 @@ class Repository:
         if side is not None:
             query = query.filter(Order.side == side)
         return query.order_by(desc(Order.created_at)).first()
+
+    def latest_trade(self) -> Trade | None:
+        return (
+            self.db.query(Trade)
+            .filter(Trade.symbol == ALLOWED_SYMBOL)
+            .order_by(desc(Trade.created_at))
+            .first()
+        )
+
+    def recent_trades(self, limit: int = 100) -> list[Trade]:
+        return (
+            self.db.query(Trade)
+            .filter(Trade.symbol == ALLOWED_SYMBOL)
+            .order_by(desc(Trade.created_at))
+            .limit(limit)
+            .all()
+        )
+
+    def all_trades_ordered(self) -> list[Trade]:
+        return (
+            self.db.query(Trade)
+            .filter(Trade.symbol == ALLOWED_SYMBOL)
+            .order_by(Trade.created_at, Trade.id)
+            .all()
+        )
+
+    def count_orders_by_side(self) -> dict[str, int]:
+        rows = (
+            self.db.query(Order.side, func.count(Order.id))
+            .filter(Order.symbol == ALLOWED_SYMBOL)
+            .group_by(Order.side)
+            .all()
+        )
+        return {str(side): int(count) for side, count in rows}
+
+    def order_summary(self) -> dict[str, int]:
+        side_counts = self.count_orders_by_side()
+        total_orders = int(
+            self.db.query(func.count(Order.id))
+            .filter(Order.symbol == ALLOWED_SYMBOL)
+            .scalar()
+            or 0
+        )
+        return {
+            "total_orders": total_orders,
+            "total_buy_orders": side_counts.get("buy", 0),
+            "total_sell_orders": side_counts.get("sell", 0),
+        }
+
+    def recent_risk_events(self, limit: int = 100) -> list[RiskEvent]:
+        return (
+            self.db.query(RiskEvent)
+            .filter(RiskEvent.symbol == ALLOWED_SYMBOL)
+            .order_by(desc(RiskEvent.created_at))
+            .limit(limit)
+            .all()
+        )
+
+    def recent_model_runs(self, limit: int = 100) -> list[ModelRun]:
+        return self.db.query(ModelRun).order_by(desc(ModelRun.created_at)).limit(limit).all()
 
     def trade_frequency_state(self, *, now: datetime | None = None) -> TradeFrequencyState:
         current_time = now or utc_now()

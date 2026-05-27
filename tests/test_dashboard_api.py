@@ -1,0 +1,312 @@
+from datetime import UTC, datetime, timedelta
+
+import pandas as pd
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.config import Settings
+from app.db.database import Base
+from app.db.models import Order, Signal, Trade
+from app.risk.risk_manager import PositionState
+
+
+class FakeMarketDataClient:
+    def __init__(self, settings) -> None:
+        self.settings = settings
+
+    async def fetch_bars(self, symbol):
+        assert symbol == "BTC/USD"
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-05-27T16:00:00Z", "2026-05-27T16:01:00Z"], utc=True),
+                "open": [100.0, 101.0],
+                "high": [101.0, 102.0],
+                "low": [99.0, 100.0],
+                "close": [100.5, 101.5],
+                "volume": [1.0, 2.0],
+            }
+        )
+
+    async def fetch_latest_quote(self, symbol):
+        assert symbol == "BTC/USD"
+        return {"bid_price": 101.0, "ask_price": 102.0, "bid_size": 3.0, "ask_size": 1.0}
+
+    def bars_cache_age_seconds(self, *, symbol):
+        assert symbol == "BTC/USD"
+        return 2.5
+
+
+class FakeBroker:
+    def credentials_available(self):
+        return True
+
+    async def get_account(self):
+        return {
+            "status": "ACTIVE",
+            "currency": "USD",
+            "buying_power": "1000",
+            "cash": "900",
+            "equity": "1000",
+            "portfolio_value": "1000",
+            "paper": True,
+            "secret_key": "must-not-leak",
+        }
+
+
+class NoCredentialsBroker:
+    def credentials_available(self):
+        return False
+
+    async def get_account(self):
+        raise AssertionError("get_account should not be called without credentials")
+
+
+class FakeTrader:
+    def __init__(self) -> None:
+        self.broker = FakeBroker()
+
+    async def get_position_state(self):
+        return PositionState()
+
+    async def run_once(self):
+        return {
+            "prediction": {
+                "buy_probability": 0.51,
+                "sell_probability": 0.49,
+                "features": {"close": 101.5},
+            },
+            "decision": {"action": "hold", "reason": "dashboard_test"},
+            "order": None,
+        }
+
+
+class NoCredentialsTrader(FakeTrader):
+    def __init__(self) -> None:
+        self.broker = NoCredentialsBroker()
+
+
+class FakeScheduler:
+    running = True
+
+
+class FailingMarketDataClient:
+    def __init__(self, settings) -> None:
+        self.settings = settings
+
+    async def fetch_bars(self, symbol):
+        raise RuntimeError("market data unavailable")
+
+    async def fetch_latest_quote(self, symbol):
+        raise RuntimeError("quote unavailable")
+
+
+@pytest.fixture
+def dashboard_client(monkeypatch):
+    from app import main
+    from app.api import dashboard
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+
+    settings = Settings(
+        _env_file=None,
+        api_admin_token="secret",
+        alpaca_api_key="paper-key",
+        alpaca_secret_key="paper-secret",
+        discord_webhook_url="https://discord.example/webhook",
+        trading_enabled=False,
+        auto_trade_enabled=False,
+        lookback_bars=2,
+        timeframe="1Min",
+    )
+    monkeypatch.setattr(main, "settings", settings)
+    monkeypatch.setattr(main.app.state, "settings", settings, raising=False)
+    monkeypatch.setattr(main.app.state, "trader", FakeTrader(), raising=False)
+    monkeypatch.setattr(main.app.state, "scheduler", FakeScheduler(), raising=False)
+    monkeypatch.setattr(dashboard, "SessionLocal", Session)
+    monkeypatch.setattr(dashboard, "MarketDataClient", FakeMarketDataClient)
+
+    try:
+        yield TestClient(main.app), Session
+    finally:
+        engine.dispose()
+
+
+def test_dashboard_endpoints_require_admin_token(dashboard_client):
+    client, _ = dashboard_client
+
+    for path in [
+        "/dashboard/summary",
+        "/dashboard/signals",
+        "/dashboard/orders",
+        "/dashboard/trades",
+        "/dashboard/equity-curve",
+        "/dashboard/market",
+    ]:
+        response = client.get(path)
+        assert response.status_code == 401, path
+
+    response = client.post("/dashboard/run-once")
+    assert response.status_code == 401
+
+
+def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client):
+    client, _ = dashboard_client
+
+    response = client.get("/dashboard/summary", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["app_status"] == "ok"
+    assert body["symbol"] == "BTC/USD"
+    assert body["paper_trading_only"] is True
+    assert body["scheduler_running"] is True
+    assert body["latest_btc_price"] == 101.5
+    assert body["total_orders"] == 0
+    assert body["total_trades"] == 0
+    assert body["total_return_pct"] is None
+    assert body["win_rate"] is None
+    assert body["average_trade_pnl"] is None
+    assert body["max_drawdown"] is None
+    assert body["latest_signal"] is None
+    assert body["last_order"] is None
+    assert body["last_trade"] is None
+    assert body["data_freshness"]["latest_timestamp"] == "2026-05-27T16:01:00+00:00"
+
+
+def test_dashboard_endpoints_do_not_expose_secrets(dashboard_client):
+    client, Session = dashboard_client
+    with Session() as db:
+        db.add(
+            Order(
+                symbol="BTC/USD",
+                side="buy",
+                status="filled",
+                notional=25,
+                raw_response='{"api_key":"raw-key","nested":{"discord_webhook_url":"raw-hook"}}',
+            )
+        )
+        db.commit()
+
+    response = client.get("/dashboard/orders", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body_text = response.text
+    assert "paper-key" not in body_text
+    assert "paper-secret" not in body_text
+    assert "https://discord.example/webhook" not in body_text
+    assert "raw-key" not in body_text
+    assert "raw-hook" not in body_text
+    raw_response = response.json()[0]["raw_response"]
+    assert raw_response["api_key"] == "***"
+    assert raw_response["nested"]["discord_webhook_url"] == "***"
+
+    summary = client.get("/dashboard/summary", headers={"X-Admin-Token": "secret"})
+    assert summary.status_code == 200
+    assert "paper-key" not in summary.text
+    assert "paper-secret" not in summary.text
+    assert "https://discord.example/webhook" not in summary.text
+    assert "raw-key" not in summary.text
+    assert "raw-hook" not in summary.text
+
+
+def test_dashboard_orders_invalid_raw_response_returns_null(dashboard_client):
+    client, Session = dashboard_client
+    with Session() as db:
+        db.add(Order(symbol="BTC/USD", side="buy", status="filled", raw_response="not valid json"))
+        db.commit()
+
+    response = client.get("/dashboard/orders", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    assert response.json()[0]["raw_response"] is None
+
+
+def test_dashboard_summary_works_without_alpaca_credentials(dashboard_client, monkeypatch):
+    from app import main
+
+    client, _ = dashboard_client
+    settings = Settings(_env_file=None, api_admin_token="secret", alpaca_api_key="", alpaca_secret_key="")
+    monkeypatch.setattr(main, "settings", settings)
+    monkeypatch.setattr(main.app.state, "settings", settings, raising=False)
+    monkeypatch.setattr(main.app.state, "trader", NoCredentialsTrader(), raising=False)
+
+    response = client.get("/dashboard/summary", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["alpaca_account"] is None
+    assert body["symbol"] == "BTC/USD"
+
+
+def test_dashboard_summary_returns_null_market_fields_when_market_fetch_fails(dashboard_client, monkeypatch):
+    from app.api import dashboard
+
+    client, _ = dashboard_client
+    monkeypatch.setattr(dashboard, "MarketDataClient", FailingMarketDataClient)
+
+    response = client.get("/dashboard/summary", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["latest_btc_price"] is None
+    assert body["data_freshness"]["latest_timestamp"] is None
+    assert body["data_freshness"]["latest_bar_age_seconds"] is None
+
+
+def test_dashboard_equity_curve_returns_empty_list_without_trades(dashboard_client):
+    client, _ = dashboard_client
+
+    response = client.get("/dashboard/equity-curve", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_dashboard_limit_query_params_are_capped_at_500(dashboard_client):
+    client, Session = dashboard_client
+    now = datetime(2026, 5, 27, 16, 0, tzinfo=UTC)
+    with Session() as db:
+        db.add_all(
+            [
+                Signal(
+                    symbol="BTC/USD",
+                    action="hold",
+                    buy_probability=0.5,
+                    sell_probability=0.5,
+                    reason="test",
+                    created_at=now + timedelta(seconds=index),
+                )
+                for index in range(550)
+            ]
+        )
+        db.commit()
+
+    response = client.get("/dashboard/signals?limit=999", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    assert len(response.json()) == 500
+
+
+def test_dashboard_run_once_includes_dashboard_summary(dashboard_client):
+    client, _ = dashboard_client
+
+    response = client.post("/dashboard/run-once", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    assert response.json()["summary"] == {
+        "action": "hold",
+        "reason": "dashboard_test",
+        "buy_probability": 0.51,
+        "sell_probability": 0.49,
+        "order_status": None,
+        "latest_price": 101.5,
+    }

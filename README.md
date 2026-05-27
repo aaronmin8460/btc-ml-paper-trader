@@ -380,7 +380,132 @@ MIN_SECONDS_BETWEEN_TRADES=30
 - `POST /train`
 - `POST /backtest`
 
-Write endpoints require `X-Admin-Token` matching `API_ADMIN_TOKEN`.
+Protected endpoints require `X-Admin-Token` matching `API_ADMIN_TOKEN`.
+
+## Dashboard API
+
+The dashboard API provides read-focused backend data for an operator dashboard: bot status, recent signals, recent paper orders, realized trade PnL from stored `Trade.pnl` rows, market freshness, and a dashboard-friendly `/run-once` wrapper. It is for BTC/USD paper-trading analytics only. It does not enable live trading, short selling, margin, or multi-symbol trading.
+
+All dashboard endpoints require the admin token. Do not expose `API_ADMIN_TOKEN` in a public frontend, browser bundle, logs, screenshots, or shared command history.
+
+Endpoints:
+
+- `GET /dashboard/summary`
+- `GET /dashboard/signals?limit=100`
+- `GET /dashboard/orders?limit=100`
+- `GET /dashboard/trades?limit=100`
+- `GET /dashboard/equity-curve`
+- `GET /dashboard/market`
+- `POST /dashboard/run-once`
+
+Example setup:
+
+```bash
+export API_URL="http://localhost:8000"
+export ADMIN_TOKEN="replace-with-your-admin-token"
+```
+
+Summary:
+
+```bash
+curl -sS "$API_URL/dashboard/summary" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Recent signals:
+
+```bash
+curl -sS "$API_URL/dashboard/signals?limit=100" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Recent paper orders:
+
+```bash
+curl -sS "$API_URL/dashboard/orders?limit=100" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Recent trades:
+
+```bash
+curl -sS "$API_URL/dashboard/trades?limit=100" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Equity curve from realized trade PnL:
+
+```bash
+curl -sS "$API_URL/dashboard/equity-curve" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Latest market snapshot:
+
+```bash
+curl -sS "$API_URL/dashboard/market" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Run one paper-trading decision with dashboard summary:
+
+```bash
+curl -sS -X POST "$API_URL/dashboard/run-once" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Unavailable metrics return `null` or an empty list instead of fabricated values. For example, total return percentage is `null` unless it can be computed safely from real data, and the equity curve is empty when there are no recorded trades. Secret-like fields in stored order responses are redacted.
+
+## Web Dashboard
+
+The React web dashboard lives in `frontend/`. It is a private operator UI for BTC/USD paper-trading analytics and controls. It consumes the protected Dashboard API and never hardcodes or commits the admin token.
+
+Install frontend dependencies:
+
+```bash
+cd frontend
+npm install
+```
+
+Run the backend API locally in another terminal:
+
+```bash
+cd ..
+APP_ENV=development PORT=8000 API_ADMIN_TOKEN=replace-with-a-local-token python scripts/run_api.py
+```
+
+Run the frontend locally:
+
+```bash
+cd frontend
+npm run dev
+```
+
+By default, the frontend calls the same origin. During local Vite development, `vite.config.ts` proxies API paths to `http://localhost:8000`, so `VITE_API_BASE_URL` can be left unset.
+
+To point the dashboard at a deployed API, set `VITE_API_BASE_URL`:
+
+```bash
+cd frontend
+VITE_API_BASE_URL="http://YOUR_SERVER_IP:8000" npm run dev
+```
+
+Build the frontend:
+
+```bash
+cd frontend
+npm run build
+```
+
+Admin token login:
+
+- The dashboard first shows a private access screen.
+- Enter the same value used by backend `API_ADMIN_TOKEN`.
+- The token is stored only in `sessionStorage`, not `localStorage`.
+- The token is cleared when you click logout or close the browser tab/session.
+- Do not expose the admin token in public frontend config, screenshots, logs, or browser bundles.
+
+If dashboard API data is missing, charts and tables show empty states instead of fake performance data.
 
 ## Risk Design
 

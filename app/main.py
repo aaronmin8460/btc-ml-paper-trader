@@ -1,19 +1,30 @@
-from fastapi import Depends, FastAPI, Header, HTTPException
+from pathlib import Path
 
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
+
+from app.api.dashboard import router as dashboard_router
 from app.config import Settings, get_settings
 from app.data.market_data import MarketDataClient
 from app.db.database import SessionLocal, init_db
 from app.db.repository import Repository
 from app.ml.train import train_model_from_bars
+from app.monitoring.logger import get_logger
 from app.notifications.discord import DiscordNotifier
 from app.services.scheduler import TradingScheduler
 from app.services.trader import Trader
 from app.utils.time import iso_utc_now
 
+FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+DASHBOARD_UI_PREFIX = "/dashboard-ui"
+
 app = FastAPI(title="btc-ml-paper-trader", version="0.1.0")
 settings = get_settings()
 trader = Trader(settings)
 scheduler = TradingScheduler(trader, settings)
+app.state.settings = settings
+app.state.trader = trader
+app.state.scheduler = scheduler
 
 
 def serialize_model(row) -> dict:
@@ -28,6 +39,46 @@ def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
     token = settings.api_admin_token
     if not token or x_admin_token != token:
         raise HTTPException(status_code=401, detail="Admin token required")
+
+
+app.include_router(dashboard_router, dependencies=[Depends(require_admin)])
+
+
+def configure_frontend_static(fastapi_app: FastAPI, static_dir: Path | str = FRONTEND_DIST) -> bool:
+    dist = Path(static_dir)
+    index_path = dist / "index.html"
+    if not dist.is_dir() or not index_path.is_file():
+        _log_frontend_static_event("frontend_static_unavailable", static_dir=str(dist))
+        return False
+
+    root = dist.resolve()
+    index = index_path.resolve()
+
+    @fastapi_app.get(DASHBOARD_UI_PREFIX, include_in_schema=False)
+    @fastapi_app.get(f"{DASHBOARD_UI_PREFIX}/{{asset_path:path}}", include_in_schema=False)
+    async def dashboard_ui(asset_path: str = "") -> FileResponse:
+        if not asset_path:
+            return FileResponse(index)
+
+        candidate = (root / asset_path).resolve()
+        if not candidate.is_relative_to(root):
+            raise HTTPException(status_code=404, detail="Not found")
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(index)
+
+    _log_frontend_static_event("frontend_static_enabled", static_dir=str(root), mount_path=DASHBOARD_UI_PREFIX)
+    return True
+
+
+def _log_frontend_static_event(event_type: str, **payload: str) -> None:
+    try:
+        get_logger().event(event_type, **payload)
+    except Exception:
+        pass
+
+
+configure_frontend_static(app)
 
 
 @app.on_event("startup")

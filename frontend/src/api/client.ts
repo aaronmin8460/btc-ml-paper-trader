@@ -1,0 +1,224 @@
+export type BotHealth = {
+  status: string;
+  paper_trading_only: boolean;
+  symbol: string;
+};
+
+export type SignalAction = 'buy' | 'sell' | 'hold' | string;
+
+export type DashboardSignal = {
+  created_at: string | null;
+  symbol: string;
+  action: SignalAction;
+  buy_probability: number | null;
+  sell_probability: number | null;
+  reason: string | null;
+};
+
+export type DashboardOrder = {
+  created_at: string | null;
+  symbol: string;
+  side: 'buy' | 'sell' | string;
+  status: string | null;
+  notional: number | null;
+  qty: number | null;
+  broker_order_id: string | null;
+  raw_response?: unknown;
+};
+
+export type DashboardTrade = {
+  created_at: string | null;
+  symbol: string;
+  side: 'buy' | 'sell' | string;
+  qty: number | null;
+  price: number | null;
+  pnl: number | null;
+};
+
+export type EquityPoint = {
+  timestamp: string | null;
+  trade_pnl: number | null;
+  cumulative_realized_pnl: number | null;
+  drawdown: number | null;
+};
+
+export type PositionSummary = {
+  symbol: string;
+  qty: number | null;
+  avg_entry_price: number | null;
+  market_value: number | null;
+  opened_at: string | null;
+  highest_price: number | null;
+  realized_pnl_today: number | null;
+  drawdown_pct: number | null;
+  last_loss_at: string | null;
+};
+
+export type AccountSummary = {
+  status: string | null;
+  currency: string | null;
+  buying_power: number | null;
+  cash: number | null;
+  equity: number | null;
+  portfolio_value: number | null;
+  paper: boolean | null;
+} | null;
+
+export type DataFreshness = {
+  latest_timestamp: string | null;
+  current_utc_time: string | null;
+  latest_bar_age_seconds: number | null;
+  cache_age_seconds: number | null;
+};
+
+export type DashboardSummary = {
+  app_status: string;
+  symbol: string;
+  paper_trading_only: boolean;
+  trading_enabled: boolean;
+  auto_trade_enabled: boolean;
+  scheduler_running: boolean | null;
+  latest_btc_price: number | null;
+  latest_signal: DashboardSignal | null;
+  current_position: PositionSummary;
+  alpaca_account: AccountSummary;
+  total_orders: number;
+  total_buy_orders: number;
+  total_sell_orders: number;
+  total_trades: number;
+  total_realized_pnl: number | null;
+  total_return_pct: number | null;
+  unrealized_pnl: number | null;
+  win_rate: number | null;
+  average_trade_pnl: number | null;
+  best_trade_pnl: number | null;
+  worst_trade_pnl: number | null;
+  max_drawdown: number | null;
+  last_order: DashboardOrder | null;
+  last_trade: DashboardTrade | null;
+  data_freshness: DataFreshness;
+};
+
+export type DashboardMarket = {
+  symbol: string;
+  timeframe: string;
+  latest_close: number | null;
+  latest_timestamp: string | null;
+  current_utc_time: string | null;
+  latest_quote: Record<string, unknown>;
+  bid_price: number | null;
+  ask_price: number | null;
+  mid_price: number | null;
+  spread_bps: number | null;
+  quote_imbalance: number | null;
+  cache_age_seconds: number | null;
+  latest_bar_age_seconds: number | null;
+  bars_count: number;
+};
+
+export type DashboardRunOnceResult = {
+  prediction?: {
+    buy_probability?: number | null;
+    sell_probability?: number | null;
+    features?: Record<string, unknown>;
+  };
+  decision?: {
+    action?: string | null;
+    reason?: string | null;
+  };
+  order?: {
+    status?: string | null;
+  } | null;
+  summary: {
+    action: string | null;
+    reason: string | null;
+    buy_probability: number | null;
+    sell_probability: number | null;
+    order_status: string | null;
+    latest_price: number | null;
+  };
+};
+
+export type DashboardData = {
+  health: BotHealth | null;
+  summary: DashboardSummary;
+  market: DashboardMarket;
+  signals: DashboardSignal[];
+  orders: DashboardOrder[];
+  trades: DashboardTrade[];
+  equityCurve: EquityPoint[];
+};
+
+export type ActionResult = {
+  ok?: boolean;
+  [key: string]: unknown;
+};
+
+const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL?.replace(/\/+$/, '') ?? '';
+
+function apiUrl(path: string): string {
+  return `${configuredBaseUrl}${path}`;
+}
+
+async function fetchJson<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(apiUrl(path), {
+    ...options,
+    headers: {
+      Accept: 'application/json',
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(options.headers ?? {}),
+    },
+  });
+
+  if (!response.ok) {
+    const detail = await safeErrorText(response);
+    throw new Error(detail || `${response.status} ${response.statusText}`);
+  }
+
+  return (await response.json()) as T;
+}
+
+function authHeaders(adminToken: string): HeadersInit {
+  if (!adminToken.trim()) {
+    throw new Error('Admin token is required.');
+  }
+  return { 'X-Admin-Token': adminToken };
+}
+
+async function protectedJson<T>(path: string, adminToken: string, options: RequestInit = {}): Promise<T> {
+  return fetchJson<T>(path, {
+    ...options,
+    headers: {
+      ...authHeaders(adminToken),
+      ...(options.headers ?? {}),
+    },
+  });
+}
+
+async function safeErrorText(response: Response): Promise<string> {
+  try {
+    const contentType = response.headers.get('content-type') ?? '';
+    if (contentType.includes('application/json')) {
+      const body = (await response.json()) as { detail?: unknown };
+      return typeof body.detail === 'string' ? body.detail : JSON.stringify(body);
+    }
+    return await response.text();
+  } catch {
+    return '';
+  }
+}
+
+export const apiClient = {
+  health: () => fetchJson<BotHealth>('/health'),
+  summary: (token: string) => protectedJson<DashboardSummary>('/dashboard/summary', token),
+  market: (token: string) => protectedJson<DashboardMarket>('/dashboard/market', token),
+  signals: (token: string, limit = 200) => protectedJson<DashboardSignal[]>(`/dashboard/signals?limit=${limit}`, token),
+  orders: (token: string, limit = 200) => protectedJson<DashboardOrder[]>(`/dashboard/orders?limit=${limit}`, token),
+  trades: (token: string, limit = 200) => protectedJson<DashboardTrade[]>(`/dashboard/trades?limit=${limit}`, token),
+  equityCurve: (token: string) => protectedJson<EquityPoint[]>('/dashboard/equity-curve', token),
+  runOnce: (token: string) => protectedJson<DashboardRunOnceResult>('/dashboard/run-once', token, { method: 'POST' }),
+  startAuto: (token: string) => protectedJson<ActionResult>('/auto/start', token, { method: 'POST' }),
+  stopAuto: (token: string) => protectedJson<ActionResult>('/auto/stop', token, { method: 'POST' }),
+  testDiscord: (token: string) => protectedJson<ActionResult>('/alerts/discord/test', token, { method: 'POST' }),
+  backtest: (token: string) => protectedJson<ActionResult>('/backtest', token, { method: 'POST' }),
+};
