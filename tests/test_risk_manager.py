@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.config import Settings
 from app.risk import risk_manager
-from app.risk.risk_manager import PositionState, RiskManager, TradeFrequencyState
+from app.risk.risk_manager import AccountState, PositionState, RiskManager, TradeFrequencyState
 
 
 class FakeLogger:
@@ -118,7 +118,7 @@ def test_trade_frequency_limits_do_not_block_position_closing_sell():
 
 
 def test_stop_loss_and_take_profit_force_sell_behavior_remains_intact():
-    risk = RiskManager(Settings(_env_file=None, stop_loss_pct=0.01, take_profit_pct=0.02))
+    risk = RiskManager(Settings(_env_file=None, scalping_mode_enabled=False, stop_loss_pct=0.01, take_profit_pct=0.02))
     position = PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000)
     now = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
 
@@ -146,3 +146,26 @@ def test_scalping_force_sell_uses_scalping_thresholds():
     should_sell, reason = risk.should_force_sell(position=position, latest_price=65196, now=now)
     assert should_sell is True
     assert reason == "scalping_take_profit"
+
+
+def test_account_drawdown_blocks_buy():
+    risk = RiskManager(Settings(_env_file=None, max_account_drawdown_pct=0.03))
+
+    approved, reason = risk.approve_buy(
+        notional=25,
+        position=PositionState(),
+        latest_price=65000,
+        account_state=AccountState(available=True, buying_power=1000, drawdown_pct=0.04),
+    )
+
+    assert approved is False
+    assert reason == "account_drawdown_reached"
+
+
+def test_account_risk_does_not_block_position_closing_sell():
+    risk = RiskManager(Settings(_env_file=None, max_account_drawdown_pct=0.03))
+
+    approved, reason = risk.approve_sell(PositionState(qty=0.01))
+
+    assert approved is True
+    assert reason == "approved"

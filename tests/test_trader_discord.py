@@ -240,12 +240,12 @@ async def test_order_alert_called_after_order_submission(trader_factory):
     assert result["order"] == {"id": "paper-order-1", "status": "submitted"}
     assert events == ["submit_order", "invalidate_position_cache", "order_alert"]
     assert notifier.calls == [
-        (
-            "order",
-            ("buy", "submitted", 25, None),
-            {"broker_order_id": "paper-order-1", "order_type": "market", "time_in_force": "gtc"},
-        )
-    ]
+            (
+                "order",
+                ("buy", "submitted", 25, None),
+                {"broker_order_id": "paper-order-1", "order_type": "limit", "time_in_force": "ioc"},
+            )
+        ]
 
 
 @pytest.mark.anyio

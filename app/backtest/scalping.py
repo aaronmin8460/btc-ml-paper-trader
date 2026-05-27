@@ -16,16 +16,24 @@ ZERO_BACKTEST_METRICS = {
     "win_rate": 0.0,
     "gross_return": 0.0,
     "net_return": 0.0,
+    "gross_return_pct": 0.0,
+    "net_return_pct": 0.0,
     "average_gross_win": 0.0,
     "average_gross_loss": 0.0,
     "average_net_win": 0.0,
     "average_net_loss": 0.0,
+    "average_trade_pnl": 0.0,
+    "best_trade_pnl": 0.0,
+    "worst_trade_pnl": 0.0,
     "profit_factor_gross": 0.0,
     "profit_factor_net": 0.0,
     "max_drawdown": 0.0,
+    "max_drawdown_pct": 0.0,
     "fees_paid_estimate": 0.0,
     "slippage_paid_estimate": 0.0,
     "spread_paid_estimate": 0.0,
+    "starting_equity": None,
+    "ending_equity": None,
 }
 
 
@@ -57,7 +65,9 @@ def calculate_fee_aware_metrics(trades: pd.DataFrame, settings: Settings) -> dic
         return {"valid": False, "reason": "missing_buy_quality_label", **ZERO_BACKTEST_METRICS}
 
     labels = trades["buy_quality_label"].astype(int).to_numpy()
-    gross_returns = np.where(labels == 1, settings.take_profit_pct, -settings.stop_loss_pct).astype(float)
+    take_profit_pct = _take_profit_pct(settings)
+    stop_loss_pct = _stop_loss_pct(settings)
+    gross_returns = np.where(labels == 1, take_profit_pct, -stop_loss_pct).astype(float)
 
     fee_bps = settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps
     fee_costs = np.full(len(trades), 2 * (fee_bps / 10_000), dtype=float)
@@ -66,23 +76,35 @@ def calculate_fee_aware_metrics(trades: pd.DataFrame, settings: Settings) -> dic
 
     net_returns = gross_returns - fee_costs - slippage_costs - spread_costs
     notional = float(settings.order_notional_usd)
+    trade_pnls = net_returns * notional
+    gross_return = float(gross_returns.sum())
+    net_return = float(net_returns.sum())
+    max_drawdown = _max_drawdown(net_returns)
 
     return {
         "valid": True,
         "number_of_trades": int(len(trades)),
         "win_rate": float((gross_returns > 0).mean()),
-        "gross_return": float(gross_returns.sum()),
-        "net_return": float(net_returns.sum()),
+        "gross_return": gross_return,
+        "net_return": net_return,
+        "gross_return_pct": gross_return,
+        "net_return_pct": net_return,
         "average_gross_win": _mean_or_zero(gross_returns[gross_returns > 0]),
         "average_gross_loss": _mean_or_zero(gross_returns[gross_returns < 0]),
         "average_net_win": _mean_or_zero(net_returns[net_returns > 0]),
         "average_net_loss": _mean_or_zero(net_returns[net_returns < 0]),
+        "average_trade_pnl": _mean_or_zero(trade_pnls),
+        "best_trade_pnl": float(trade_pnls.max()) if len(trade_pnls) else 0.0,
+        "worst_trade_pnl": float(trade_pnls.min()) if len(trade_pnls) else 0.0,
         "profit_factor_gross": _profit_factor(gross_returns),
         "profit_factor_net": _profit_factor(net_returns),
-        "max_drawdown": _max_drawdown(net_returns),
+        "max_drawdown": max_drawdown,
+        "max_drawdown_pct": max_drawdown,
         "fees_paid_estimate": float((fee_costs * notional).sum()),
         "slippage_paid_estimate": float((slippage_costs * notional).sum()),
         "spread_paid_estimate": float((spread_costs * notional).sum()),
+        "starting_equity": notional,
+        "ending_equity": notional * (1 + net_return),
     }
 
 
@@ -133,6 +155,8 @@ def _walk_forward_prediction_frame(df: pd.DataFrame, *, min_train_rows: int, fol
             continue
         train = df.iloc[:train_end]
         valid = df.iloc[train_end:valid_end]
+        if "buy_quality_label" in train.columns and train["buy_quality_label"].astype(int).nunique() < 2:
+            continue
         model = MLSignalModel(feature_columns=FEATURE_COLUMNS).train(train)
         frame = valid.copy()
         frame["_probability"] = model.predict_proba(valid)
@@ -171,3 +195,11 @@ def _max_drawdown(returns: np.ndarray) -> float:
     drawdown = equity - peak
     value = abs(float(drawdown.min()))
     return value if math.isfinite(value) else 0.0
+
+
+def _take_profit_pct(settings: Settings) -> float:
+    return settings.scalping_take_profit_pct if settings.scalping_mode_enabled else settings.take_profit_pct
+
+
+def _stop_loss_pct(settings: Settings) -> float:
+    return settings.scalping_stop_loss_pct if settings.scalping_mode_enabled else settings.stop_loss_pct

@@ -26,3 +26,29 @@ async def test_rate_limiter_can_be_disabled():
     waited = await limiter.acquire(endpoint="test")
 
     assert waited == 0
+
+
+@pytest.mark.anyio
+async def test_rate_limiter_tracks_endpoint_usage_and_budget():
+    limiter = AsyncRateLimiter(max_calls=3, target_calls=2, window_seconds=10)
+
+    await limiter.acquire(endpoint="latest_quote")
+    await limiter.acquire(endpoint="position")
+
+    snapshot = limiter.snapshot()
+
+    assert snapshot["calls_last_minute"] == 2
+    assert snapshot["budget_remaining"] == 1
+    assert snapshot["endpoint_counts"] == {"latest_quote": 1, "position": 1}
+    assert snapshot["api_budget_status"] == "soft_limit"
+
+
+@pytest.mark.anyio
+async def test_rate_limiter_hard_budget_check_stays_under_stop():
+    limiter = AsyncRateLimiter(max_calls=2, target_calls=1, window_seconds=10)
+
+    await limiter.acquire(endpoint="latest_quote")
+    await limiter.acquire(endpoint="position")
+
+    assert limiter.hard_budget_reached() is True
+    assert limiter.snapshot()["calls_last_minute"] == 2

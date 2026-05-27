@@ -61,6 +61,10 @@ export type AccountSummary = {
   cash: number | null;
   equity: number | null;
   portfolio_value: number | null;
+  last_equity?: number | null;
+  daily_change_usd?: number | null;
+  daily_change_pct?: number | null;
+  drawdown_pct?: number | null;
   paper: boolean | null;
 } | null;
 
@@ -82,6 +86,22 @@ export type DashboardSummary = {
   latest_signal: DashboardSignal | null;
   current_position: PositionSummary;
   alpaca_account: AccountSummary;
+  alpaca_calls_last_minute: number | null;
+  alpaca_budget_remaining: number | null;
+  alpaca_endpoint_counts: Record<string, number> | null;
+  api_budget_status: string | null;
+  account_equity: number | null;
+  cash: number | null;
+  buying_power: number | null;
+  portfolio_value: number | null;
+  account_daily_change_usd: number | null;
+  account_daily_change_pct: number | null;
+  account_drawdown_pct: number | null;
+  latest_model_net_return_pct: number | null;
+  latest_model_max_drawdown_pct: number | null;
+  latest_model_profit_factor: number | null;
+  latest_model_accepted: boolean | null;
+  latest_model_rejected_reason: string | null;
   total_orders: number;
   total_buy_orders: number;
   total_sell_orders: number;

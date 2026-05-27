@@ -31,14 +31,17 @@ class Settings(BaseSettings):
     alpaca_paper_base_url: str = "https://paper-api.alpaca.markets"
     alpaca_data_base_url: str = "https://data.alpaca.markets"
     alpaca_rate_limit_enabled: bool = True
-    alpaca_max_calls_per_minute: int = 160
+    alpaca_max_calls_per_minute: int = 180
+    alpaca_api_budget_target_per_minute: int = 170
+    alpaca_api_budget_hard_stop_per_minute: int = 195
 
     symbol: str = ALLOWED_SYMBOL
-    timeframe: str = "15Min"
-    lookback_bars: int = 500
-    scan_interval_seconds: int = 60
-    market_bars_cache_seconds: int = 20
-    position_cache_seconds: int = 5
+    timeframe: str = "1Min"
+    lookback_bars: int = 1500
+    scan_interval_seconds: int = 1
+    market_bars_cache_seconds: int = 30
+    position_cache_seconds: int = 2
+    account_equity_cache_seconds: int = 5
     quote_cache_seconds: int = 0
 
     database_url: str = "sqlite:///./data/trading.db"
@@ -46,8 +49,8 @@ class Settings(BaseSettings):
     log_dir: str = "logs"
 
     order_notional_usd: float = 25
-    order_type: str = "market"
-    time_in_force: str = "gtc"
+    order_type: str = "limit"
+    time_in_force: str = "ioc"
     limit_price_offset_bps: float = 2
     max_position_notional_usd: float = 100
     max_total_exposure_usd: float = 100
@@ -55,28 +58,34 @@ class Settings(BaseSettings):
     max_drawdown_pct: float = 0.05
     max_open_positions: int = 1
 
-    scalping_mode_enabled: bool = False
-    max_spread_bps: float = 8
-    max_slippage_bps: float = 10
-    min_quote_imbalance: float = -0.25
-    max_trades_per_hour: int = 10
-    max_daily_trades: int = 30
+    scalping_mode_enabled: bool = True
+    max_spread_bps: float = 10
+    max_slippage_bps: float = 8
+    min_quote_imbalance: float = -0.05
+    max_trades_per_hour: int = 1000
+    max_daily_trades: int = 10000
     max_consecutive_losses: int = 3
-    min_seconds_between_trades: int = 30
+    min_seconds_between_trades: int = 0
 
-    scalping_entry_dip_pct: float = 0.001
-    scalping_take_profit_pct: float = 0.003
-    scalping_stop_loss_pct: float = 0.002
-    scalping_trailing_stop_pct: float = 0.0015
+    scalping_entry_dip_pct: float = 0.0005
+    scalping_take_profit_pct: float = 0.0015
+    scalping_stop_loss_pct: float = 0.001
+    scalping_trailing_stop_pct: float = 0.0008
     scalping_min_momentum_pct: float = -0.0005
-    scalping_max_position_seconds: int = 180
+    scalping_max_position_seconds: int = 90
     scalping_buy_probability_floor: float = 0.50
     scalping_sell_on_weak_quote: bool = True
-    scalping_quote_imbalance_exit: float = -0.20
+    scalping_quote_imbalance_exit: float = -0.10
 
     order_in_flight_timeout_seconds: int = 15
     order_status_check_enabled: bool = True
-    order_status_check_delay_seconds: float = 1
+    order_status_check_delay_seconds: float = 0.5
+
+    pause_trading_on_account_drawdown: bool = True
+    max_account_daily_loss_usd: float = 25
+    max_account_daily_loss_pct: float = 0.01
+    max_account_drawdown_pct: float = 0.03
+    require_account_data_for_trading: bool = False
 
     taker_fee_bps: float = 25
     maker_fee_bps: float = 15
@@ -101,6 +110,11 @@ class Settings(BaseSettings):
     min_precision_for_promotion: float = 0.52
     max_validation_drawdown_pct: float = 0.20
     max_trade_fraction: float = 0.40
+    min_backtest_net_return_pct: float = 0.001
+    max_backtest_drawdown_pct: float = 0.01
+    min_backtest_profit_factor: float = 1.05
+    min_backtest_trades: int = 20
+    model_promotion_require_positive_net_return: bool = True
 
     @field_validator("symbol")
     @classmethod
@@ -134,12 +148,22 @@ class Settings(BaseSettings):
 
     @field_validator(
         "alpaca_max_calls_per_minute",
+        "alpaca_api_budget_target_per_minute",
+        "alpaca_api_budget_hard_stop_per_minute",
         "market_bars_cache_seconds",
         "position_cache_seconds",
+        "account_equity_cache_seconds",
         "quote_cache_seconds",
         "order_in_flight_timeout_seconds",
         "order_status_check_delay_seconds",
         "scalping_max_position_seconds",
+        "max_account_daily_loss_usd",
+        "max_account_daily_loss_pct",
+        "max_account_drawdown_pct",
+        "min_backtest_net_return_pct",
+        "max_backtest_drawdown_pct",
+        "min_backtest_profit_factor",
+        "min_backtest_trades",
     )
     @classmethod
     def runtime_timing_values_must_be_non_negative(cls, value: float) -> float:
@@ -153,6 +177,14 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("ALPACA_MAX_CALLS_PER_MINUTE must be positive.")
         return value
+
+    @model_validator(mode="after")
+    def enforce_api_budget_sanity(self) -> "Settings":
+        if self.alpaca_api_budget_hard_stop_per_minute >= 200:
+            raise ValueError("ALPACA_API_BUDGET_HARD_STOP_PER_MINUTE must stay below 200.")
+        if self.alpaca_api_budget_target_per_minute >= self.alpaca_api_budget_hard_stop_per_minute:
+            raise ValueError("ALPACA_API_BUDGET_TARGET_PER_MINUTE must be below hard stop.")
+        return self
 
     @model_validator(mode="after")
     def enforce_paper_only(self) -> "Settings":

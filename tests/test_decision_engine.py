@@ -4,7 +4,7 @@ from app.broker.execution_guard import BTCOnlyViolation
 from app.config import Settings
 from app.data.feature_engineering import latest_feature_row
 from app.data.market_data import MarketDataClient
-from app.risk.risk_manager import PositionState, TradeFrequencyState
+from app.risk.risk_manager import AccountState, PositionState, TradeFrequencyState
 from app.strategy.decision_engine import DecisionEngine
 
 
@@ -28,7 +28,7 @@ def _scalping_feature_row():
 
 
 def test_decision_engine_does_not_buy_when_ml_probability_low():
-    engine = DecisionEngine(Settings())
+    engine = DecisionEngine(Settings(_env_file=None, scalping_mode_enabled=False))
     decision = engine.decide(
         prediction={"symbol": "BTC/USD", "buy_probability": 0.2, "sell_probability": 0.8},
         feature_row=_feature_row(),
@@ -40,7 +40,7 @@ def test_decision_engine_does_not_buy_when_ml_probability_low():
 
 
 def test_decision_engine_does_not_buy_when_already_holding():
-    engine = DecisionEngine(Settings())
+    engine = DecisionEngine(Settings(_env_file=None, scalping_mode_enabled=False))
     decision = engine.decide(
         prediction={"symbol": "BTC/USD", "buy_probability": 0.9, "sell_probability": 0.1},
         feature_row=_feature_row(),
@@ -151,7 +151,7 @@ def test_scalping_mode_uses_buy_probability_floor_instead_of_old_threshold():
     )
 
     assert decision.action == "buy"
-    assert decision.reason == "scalping_entry_approved"
+    assert decision.reason == "scalping_dip_entry"
 
 
 def test_scalping_buy_blocked_by_trade_cooldown():
@@ -233,4 +233,130 @@ def test_scalping_sell_triggers_on_max_position_seconds():
     )
 
     assert decision.action == "sell"
-    assert decision.reason == "scalping_max_position_time"
+    assert decision.reason == "scalping_max_position_seconds"
+
+
+def test_scalping_quote_first_sell_triggers_take_profit():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, scalping_take_profit_pct=0.0015)
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 65000
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
+        trading_enabled=True,
+        quote={"bid_price": 65100, "ask_price": 65110},
+    )
+
+    assert decision.action == "sell"
+    assert decision.reason == "scalping_take_profit"
+
+
+def test_scalping_quote_first_sell_triggers_stop_loss():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, scalping_stop_loss_pct=0.001)
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 65000
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
+        trading_enabled=True,
+        quote={"bid_price": 64920, "ask_price": 64930},
+    )
+
+    assert decision.action == "sell"
+    assert decision.reason == "scalping_stop_loss"
+
+
+def test_scalping_quote_first_sell_triggers_trailing_stop():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        scalping_take_profit_pct=0.01,
+        scalping_trailing_stop_pct=0.0008,
+    )
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 65000
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65200),
+        trading_enabled=True,
+        quote={"bid_price": 65130, "ask_price": 65140},
+    )
+
+    assert decision.action == "sell"
+    assert decision.reason == "scalping_trailing_stop"
+
+
+def test_api_hard_budget_blocks_buy_but_not_sell():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, trading_enabled=True)
+    engine = DecisionEngine(settings)
+    exhausted_budget = {"api_budget_status": "hard_stop", "budget_remaining": 0}
+
+    buy = engine.decide(
+        prediction=_buy_prediction(),
+        feature_row=_scalping_feature_row(),
+        position=PositionState(),
+        trading_enabled=True,
+        api_budget=exhausted_budget,
+    )
+    sell = engine.decide(
+        prediction=_buy_prediction(),
+        feature_row=_scalping_feature_row(),
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
+        trading_enabled=True,
+        api_budget=exhausted_budget,
+        quote={"bid_price": 65100, "ask_price": 65110},
+    )
+
+    assert buy.action == "hold"
+    assert buy.reason == "api_budget_exhausted"
+    assert sell.action == "sell"
+
+
+def test_account_drawdown_blocks_buy_but_not_sell():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, trading_enabled=True, max_account_drawdown_pct=0.03)
+    engine = DecisionEngine(settings)
+
+    buy = engine.decide(
+        prediction=_buy_prediction(),
+        feature_row=_scalping_feature_row(),
+        position=PositionState(),
+        trading_enabled=True,
+        account_state=AccountState(available=True, equity=96_000, buying_power=1_000, drawdown_pct=0.04),
+    )
+    sell = engine.decide(
+        prediction=_buy_prediction(),
+        feature_row=_scalping_feature_row(),
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
+        trading_enabled=True,
+        account_state=AccountState(available=True, equity=96_000, buying_power=1_000, drawdown_pct=0.04),
+        quote={"bid_price": 65100, "ask_price": 65110},
+    )
+
+    assert buy.action == "hold"
+    assert buy.reason == "account_drawdown_reached"
+    assert sell.action == "sell"
+
+
+def test_recent_ioc_cancels_block_scalping_buy():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, trading_enabled=True)
+    engine = DecisionEngine(settings)
+
+    decision = engine.decide(
+        prediction=_buy_prediction(),
+        feature_row=_scalping_feature_row(),
+        position=PositionState(),
+        trading_enabled=True,
+        recent_ioc_canceled_buys=3,
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "recent_ioc_cancels_too_high"

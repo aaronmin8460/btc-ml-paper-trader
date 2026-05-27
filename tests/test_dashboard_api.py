@@ -51,6 +51,7 @@ class FakeBroker:
             "cash": "900",
             "equity": "1000",
             "portfolio_value": "1000",
+            "last_equity": "990",
             "paper": True,
             "secret_key": "must-not-leak",
         }
@@ -176,6 +177,16 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["win_rate"] is None
     assert body["average_trade_pnl"] is None
     assert body["max_drawdown"] is None
+    assert body["account_equity"] == 1000
+    assert body["buying_power"] == 1000
+    assert body["account_daily_change_usd"] == 10
+    assert body["account_daily_change_pct"] == pytest.approx(10 / 990)
+    assert body["account_drawdown_pct"] == 0
+    assert body["alpaca_calls_last_minute"] is not None
+    assert isinstance(body["alpaca_endpoint_counts"], dict)
+    assert body["api_budget_status"] in {"ok", "soft_limit", "hard_stop", "disabled"}
+    assert body["latest_model_net_return_pct"] is None
+    assert body["latest_model_accepted"] is None
     assert body["latest_signal"] is None
     assert body["last_order"] is None
     assert body["last_trade"] is None

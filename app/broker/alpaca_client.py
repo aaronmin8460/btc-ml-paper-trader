@@ -18,6 +18,7 @@ class AlpacaClient:
         self.settings = settings or get_settings()
         self.logger = get_logger()
         self._position_cache: dict[str, tuple[datetime, dict[str, Any] | None]] = {}
+        self._account_cache: tuple[datetime, dict[str, Any]] | None = None
 
     @property
     def headers(self) -> dict[str, str]:
@@ -29,14 +30,21 @@ class AlpacaClient:
     def credentials_available(self) -> bool:
         return bool(self.settings.alpaca_api_key and self.settings.alpaca_secret_key)
 
-    async def get_account(self) -> dict[str, Any]:
+    async def get_account(self, *, force_refresh: bool = False) -> dict[str, Any]:
+        cached = self._get_account_cache(force_refresh=force_refresh)
+        if cached is not None:
+            return cached
         if not self.credentials_available():
-            return {"buying_power": "0", "paper": True, "credentials": "missing"}
+            account = {"buying_power": "0", "paper": True, "credentials": "missing"}
+            self._set_account_cache(account)
+            return account
         async with httpx.AsyncClient(timeout=15) as client:
             await self._wait_for_alpaca(endpoint="account")
             response = await client.get(f"{self.settings.alpaca_paper_base_url}/v2/account", headers=self.headers)
             response.raise_for_status()
-            return response.json()
+            account = response.json()
+            self._set_account_cache(account)
+            return account
 
     async def get_position(self, symbol: str = ALLOWED_SYMBOL, *, force_refresh: bool = False) -> dict[str, Any] | None:
         assert_btc_only(symbol, context="position_symbol_validation")
@@ -270,6 +278,11 @@ class AlpacaClient:
         order_id = data.get("id")
         if not order_id or not self.settings.order_status_check_enabled:
             return data
+        limiter = get_alpaca_rate_limiter(self.settings)
+        if limiter.soft_budget_reached():
+            data["status_check_skipped_reason"] = "api_soft_budget"
+            self.logger.event("order_status_check_skipped", broker_order_id=order_id, reason="api_soft_budget")
+            return data
         if self.settings.order_status_check_delay_seconds > 0:
             await asyncio.sleep(self.settings.order_status_check_delay_seconds)
         try:
@@ -305,6 +318,33 @@ class AlpacaClient:
             self._position_cache.clear()
             return
         self._position_cache.pop(symbol, None)
+
+    def _get_account_cache(self, *, force_refresh: bool) -> dict[str, Any] | None:
+        cached = self._account_cache
+        age = self._cache_age_seconds(cached[0]) if cached else None
+        cache_hit = (
+            cached is not None
+            and not force_refresh
+            and self.settings.account_equity_cache_seconds > 0
+            and age is not None
+            and age <= self.settings.account_equity_cache_seconds
+        )
+        self._log_cache_event(endpoint="account", symbol=ALLOWED_SYMBOL, cache_hit=cache_hit, cache_age_seconds=age)
+        if cache_hit:
+            return dict(cached[1])
+        if cached is not None and get_alpaca_rate_limiter(self.settings).soft_budget_reached():
+            self._log_cache_event(
+                endpoint="account",
+                symbol=ALLOWED_SYMBOL,
+                cache_hit=True,
+                cache_age_seconds=age,
+                api_budget_status="soft_limit_stale_cache",
+            )
+            return dict(cached[1])
+        return None
+
+    def _set_account_cache(self, account: dict[str, Any]) -> None:
+        self._account_cache = (datetime.now(UTC), dict(account))
 
     @staticmethod
     def _cache_age_seconds(cached_at: datetime) -> float:

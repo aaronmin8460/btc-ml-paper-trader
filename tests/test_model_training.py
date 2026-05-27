@@ -8,6 +8,7 @@ from app.data.feature_engineering import FEATURE_COLUMNS
 from app.data.market_data import MarketDataClient
 from app.ml.model import MLSignalModel
 from app.ml.train import train_model_from_bars
+from app.ml.validation import promotion_decision
 
 
 def test_model_training_produces_probabilities():
@@ -51,3 +52,73 @@ def test_training_rejects_single_class_dataset_without_crashing(tmp_path):
     assert result["reason"] == "target_class_diversity_too_low"
     assert result["model_path"] is None
     assert list(tmp_path.glob("*.joblib")) == []
+
+
+def _passing_metrics(**overrides):
+    metrics = {
+        "validation_rows": 200,
+        "precision": 0.8,
+        "profit_factor": 1.5,
+        "max_drawdown": 0.005,
+        "number_of_trades": 25,
+        "net_return_pct": 0.01,
+        "max_drawdown_pct": 0.005,
+        "profit_factor_net": 1.2,
+        "fee_aware_backtest_valid": True,
+    }
+    metrics.update(overrides)
+    return metrics
+
+
+def test_model_rejected_when_precision_passes_but_net_return_is_negative():
+    accepted, reason = promotion_decision(
+        _passing_metrics(net_return_pct=-0.01),
+        min_rows=100,
+        min_precision=0.52,
+        max_drawdown=0.2,
+        max_trade_fraction=0.4,
+        min_net_return_pct=0.001,
+        max_backtest_drawdown_pct=0.01,
+        min_backtest_profit_factor=1.05,
+        min_backtest_trades=20,
+        require_positive_net_return=True,
+    )
+
+    assert accepted is False
+    assert reason == "model_not_profitable_after_costs"
+
+
+def test_model_rejected_when_backtest_drawdown_is_too_high():
+    accepted, reason = promotion_decision(
+        _passing_metrics(max_drawdown_pct=0.02),
+        min_rows=100,
+        min_precision=0.52,
+        max_drawdown=0.2,
+        max_trade_fraction=0.4,
+        min_net_return_pct=0.001,
+        max_backtest_drawdown_pct=0.01,
+        min_backtest_profit_factor=1.05,
+        min_backtest_trades=20,
+        require_positive_net_return=True,
+    )
+
+    assert accepted is False
+    assert reason == "backtest_drawdown_too_high"
+
+
+def test_model_accepted_only_when_ml_and_account_style_metrics_pass():
+    accepted, reason = promotion_decision(
+        _passing_metrics(),
+        min_rows=100,
+        min_precision=0.52,
+        max_drawdown=0.2,
+        max_trade_fraction=0.4,
+        min_net_return_pct=0.001,
+        max_backtest_drawdown_pct=0.01,
+        min_backtest_profit_factor=1.05,
+        min_backtest_trades=20,
+        require_positive_net_return=True,
+    )
+
+    assert accepted is True
+    assert reason == "accepted"

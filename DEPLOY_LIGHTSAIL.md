@@ -35,26 +35,29 @@ SYMBOL=BTC/USD
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ```
 
-For two-second REST scalping paper trading, use settings like:
+For one-second REST scalping paper trading, use settings like:
 
 ```env
 TIMEFRAME=1Min
 LOOKBACK_BARS=1500
-SCAN_INTERVAL_SECONDS=2
+SCAN_INTERVAL_SECONDS=1
 SCALPING_MODE_ENABLED=true
 ORDER_TYPE=limit
 TIME_IN_FORCE=ioc
 ALPACA_RATE_LIMIT_ENABLED=true
-ALPACA_MAX_CALLS_PER_MINUTE=160
-MARKET_BARS_CACHE_SECONDS=20
-POSITION_CACHE_SECONDS=5
+ALPACA_MAX_CALLS_PER_MINUTE=180
+ALPACA_API_BUDGET_TARGET_PER_MINUTE=170
+ALPACA_API_BUDGET_HARD_STOP_PER_MINUTE=195
+MARKET_BARS_CACHE_SECONDS=30
+POSITION_CACHE_SECONDS=2
+ACCOUNT_EQUITY_CACHE_SECONDS=5
 QUOTE_CACHE_SECONDS=0
-MIN_SECONDS_BETWEEN_TRADES=10
-MAX_TRADES_PER_HOUR=20
-MAX_DAILY_TRADES=100
+MIN_SECONDS_BETWEEN_TRADES=0
+MAX_TRADES_PER_HOUR=1000
+MAX_DAILY_TRADES=10000
 ```
 
-This is still REST polling, not true HFT. The cache and rate limiter are there to keep the bot below Alpaca API limits while scanning quickly.
+This is still REST polling, not true HFT. The cache and rate limiter are there to keep the bot below Alpaca API limits while scanning quickly. Higher frequency can increase paper losses from spread, slippage, and IOC cancels.
 
 ## Create Runtime Directories
 

@@ -183,6 +183,30 @@ async def test_missing_quote_blocks_limit_order_safely(recording_httpx):
 
 
 @pytest.mark.anyio
+async def test_soft_api_budget_skips_optional_order_status_check(recording_httpx, monkeypatch):
+    class SoftBudgetLimiter:
+        async def acquire(self, *, endpoint):
+            return 0
+
+        def soft_budget_reached(self):
+            return True
+
+    monkeypatch.setattr("app.broker.alpaca_client.get_alpaca_rate_limiter", lambda settings: SoftBudgetLimiter())
+    client = AlpacaClient(
+        _live_paper_settings(
+            order_status_check_enabled=True,
+            order_status_check_delay_seconds=0,
+        )
+    )
+
+    result = await client.submit_order(symbol="BTC/USD", side="buy", notional=25, current_position_qty=0)
+
+    assert result["status_check_skipped_reason"] == "api_soft_budget"
+    assert len(recording_httpx.requests) == 1
+    assert recording_httpx.requests[0]["json"]["type"] == "market"
+
+
+@pytest.mark.anyio
 async def test_get_position_url_encodes_crypto_symbol(recording_httpx):
     client = AlpacaClient(_live_paper_settings())
 

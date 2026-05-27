@@ -120,7 +120,19 @@ def walk_forward_validate(
     return metrics
 
 
-def promotion_decision(metrics: dict, *, min_rows: int, min_precision: float, max_drawdown: float, max_trade_fraction: float) -> tuple[bool, str]:
+def promotion_decision(
+    metrics: dict,
+    *,
+    min_rows: int,
+    min_precision: float,
+    max_drawdown: float,
+    max_trade_fraction: float,
+    min_net_return_pct: float = 0.0,
+    max_backtest_drawdown_pct: float | None = None,
+    min_backtest_profit_factor: float = 1.05,
+    min_backtest_trades: int = 1,
+    require_positive_net_return: bool = False,
+) -> tuple[bool, str]:
     if not metrics or metrics.get("validation_rows", 0) < min(50, min_rows):
         return False, "validation_rows_too_low"
     if metrics.get("precision", 0) < min_precision:
@@ -133,11 +145,42 @@ def promotion_decision(metrics: dict, *, min_rows: int, min_precision: float, ma
     rows = metrics.get("validation_rows", 1)
     if trades == 0:
         return False, "zero_trades"
+    if trades < min_backtest_trades:
+        return False, "not_enough_backtest_trades"
     if trades / rows > max_trade_fraction:
         return False, "too_many_trades"
+    if metrics.get("fee_aware_backtest_valid") is False:
+        return False, metrics.get("fee_aware_backtest_reason") or "fee_aware_backtest_invalid"
+    net_return = _metric_float(metrics.get("net_return_pct"))
+    if net_return is None:
+        return False, "net_return_unavailable"
+    if require_positive_net_return and net_return <= 0:
+        return False, "model_not_profitable_after_costs"
+    if net_return < min_net_return_pct:
+        return False, "net_return_below_threshold"
+    backtest_drawdown = _metric_float(metrics.get("max_drawdown_pct"))
+    if (
+        max_backtest_drawdown_pct is not None
+        and backtest_drawdown is not None
+        and backtest_drawdown > max_backtest_drawdown_pct
+    ):
+        return False, "backtest_drawdown_too_high"
+    profit_factor_net = _metric_float(metrics.get("profit_factor_net"))
+    if profit_factor_net is not None and profit_factor_net < min_backtest_profit_factor:
+        return False, "profit_factor_net_too_low"
     return True, "accepted"
 
 
 def _class_counts(values: pd.Series) -> dict[int, int]:
     counts = values.astype(int).value_counts().sort_index()
     return {int(label): int(count) for label, count in counts.items()}
+
+
+def _metric_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None

@@ -10,8 +10,9 @@ from app.db.repository import Repository
 from app.ml.predict import Predictor
 from app.monitoring.logger import get_logger
 from app.notifications.discord import DiscordNotifier
-from app.risk.risk_manager import PositionState
+from app.risk.risk_manager import AccountState, PositionState, account_state_from_payload
 from app.strategy.decision_engine import Decision, DecisionEngine
+from app.utils.rate_limiter import get_alpaca_rate_limiter
 
 
 KILL_SWITCH_REASONS = {
@@ -22,6 +23,14 @@ KILL_SWITCH_REASONS = {
     "order_in_flight",
     "already_holding_btc",
     "sell_without_position",
+    "api_budget_exhausted",
+    "account_daily_loss_usd_reached",
+    "account_daily_loss_pct_reached",
+    "account_drawdown_reached",
+    "account_data_required_unavailable",
+    "buying_power_too_low",
+    "recent_ioc_cancels_too_high",
+    "model_not_profitable_after_costs",
 }
 
 
@@ -64,15 +73,29 @@ class Trader:
             prediction = self.predictor.predict(bars, quote=quote)
             feature_row = latest_feature_row(bars, quote=quote).iloc[-1]
             position = await self.get_position_state()
+            quote_mid_price = _mid_price_from_quote(quote)
+            if position.has_position and quote_mid_price is not None:
+                position.highest_price = max(position.highest_price or 0.0, quote_mid_price)
+            account_state = await self._account_state()
+            api_budget = get_alpaca_rate_limiter(self.settings).snapshot()
             with SessionLocal() as db:
                 repo = Repository(db)
                 trade_frequency = repo.trade_frequency_state()
+                recent_ioc_canceled_buys = (
+                    repo.recent_ioc_canceled_buy_count()
+                    if hasattr(repo, "recent_ioc_canceled_buy_count")
+                    else 0
+                )
                 decision = self.decision_engine.decide(
                     prediction=prediction,
                     feature_row=feature_row,
                     position=position,
                     trading_enabled=self.settings.trading_enabled,
                     trade_frequency=trade_frequency,
+                    quote=quote,
+                    api_budget=api_budget,
+                    account_state=account_state,
+                    recent_ioc_canceled_buys=recent_ioc_canceled_buys,
                 )
                 decision, order_lock_acquired = await self._guard_order_decision(decision, position)
                 self.logger.event(
@@ -83,6 +106,8 @@ class Trader:
                     buy_probability=prediction["buy_probability"],
                     sell_probability=prediction["sell_probability"],
                     **self._alert_market_context(feature_row, quote),
+                    api_budget_status=api_budget.get("api_budget_status"),
+                    alpaca_calls_last_minute=api_budget.get("calls_last_minute"),
                 )
                 await self._send_signal_alert(decision, prediction, self._alert_market_context(feature_row, quote))
                 await self._send_risk_alert(decision)
@@ -102,7 +127,7 @@ class Trader:
                             qty=decision.qty,
                             current_position_qty=position.qty,
                             quote=quote,
-                            latest_price=float(feature_row["close"]),
+                            latest_price=quote_mid_price or float(feature_row["close"]),
                         )
                         self.broker.invalidate_position_cache(decision.symbol)
                         await self._send_order_alert(decision, order_response)
@@ -122,6 +147,13 @@ class Trader:
         except Exception as exc:
             await self._send_error_alert("trader.run_once", exc)
             raise
+
+    async def _account_state(self) -> AccountState:
+        try:
+            account = await self.broker.get_account()
+        except Exception:
+            return AccountState()
+        return account_state_from_payload(account)
 
     def _position_opened_at(self) -> datetime:
         try:
@@ -263,3 +295,11 @@ def _float_quote(quote: dict, *keys: str) -> float | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _mid_price_from_quote(quote: dict) -> float | None:
+    bid = _float_quote(quote, "bid_price", "bp", "bid")
+    ask = _float_quote(quote, "ask_price", "ap", "ask")
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2
+    return _float_quote(quote, "mid_price", "mid")

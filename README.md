@@ -171,12 +171,19 @@ Recommended BTC/USD scalping paper-trading variables:
 ```env
 TIMEFRAME=1Min
 LOOKBACK_BARS=1500
-SCAN_INTERVAL_SECONDS=5
-ORDER_NOTIONAL_USD=10
-STOP_LOSS_PCT=0.0025
-TAKE_PROFIT_PCT=0.006
-TRAILING_STOP_PCT=0.003
-MAX_HOLDING_MINUTES=15
+SCAN_INTERVAL_SECONDS=1
+ALPACA_MAX_CALLS_PER_MINUTE=180
+ALPACA_API_BUDGET_TARGET_PER_MINUTE=170
+ALPACA_API_BUDGET_HARD_STOP_PER_MINUTE=195
+MARKET_BARS_CACHE_SECONDS=30
+POSITION_CACHE_SECONDS=2
+ACCOUNT_EQUITY_CACHE_SECONDS=5
+ORDER_TYPE=limit
+TIME_IN_FORCE=ioc
+SCALPING_TAKE_PROFIT_PCT=0.0015
+SCALPING_STOP_LOSS_PCT=0.001
+SCALPING_TRAILING_STOP_PCT=0.0008
+SCALPING_MAX_POSITION_SECONDS=90
 ```
 
 ## Railway Volume setup for SQLite persistence
@@ -327,45 +334,74 @@ Feature columns are tracked and saved with the model. Random train/test splits a
 
 ## Order Execution
 
-Orders default to market/GTC paper orders:
+Orders default to limit/IOC paper orders for scalping-oriented paper execution:
 
 ```env
-ORDER_TYPE=market
-TIME_IN_FORCE=gtc
+ORDER_TYPE=limit
+TIME_IN_FORCE=ioc
 LIMIT_PRICE_OFFSET_BPS=2
 ```
 
-Optional limit/IOC paper orders can be enabled with `ORDER_TYPE=limit` and `TIME_IN_FORCE=ioc`. Limit prices are derived from the latest BTC/USD quote with `LIMIT_PRICE_OFFSET_BPS`; if a valid quote is unavailable, the order is blocked instead of falling back to market execution.
+Limit prices are derived from the latest BTC/USD quote with `LIMIT_PRICE_OFFSET_BPS`; if a valid quote is unavailable, the order is blocked instead of falling back to market execution. Market/GTC paper orders are still available by explicitly setting `ORDER_TYPE=market` and `TIME_IN_FORCE=gtc`.
 
 ## Scalping Configuration
 
-Scalping mode is a configuration profile for faster BTC/USD paper-trading experiments. It is disabled by default and these settings are not yet enforced in strategy logic; they are available for a later risk/strategy phase without changing the current trading behavior.
+Scalping mode is a REST-polling paper-trading profile for faster BTC/USD experiments. It is not true HFT: every decision still uses ordinary Alpaca REST calls, shared API budgeting, paper account risk checks, and long-only BTC/USD guardrails.
 
-Recommended paper-trading settings for a scalping experiment:
+Recommended API-safe aggressive paper scalping settings:
 
 ```env
 SCALPING_MODE_ENABLED=true
 TIMEFRAME=1Min
 LOOKBACK_BARS=1500
-SCAN_INTERVAL_SECONDS=5
-ORDER_NOTIONAL_USD=10
-STOP_LOSS_PCT=0.0025
-TAKE_PROFIT_PCT=0.006
-TRAILING_STOP_PCT=0.003
-MAX_HOLDING_MINUTES=15
+SCAN_INTERVAL_SECONDS=1
+
+ALPACA_RATE_LIMIT_ENABLED=true
+ALPACA_MAX_CALLS_PER_MINUTE=180
+ALPACA_API_BUDGET_TARGET_PER_MINUTE=170
+ALPACA_API_BUDGET_HARD_STOP_PER_MINUTE=195
+
+MARKET_BARS_CACHE_SECONDS=30
+POSITION_CACHE_SECONDS=2
+ACCOUNT_EQUITY_CACHE_SECONDS=5
+QUOTE_CACHE_SECONDS=0
+
+ORDER_TYPE=limit
+TIME_IN_FORCE=ioc
+LIMIT_PRICE_OFFSET_BPS=2
+
+SCALPING_ENTRY_DIP_PCT=0.0005
+SCALPING_TAKE_PROFIT_PCT=0.0015
+SCALPING_STOP_LOSS_PCT=0.001
+SCALPING_TRAILING_STOP_PCT=0.0008
+SCALPING_MAX_POSITION_SECONDS=90
 ```
 
-The scalping guard configuration is intentionally conservative by default:
+The bot uses latest quote/mid price for scalping entries, limit prices, stop-loss, take-profit, trailing stop, and weak-quote exits. Cached bars are used as background context for momentum, RSI, SMA distance, and volatility so the bot does not fetch 1500 bars every second.
+
+The shared Alpaca budget tracks calls by endpoint (`latest_quote`, `crypto_bars`, `position`, `account`, `submit_order`, `get_order`). Near the soft target, optional work is skipped first, such as order-status checks or bars refresh. At the hard stop, new buys are blocked with `api_budget_exhausted`; sells that reduce or close BTC exposure are still prioritized.
+
+Aggressive scalping can lose money quickly from spread, slippage, and repeated IOC cancellations. This project does not support live trading; do not point it at a live Alpaca account.
+
+Account-aware buy risk checks are paper-account only:
 
 ```env
-MAX_SPREAD_BPS=8
-MAX_SLIPPAGE_BPS=10
-MIN_QUOTE_IMBALANCE=-0.25
-MAX_TRADES_PER_HOUR=10
-MAX_DAILY_TRADES=30
+MAX_SPREAD_BPS=10
+MAX_SLIPPAGE_BPS=8
+MIN_QUOTE_IMBALANCE=-0.05
+MAX_TRADES_PER_HOUR=1000
+MAX_DAILY_TRADES=10000
 MAX_CONSECUTIVE_LOSSES=3
-MIN_SECONDS_BETWEEN_TRADES=30
+MIN_SECONDS_BETWEEN_TRADES=0
+
+PAUSE_TRADING_ON_ACCOUNT_DRAWDOWN=true
+MAX_ACCOUNT_DAILY_LOSS_USD=25
+MAX_ACCOUNT_DAILY_LOSS_PCT=0.01
+MAX_ACCOUNT_DRAWDOWN_PCT=0.03
+REQUIRE_ACCOUNT_DATA_FOR_TRADING=false
 ```
+
+Account risk blocks only new buys. Sells needed to reduce or close BTC exposure are not blocked by daily trade counts, hourly trade counts, account drawdown, or soft API-budget pressure.
 
 ## API
 
@@ -386,7 +422,7 @@ Protected endpoints require `X-Admin-Token` matching `API_ADMIN_TOKEN`.
 
 ## Dashboard API
 
-The dashboard API provides read-focused backend data for an operator dashboard: bot status, recent signals, recent paper orders, realized trade PnL from stored `Trade.pnl` rows, market freshness, and a dashboard-friendly `/run-once` wrapper. It is for BTC/USD paper-trading analytics only. It does not enable live trading, short selling, margin, or multi-symbol trading.
+The dashboard API provides read-focused backend data for an operator dashboard: bot status, recent signals, recent paper orders, realized trade PnL from stored `Trade.pnl` rows, market freshness, Alpaca API budget telemetry, paper account risk state, latest model promotion metrics, and a dashboard-friendly `/run-once` wrapper. It is for BTC/USD paper-trading analytics only. It does not enable live trading, short selling, margin, or multi-symbol trading.
 
 All dashboard endpoints require the admin token. Do not expose `API_ADMIN_TOKEN` in a public frontend, browser bundle, logs, screenshots, or shared command history.
 
@@ -624,6 +660,18 @@ BACKTEST_USE_TAKER_FEES=true
 ```
 
 The report separates gross and net return metrics. Net metrics subtract configured round-trip fees, configured round-trip slippage, and available `orderbook_spread` costs; if there is not enough validation data, the report returns a clear reason instead of profitability metrics.
+
+Model promotion also checks account-style net performance after costs:
+
+```env
+MIN_BACKTEST_NET_RETURN_PCT=0.001
+MAX_BACKTEST_DRAWDOWN_PCT=0.01
+MIN_BACKTEST_PROFIT_FACTOR=1.05
+MIN_BACKTEST_TRADES=20
+MODEL_PROMOTION_REQUIRE_POSITIVE_NET_RETURN=true
+```
+
+The model does not use account equity as a direct BTC price-prediction feature. Account/equity data is used for risk controls, model evaluation, model promotion/rejection, and dashboard analytics.
 
 ## Logs
 

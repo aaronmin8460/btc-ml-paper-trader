@@ -1,6 +1,7 @@
 import asyncio
-from collections import deque
+from collections import Counter, deque
 from time import monotonic
+from typing import Any
 
 from app.config import Settings
 from app.monitoring.logger import get_logger
@@ -13,6 +14,7 @@ class AsyncRateLimiter:
         max_calls: int,
         window_seconds: float = 60.0,
         enabled: bool = True,
+        target_calls: int | None = None,
         settings: Settings | None = None,
         wait_alert_threshold_seconds: float = 2.0,
     ) -> None:
@@ -23,10 +25,13 @@ class AsyncRateLimiter:
         self.max_calls = max_calls
         self.window_seconds = window_seconds
         self.enabled = enabled
+        self.target_calls = min(target_calls or max_calls, max_calls)
         self.settings = settings
         self.wait_alert_threshold_seconds = wait_alert_threshold_seconds
         self._last_wait_alert_at = 0.0
-        self._calls: deque[float] = deque()
+        self._calls: deque[tuple[float, str]] = deque()
+        self._last_wait_seconds = 0.0
+        self._total_wait_seconds = 0.0
         self._lock = asyncio.Lock()
 
     async def acquire(self, *, endpoint: str) -> float:
@@ -39,20 +44,69 @@ class AsyncRateLimiter:
                 now = monotonic()
                 self._drop_expired(now)
                 if len(self._calls) < self.max_calls:
-                    self._calls.append(now)
+                    self._calls.append((now, endpoint))
+                    self._last_wait_seconds = total_wait
                     return total_wait
 
-                wait_seconds = max(0.0, self.window_seconds - (now - self._calls[0]))
+                wait_seconds = max(0.0, self.window_seconds - (now - self._calls[0][0]))
                 self._log_wait(endpoint=endpoint, wait_seconds=wait_seconds)
 
             await self._alert_wait_if_needed(endpoint=endpoint, wait_seconds=wait_seconds)
             await asyncio.sleep(wait_seconds)
             total_wait += wait_seconds
+            self._total_wait_seconds += wait_seconds
 
     def _drop_expired(self, now: float) -> None:
         cutoff = now - self.window_seconds
-        while self._calls and self._calls[0] <= cutoff:
+        while self._calls and self._calls[0][0] <= cutoff:
             self._calls.popleft()
+
+    def snapshot(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {
+                "enabled": False,
+                "calls_last_minute": 0,
+                "budget_remaining": None,
+                "endpoint_counts": {},
+                "limiter_wait_seconds": 0.0,
+                "api_budget_status": "disabled",
+                "target_calls_per_minute": self.target_calls,
+                "hard_stop_calls_per_minute": self.max_calls,
+            }
+        now = monotonic()
+        self._drop_expired(now)
+        endpoint_counts = Counter(endpoint for _, endpoint in self._calls)
+        calls = len(self._calls)
+        status = "ok"
+        if calls >= self.max_calls:
+            status = "hard_stop"
+        elif calls >= self.target_calls:
+            status = "soft_limit"
+        return {
+            "enabled": True,
+            "calls_last_minute": calls,
+            "budget_remaining": max(0, self.max_calls - calls),
+            "endpoint_counts": dict(endpoint_counts),
+            "limiter_wait_seconds": self._last_wait_seconds,
+            "total_limiter_wait_seconds": self._total_wait_seconds,
+            "api_budget_status": status,
+            "target_calls_per_minute": self.target_calls,
+            "hard_stop_calls_per_minute": self.max_calls,
+        }
+
+    def soft_budget_reached(self, *, required_calls: int = 1) -> bool:
+        if not self.enabled:
+            return False
+        now = monotonic()
+        self._drop_expired(now)
+        return len(self._calls) + required_calls > self.target_calls
+
+    def hard_budget_reached(self, *, required_calls: int = 1) -> bool:
+        if not self.enabled:
+            return False
+        now = monotonic()
+        self._drop_expired(now)
+        return len(self._calls) + required_calls > self.max_calls
 
     def _log_wait(self, *, endpoint: str, wait_seconds: float) -> None:
         try:
@@ -87,15 +141,23 @@ class AsyncRateLimiter:
 
 
 _alpaca_limiter: AsyncRateLimiter | None = None
-_alpaca_limiter_key: tuple[bool, int] | None = None
+_alpaca_limiter_key: tuple[bool, int, int, int] | None = None
 
 
 def get_alpaca_rate_limiter(settings: Settings) -> AsyncRateLimiter:
     global _alpaca_limiter, _alpaca_limiter_key
-    key = (settings.alpaca_rate_limit_enabled, settings.alpaca_max_calls_per_minute)
+    hard_stop = min(settings.alpaca_max_calls_per_minute, settings.alpaca_api_budget_hard_stop_per_minute)
+    target = min(settings.alpaca_api_budget_target_per_minute, hard_stop)
+    key = (
+        settings.alpaca_rate_limit_enabled,
+        settings.alpaca_max_calls_per_minute,
+        settings.alpaca_api_budget_target_per_minute,
+        settings.alpaca_api_budget_hard_stop_per_minute,
+    )
     if _alpaca_limiter is None or _alpaca_limiter_key != key:
         _alpaca_limiter = AsyncRateLimiter(
-            max_calls=settings.alpaca_max_calls_per_minute,
+            max_calls=hard_stop,
+            target_calls=target,
             enabled=settings.alpaca_rate_limit_enabled,
             settings=settings,
         )

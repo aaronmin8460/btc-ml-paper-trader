@@ -153,6 +153,9 @@ class MarketDataClient:
         cached = self._get_bars_cache(cache_key, force_refresh=force_refresh)
         if cached is not None:
             return cached
+        budget_cached = self._get_budget_stale_bars_cache(cache_key, force_refresh=force_refresh)
+        if budget_cached is not None:
+            return budget_cached
 
         request_limit = request_limit_with_buffer(desired_limit)
         if self.settings.alpaca_api_key and self.settings.alpaca_secret_key:
@@ -266,6 +269,33 @@ class MarketDataClient:
 
     def _set_bars_cache(self, cache_key: tuple[str, str, int], bars: pd.DataFrame) -> None:
         self._bars_cache[cache_key] = (datetime.now(UTC), bars.copy())
+
+    def _get_budget_stale_bars_cache(
+        self,
+        cache_key: tuple[str, str, int],
+        *,
+        force_refresh: bool,
+    ) -> pd.DataFrame | None:
+        if force_refresh:
+            return None
+        cached = self._bars_cache.get(cache_key)
+        if cached is None:
+            return None
+        limiter = get_alpaca_rate_limiter(self.settings)
+        if not limiter.soft_budget_reached():
+            return None
+        symbol, timeframe, desired_limit = cache_key
+        age = self._cache_age_seconds(cached[0])
+        self._log_cache_event(
+            endpoint="bars",
+            symbol=symbol,
+            cache_hit=True,
+            cache_age_seconds=age,
+            timeframe=timeframe,
+            desired_limit=desired_limit,
+            api_budget_status="soft_limit_stale_cache",
+        )
+        return cached[1].copy()
 
     def bars_cache_age_seconds(
         self,

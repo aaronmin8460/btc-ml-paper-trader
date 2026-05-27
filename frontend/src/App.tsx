@@ -9,6 +9,7 @@ import { Header } from './components/Header';
 import { KpiGrid } from './components/KpiGrid';
 import { LoginScreen } from './components/LoginScreen';
 import { OrdersTable } from './components/OrdersTable';
+import { RiskBudgetPanel } from './components/RiskBudgetPanel';
 import { SignalPanel } from './components/SignalPanel';
 import { Toast, type ToastState } from './components/Toast';
 import { TradesTable } from './components/TradesTable';
@@ -93,6 +94,7 @@ export default function App() {
             ) : null}
 
             <KpiGrid summary={data.summary} />
+            <RiskBudgetPanel summary={data.summary} />
 
             <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
               <SignalPanel market={data.market} signal={latestSignal} />

@@ -11,6 +11,7 @@ from app.db.repository import Repository
 from app.ml.train import train_model_from_bars
 from app.monitoring.logger import get_logger
 from app.notifications.discord import DiscordNotifier
+from app.risk.risk_manager import account_state_from_payload
 from app.services.scheduler import TradingScheduler
 from app.services.trader import Trader
 from app.utils.time import iso_utc_now
@@ -184,7 +185,13 @@ async def test_discord_alert() -> dict:
 @app.post("/train", dependencies=[Depends(require_admin)])
 async def train() -> dict:
     bars = await MarketDataClient(settings).fetch_bars(settings.symbol, limit=max(settings.lookback_bars, settings.min_training_rows + 200))
-    return train_model_from_bars(bars, settings)
+    starting_equity = None
+    try:
+        account_state = account_state_from_payload(await trader.broker.get_account())
+        starting_equity = account_state.equity or account_state.portfolio_value
+    except Exception:
+        starting_equity = None
+    return train_model_from_bars(bars, settings, starting_equity=starting_equity)
 
 
 @app.post("/backtest", dependencies=[Depends(require_admin)])

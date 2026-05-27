@@ -128,6 +128,32 @@ class Repository:
             "total_sell_orders": side_counts.get("sell", 0),
         }
 
+    def recent_ioc_canceled_buy_count(self, *, limit: int = 10) -> int:
+        orders = (
+            self.db.query(Order)
+            .filter(Order.symbol == ALLOWED_SYMBOL, Order.side == "buy")
+            .order_by(desc(Order.created_at))
+            .limit(limit)
+            .all()
+        )
+        count = 0
+        for order in orders:
+            if order.status != "canceled":
+                continue
+            raw = _safe_json_loads(order.raw_response)
+            order_type = str(raw.get("order_type") or raw.get("type") or "").lower()
+            time_in_force = str(raw.get("time_in_force") or "").lower()
+            if order_type == "limit" and time_in_force == "ioc":
+                count += 1
+        return count
+
+    def add_model_run(self, *, model_version: str, status: str, metrics: dict[str, Any]) -> ModelRun:
+        run = ModelRun(model_version=model_version, status=status, metrics_json=json.dumps(metrics, default=str))
+        self.db.add(run)
+        self.db.commit()
+        self.db.refresh(run)
+        return run
+
     def recent_risk_events(self, limit: int = 100) -> list[RiskEvent]:
         return (
             self.db.query(RiskEvent)
@@ -190,3 +216,13 @@ class Repository:
                 continue
             break
         return losses
+
+
+def _safe_json_loads(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}

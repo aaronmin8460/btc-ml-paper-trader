@@ -12,7 +12,8 @@ from app.data.market_data import MarketDataClient
 from app.db.database import SessionLocal
 from app.db.models import Order, Signal, Trade
 from app.db.repository import Repository
-from app.risk.risk_manager import PositionState
+from app.risk.risk_manager import PositionState, account_state_from_payload
+from app.utils.rate_limiter import get_alpaca_rate_limiter
 from app.utils.time import iso_utc_now
 
 
@@ -36,11 +37,14 @@ async def dashboard_summary(request: Request) -> dict:
         latest_trade = repo.latest_trade()
         trades = repo.all_trades_ordered()
         order_summary = repo.order_summary()
+        latest_model_run = repo.recent_model_runs(1)
 
     position = await _current_position(trader)
     account_summary = await _account_summary(broker)
     market_summary = await _market_snapshot(settings, market)
     trade_metrics = _trade_metrics(trades, position)
+    api_budget = get_alpaca_rate_limiter(settings).snapshot()
+    latest_model = _latest_model_summary(latest_model_run[0] if latest_model_run else None)
 
     return {
         "app_status": "ok",
@@ -53,6 +57,22 @@ async def dashboard_summary(request: Request) -> dict:
         "latest_signal": _serialize_signal(latest_signal) if latest_signal else None,
         "current_position": _serialize_position(position),
         "alpaca_account": account_summary,
+        "alpaca_calls_last_minute": api_budget.get("calls_last_minute"),
+        "alpaca_budget_remaining": api_budget.get("budget_remaining"),
+        "alpaca_endpoint_counts": api_budget.get("endpoint_counts"),
+        "api_budget_status": api_budget.get("api_budget_status"),
+        "account_equity": account_summary.get("equity") if account_summary else None,
+        "cash": account_summary.get("cash") if account_summary else None,
+        "buying_power": account_summary.get("buying_power") if account_summary else None,
+        "portfolio_value": account_summary.get("portfolio_value") if account_summary else None,
+        "account_daily_change_usd": account_summary.get("daily_change_usd") if account_summary else None,
+        "account_daily_change_pct": account_summary.get("daily_change_pct") if account_summary else None,
+        "account_drawdown_pct": account_summary.get("drawdown_pct") if account_summary else None,
+        "latest_model_net_return_pct": latest_model.get("latest_model_net_return_pct"),
+        "latest_model_max_drawdown_pct": latest_model.get("latest_model_max_drawdown_pct"),
+        "latest_model_profit_factor": latest_model.get("latest_model_profit_factor"),
+        "latest_model_accepted": latest_model.get("latest_model_accepted"),
+        "latest_model_rejected_reason": latest_model.get("latest_model_rejected_reason"),
         **order_summary,
         "total_trades": len(trades),
         **trade_metrics,
@@ -145,13 +165,18 @@ async def _account_summary(broker: Any) -> dict | None:
         account = await broker.get_account()
     except Exception:
         return None
+    state = account_state_from_payload(account)
     return {
         "status": account.get("status"),
         "currency": account.get("currency"),
-        "buying_power": _safe_float(account.get("buying_power")),
-        "cash": _safe_float(account.get("cash")),
-        "equity": _safe_float(account.get("equity")),
-        "portfolio_value": _safe_float(account.get("portfolio_value")),
+        "buying_power": state.buying_power,
+        "cash": state.cash,
+        "equity": state.equity,
+        "portfolio_value": state.portfolio_value,
+        "last_equity": state.last_equity,
+        "daily_change_usd": state.daily_change_usd,
+        "daily_change_pct": state.daily_change_pct,
+        "drawdown_pct": state.drawdown_pct,
         "paper": account.get("paper"),
     }
 
@@ -300,6 +325,28 @@ def _parse_order_raw_response(raw_response: str | None) -> Any:
     except (TypeError, json.JSONDecodeError):
         return None
     return _redact_secrets(parsed)
+
+
+def _latest_model_summary(model_run: Any | None) -> dict:
+    if model_run is None:
+        return {
+            "latest_model_net_return_pct": None,
+            "latest_model_max_drawdown_pct": None,
+            "latest_model_profit_factor": None,
+            "latest_model_accepted": None,
+            "latest_model_rejected_reason": None,
+        }
+    metrics = _parse_order_raw_response(getattr(model_run, "metrics_json", None))
+    if not isinstance(metrics, dict):
+        metrics = {}
+    status = getattr(model_run, "status", None)
+    return {
+        "latest_model_net_return_pct": _safe_float(metrics.get("net_return_pct")),
+        "latest_model_max_drawdown_pct": _safe_float(metrics.get("max_drawdown_pct")),
+        "latest_model_profit_factor": _safe_float(metrics.get("profit_factor_net")),
+        "latest_model_accepted": status == "accepted" if status is not None else None,
+        "latest_model_rejected_reason": None if status == "accepted" else metrics.get("promotion_reason") or metrics.get("reason"),
+    }
 
 
 def _sanitize_mapping(value: dict[str, Any]) -> dict[str, Any]:
