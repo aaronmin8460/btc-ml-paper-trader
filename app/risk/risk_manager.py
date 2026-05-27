@@ -75,15 +75,29 @@ class RiskManager:
         if not position.has_position:
             return False, "no_position"
         entry = position.avg_entry_price
-        if latest_price <= entry * (1 - self.settings.stop_loss_pct):
-            return True, "stop_loss"
-        if latest_price >= entry * (1 + self.settings.take_profit_pct):
-            return True, "take_profit"
+        stop_loss_pct = self.settings.scalping_stop_loss_pct if self.settings.scalping_mode_enabled else self.settings.stop_loss_pct
+        take_profit_pct = self.settings.scalping_take_profit_pct if self.settings.scalping_mode_enabled else self.settings.take_profit_pct
+        trailing_stop_pct = self.settings.scalping_trailing_stop_pct if self.settings.scalping_mode_enabled else self.settings.trailing_stop_pct
+        stop_reason = "scalping_stop_loss" if self.settings.scalping_mode_enabled else "stop_loss"
+        take_profit_reason = "scalping_take_profit" if self.settings.scalping_mode_enabled else "take_profit"
+        trailing_reason = "scalping_trailing_stop" if self.settings.scalping_mode_enabled else "trailing_stop"
+        max_position_reason = "scalping_max_position_time" if self.settings.scalping_mode_enabled else "max_holding_time"
+
+        if latest_price <= entry * (1 - stop_loss_pct):
+            return True, stop_reason
+        if latest_price >= entry * (1 + take_profit_pct):
+            return True, take_profit_reason
         high = max(position.highest_price or entry, latest_price)
-        if latest_price <= high * (1 - self.settings.trailing_stop_pct):
-            return True, "trailing_stop"
-        if position.opened_at and now - position.opened_at >= timedelta(minutes=self.settings.max_holding_minutes):
-            return True, "max_holding_time"
+        if latest_price <= high * (1 - trailing_stop_pct):
+            return True, trailing_reason
+        if position.opened_at:
+            max_holding = (
+                timedelta(seconds=self.settings.scalping_max_position_seconds)
+                if self.settings.scalping_mode_enabled
+                else timedelta(minutes=self.settings.max_holding_minutes)
+            )
+            if now - position.opened_at >= max_holding:
+                return True, max_position_reason
         return False, "hold"
 
     def approve_sell(self, position: PositionState) -> tuple[bool, str]:

@@ -4,7 +4,7 @@ from app.broker.execution_guard import BTCOnlyViolation
 from app.config import Settings
 from app.data.feature_engineering import latest_feature_row
 from app.data.market_data import MarketDataClient
-from app.risk.risk_manager import PositionState
+from app.risk.risk_manager import PositionState, TradeFrequencyState
 from app.strategy.decision_engine import DecisionEngine
 
 
@@ -15,6 +15,16 @@ def _feature_row():
 
 def _buy_prediction(symbol="BTC/USD"):
     return {"symbol": symbol, "buy_probability": 0.9, "sell_probability": 0.1}
+
+
+def _scalping_feature_row():
+    feature_row = _feature_row()
+    feature_row["orderbook_spread"] = 0.0001
+    feature_row["quote_imbalance"] = 0.2
+    feature_row["sma_20_distance"] = -0.002
+    feature_row["log_return_3"] = 0
+    feature_row["log_return_5"] = -0.0015
+    return feature_row
 
 
 def test_decision_engine_does_not_buy_when_ml_probability_low():
@@ -121,3 +131,106 @@ def test_decision_engine_still_enforces_btc_only_symbol():
             position=PositionState(),
             trading_enabled=True,
         )
+
+
+def test_scalping_mode_uses_buy_probability_floor_instead_of_old_threshold():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        trading_enabled=True,
+        min_buy_probability=0.58,
+        scalping_buy_probability_floor=0.50,
+    )
+    engine = DecisionEngine(settings)
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.52, "sell_probability": 0.48},
+        feature_row=_scalping_feature_row(),
+        position=PositionState(),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "buy"
+    assert decision.reason == "scalping_entry_approved"
+
+
+def test_scalping_buy_blocked_by_trade_cooldown():
+    from datetime import UTC, datetime, timedelta
+
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        trading_enabled=True,
+        min_seconds_between_trades=10,
+    )
+    engine = DecisionEngine(settings)
+    now = datetime.now(UTC)
+
+    decision = engine.decide(
+        prediction=_buy_prediction(),
+        feature_row=_scalping_feature_row(),
+        position=PositionState(),
+        trading_enabled=True,
+        trade_frequency=TradeFrequencyState(last_trade_at=now - timedelta(seconds=2)),
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "trade_cooldown_active"
+
+
+def test_scalping_sell_triggers_on_take_profit():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, scalping_take_profit_pct=0.003)
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 65200
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65200),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "sell"
+    assert decision.reason == "scalping_take_profit"
+
+
+def test_scalping_sell_triggers_on_stop_loss():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, scalping_stop_loss_pct=0.002)
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 64800
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "sell"
+    assert decision.reason == "scalping_stop_loss"
+
+
+def test_scalping_sell_triggers_on_max_position_seconds():
+    from datetime import UTC, datetime, timedelta
+
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, scalping_max_position_seconds=180)
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 65010
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(
+            qty=0.01,
+            avg_entry_price=65000,
+            highest_price=65010,
+            opened_at=datetime.now(UTC) - timedelta(seconds=181),
+        ),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "sell"
+    assert decision.reason == "scalping_max_position_time"

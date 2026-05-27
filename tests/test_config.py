@@ -48,6 +48,23 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.maker_fee_bps == 15
     assert settings.slippage_bps == 10
     assert settings.backtest_use_taker_fees is True
+    assert settings.alpaca_rate_limit_enabled is True
+    assert settings.alpaca_max_calls_per_minute == 160
+    assert settings.market_bars_cache_seconds == 20
+    assert settings.position_cache_seconds == 5
+    assert settings.quote_cache_seconds == 0
+    assert settings.scalping_entry_dip_pct == 0.001
+    assert settings.scalping_take_profit_pct == 0.003
+    assert settings.scalping_stop_loss_pct == 0.002
+    assert settings.scalping_trailing_stop_pct == 0.0015
+    assert settings.scalping_min_momentum_pct == -0.0005
+    assert settings.scalping_max_position_seconds == 180
+    assert settings.scalping_buy_probability_floor == 0.50
+    assert settings.scalping_sell_on_weak_quote is True
+    assert settings.scalping_quote_imbalance_exit == -0.20
+    assert settings.order_in_flight_timeout_seconds == 15
+    assert settings.order_status_check_enabled is True
+    assert settings.order_status_check_delay_seconds == 1
 
 
 def test_config_still_rejects_unsafe_symbol_and_non_paper_mode():
@@ -65,6 +82,9 @@ def test_config_still_rejects_unsafe_symbol_and_non_paper_mode():
 
     with pytest.raises(ValueError):
         Settings(_env_file=None, taker_fee_bps=-1)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, alpaca_max_calls_per_minute=0)
 
 
 def test_safe_dict_masks_discord_webhook_url():

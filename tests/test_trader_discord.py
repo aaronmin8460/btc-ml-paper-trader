@@ -41,12 +41,13 @@ class FakeDecisionEngine:
 
 
 class FakeBroker:
-    def __init__(self, events: list[str], order_response: dict | None = None) -> None:
+    def __init__(self, events: list[str], order_response: dict | None = None, position: dict | None = None) -> None:
         self.events = events
         self.order_response = order_response or {"id": "paper-order-1", "status": "submitted"}
+        self.position = position
 
     async def get_position(self, symbol):
-        return None
+        return self.position
 
     async def submit_market_order(self, **kwargs):
         self.events.append("submit_order")
@@ -55,6 +56,9 @@ class FakeBroker:
     async def submit_order(self, **kwargs):
         return await self.submit_market_order(**kwargs)
 
+    def invalidate_position_cache(self, symbol=None):
+        self.events.append("invalidate_position_cache")
+
 
 class FakeNotifier:
     def __init__(self, events: list[str] | None = None, fail: bool = False) -> None:
@@ -62,11 +66,11 @@ class FakeNotifier:
         self.calls = []
         self.fail = fail
 
-    async def signal_alert(self, *args):
+    async def signal_alert(self, *args, **kwargs):
         if self.fail:
             raise RuntimeError("discord failed")
         self.events.append("signal_alert")
-        self.calls.append(("signal", args))
+        self.calls.append(("signal", args, kwargs))
 
     async def order_alert(self, *args, **kwargs):
         if self.fail:
@@ -88,7 +92,7 @@ class FakeNotifier:
 
 
 class RaisingNotifier:
-    async def signal_alert(self, *args):
+    async def signal_alert(self, *args, **kwargs):
         raise AssertionError("Discord signal alert should not be called")
 
     async def order_alert(self, *args, **kwargs):
@@ -159,7 +163,10 @@ def trader_factory(monkeypatch):
         trader.market_data = FakeMarketData(error=market_error)
         trader.predictor = FakePredictor()
         trader.decision_engine = FakeDecisionEngine(decision)
-        trader.broker = FakeBroker(flow_events)
+        position = None
+        if decision.action == "sell":
+            position = {"qty": "0.01", "avg_entry_price": "65000", "market_value": "650", "current_price": "65000"}
+        trader.broker = FakeBroker(flow_events, position=position)
         trader.logger = FakeLogger()
         trader.notifier = notifier if notifier is not None else FakeNotifier(flow_events)
         return trader
@@ -231,9 +238,13 @@ async def test_order_alert_called_after_order_submission(trader_factory):
     result = await trader.run_once()
 
     assert result["order"] == {"id": "paper-order-1", "status": "submitted"}
-    assert events == ["submit_order", "order_alert"]
+    assert events == ["submit_order", "invalidate_position_cache", "order_alert"]
     assert notifier.calls == [
-        ("order", ("buy", "submitted", 25, None), {"broker_order_id": "paper-order-1"})
+        (
+            "order",
+            ("buy", "submitted", 25, None),
+            {"broker_order_id": "paper-order-1", "order_type": "market", "time_in_force": "gtc"},
+        )
     ]
 
 
@@ -326,3 +337,17 @@ async def test_discord_failure_does_not_interrupt_trading(trader_factory):
         "discord_alert_failed",
     ]
     assert "discord.example" not in str(trader.logger.events)
+
+
+@pytest.mark.anyio
+async def test_duplicate_order_lock_blocks_concurrent_attempt(trader_factory):
+    settings = Settings(_env_file=None, trading_enabled=True)
+    decision = Decision("BTC/USD", "buy", "ml_and_rules_approved", notional=25)
+    trader = trader_factory(settings=settings, decision=decision)
+    await trader._order_lock.acquire()
+
+    result = await trader.run_once()
+
+    assert result["decision"]["action"] == "hold"
+    assert result["decision"]["reason"] == "order_in_flight"
+    trader._order_lock.release()

@@ -71,6 +71,12 @@ class Repository:
     def recent_orders(self, limit: int = 50) -> list[Order]:
         return self.db.query(Order).order_by(desc(Order.created_at)).limit(limit).all()
 
+    def latest_order(self, *, side: str | None = None) -> Order | None:
+        query = self.db.query(Order).filter(Order.symbol == ALLOWED_SYMBOL)
+        if side is not None:
+            query = query.filter(Order.side == side)
+        return query.order_by(desc(Order.created_at)).first()
+
     def trade_frequency_state(self, *, now: datetime | None = None) -> TradeFrequencyState:
         current_time = now or utc_now()
         if current_time.tzinfo is None:

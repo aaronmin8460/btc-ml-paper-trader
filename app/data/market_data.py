@@ -10,6 +10,8 @@ import pandas as pd
 
 from app.broker.execution_guard import assert_btc_only
 from app.config import ALLOWED_SYMBOL, Settings, get_settings
+from app.monitoring.logger import get_logger
+from app.utils.rate_limiter import get_alpaca_rate_limiter
 
 
 MAX_ALPACA_BARS_PER_REQUEST = 10_000
@@ -125,6 +127,9 @@ def _log_bars_fetched(
 class MarketDataClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self.logger = get_logger()
+        self._bars_cache: dict[tuple[str, str, int], tuple[datetime, pd.DataFrame]] = {}
+        self._quote_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
 
     @property
     def headers(self) -> dict[str, str]:
@@ -139,14 +144,20 @@ class MarketDataClient:
         *,
         timeframe: str | None = None,
         limit: int | None = None,
+        force_refresh: bool = False,
     ) -> pd.DataFrame:
         assert_btc_only(symbol, context="market_data_fetch_bars")
         timeframe = timeframe or self.settings.timeframe
         desired_limit = self.settings.lookback_bars if limit is None else limit
+        cache_key = (symbol, timeframe, desired_limit)
+        cached = self._get_bars_cache(cache_key, force_refresh=force_refresh)
+        if cached is not None:
+            return cached
+
         request_limit = request_limit_with_buffer(desired_limit)
         if self.settings.alpaca_api_key and self.settings.alpaca_secret_key:
             end = datetime.now(UTC)
-            start = end - (parse_timeframe_duration(timeframe) * request_limit)
+            start = calculate_request_start(end, timeframe, desired_limit)
             params = {
                 "symbols": symbol,
                 "timeframe": timeframe,
@@ -155,6 +166,7 @@ class MarketDataClient:
                 "limit": request_limit,
             }
             async with httpx.AsyncClient(timeout=30) as client:
+                await self._wait_for_alpaca(endpoint="crypto_bars")
                 response = await client.get(
                     f"{self.settings.alpaca_data_base_url}/v1beta3/crypto/us/bars",
                     headers=self.headers,
@@ -172,7 +184,9 @@ class MarketDataClient:
                     bars=fetched_bars,
                 )
                 validate_bars_are_fresh(fetched_bars, timeframe)
-                return fetched_bars.tail(desired_limit).reset_index(drop=True)
+                bars = fetched_bars.tail(desired_limit).reset_index(drop=True)
+                self._set_bars_cache(cache_key, bars)
+                return bars
         bars = self.synthetic_btc_bars(limit=desired_limit)
         _log_bars_fetched(
             symbol=symbol,
@@ -182,20 +196,29 @@ class MarketDataClient:
             desired_limit=desired_limit,
             bars=bars,
         )
+        self._set_bars_cache(cache_key, bars)
         return bars
 
-    async def fetch_latest_quote(self, symbol: str = ALLOWED_SYMBOL) -> dict[str, Any]:
+    async def fetch_latest_quote(self, symbol: str = ALLOWED_SYMBOL, *, force_refresh: bool = False) -> dict[str, Any]:
         assert_btc_only(symbol, context="market_data_fetch_latest_quote")
+        cached = self._get_quote_cache(symbol, force_refresh=force_refresh)
+        if cached is not None:
+            return cached
         if not (self.settings.alpaca_api_key and self.settings.alpaca_secret_key):
-            return {"bid_price": None, "ask_price": None, "bid_size": None, "ask_size": None}
+            quote = {"bid_price": None, "ask_price": None, "bid_size": None, "ask_size": None}
+            self._set_quote_cache(symbol, quote)
+            return quote
         async with httpx.AsyncClient(timeout=15) as client:
+            await self._wait_for_alpaca(endpoint="latest_quote")
             response = await client.get(
                 f"{self.settings.alpaca_data_base_url}/v1beta3/crypto/us/latest/quotes",
                 headers=self.headers,
                 params={"symbols": symbol},
             )
             response.raise_for_status()
-            return response.json().get("quotes", {}).get(symbol, {})
+            quote = response.json().get("quotes", {}).get(symbol, {})
+            self._set_quote_cache(symbol, quote)
+            return quote
 
     def load_csv(self, path: str | Path, symbol: str = ALLOWED_SYMBOL) -> pd.DataFrame:
         assert_btc_only(symbol, context="market_data_load_csv")
@@ -209,6 +232,87 @@ class MarketDataClient:
             columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
         )
         return normalize_ohlcv(df)
+
+    async def _wait_for_alpaca(self, *, endpoint: str) -> None:
+        await get_alpaca_rate_limiter(self.settings).acquire(endpoint=endpoint)
+
+    def _get_bars_cache(
+        self,
+        cache_key: tuple[str, str, int],
+        *,
+        force_refresh: bool,
+    ) -> pd.DataFrame | None:
+        symbol, timeframe, desired_limit = cache_key
+        cached = self._bars_cache.get(cache_key)
+        age = self._cache_age_seconds(cached[0]) if cached else None
+        cache_hit = (
+            cached is not None
+            and not force_refresh
+            and self.settings.market_bars_cache_seconds > 0
+            and age is not None
+            and age <= self.settings.market_bars_cache_seconds
+        )
+        self._log_cache_event(
+            endpoint="bars",
+            symbol=symbol,
+            cache_hit=cache_hit,
+            cache_age_seconds=age,
+            timeframe=timeframe,
+            desired_limit=desired_limit,
+        )
+        if cache_hit:
+            return cached[1].copy()
+        return None
+
+    def _set_bars_cache(self, cache_key: tuple[str, str, int], bars: pd.DataFrame) -> None:
+        self._bars_cache[cache_key] = (datetime.now(UTC), bars.copy())
+
+    def bars_cache_age_seconds(
+        self,
+        *,
+        symbol: str = ALLOWED_SYMBOL,
+        timeframe: str | None = None,
+        limit: int | None = None,
+    ) -> float | None:
+        timeframe = timeframe or self.settings.timeframe
+        desired_limit = self.settings.lookback_bars if limit is None else limit
+        cached = self._bars_cache.get((symbol, timeframe, desired_limit))
+        return self._cache_age_seconds(cached[0]) if cached else None
+
+    def _get_quote_cache(self, symbol: str, *, force_refresh: bool) -> dict[str, Any] | None:
+        cached = self._quote_cache.get(symbol)
+        age = self._cache_age_seconds(cached[0]) if cached else None
+        cache_hit = (
+            cached is not None
+            and not force_refresh
+            and self.settings.quote_cache_seconds > 0
+            and age is not None
+            and age <= self.settings.quote_cache_seconds
+        )
+        self._log_cache_event(endpoint="quote", symbol=symbol, cache_hit=cache_hit, cache_age_seconds=age)
+        if cache_hit:
+            return dict(cached[1])
+        return None
+
+    def _set_quote_cache(self, symbol: str, quote: dict[str, Any]) -> None:
+        self._quote_cache[symbol] = (datetime.now(UTC), dict(quote))
+
+    @staticmethod
+    def _cache_age_seconds(cached_at: datetime) -> float:
+        return max(0.0, (datetime.now(UTC) - cached_at).total_seconds())
+
+    def _log_cache_event(self, *, endpoint: str, symbol: str, cache_hit: bool, cache_age_seconds: float | None, **extra: Any) -> None:
+        try:
+            self.logger.event(
+                "market_data_cache",
+                endpoint=endpoint,
+                symbol=symbol,
+                cache_hit=cache_hit,
+                cache_age_seconds=cache_age_seconds,
+                **extra,
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def synthetic_btc_bars(limit: int = 1200) -> pd.DataFrame:

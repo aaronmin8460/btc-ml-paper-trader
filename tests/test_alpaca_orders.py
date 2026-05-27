@@ -46,6 +46,7 @@ def _live_paper_settings(**overrides):
         "order_type": "market",
         "time_in_force": "gtc",
         "limit_price_offset_bps": 2,
+        "order_status_check_enabled": False,
     }
     defaults.update(overrides)
     return Settings(**defaults)

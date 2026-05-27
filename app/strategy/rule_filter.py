@@ -21,6 +21,8 @@ class RuleFilter:
                 return False, "invalid_price"
             if spread * 10_000 > self.settings.max_spread_bps:
                 return False, "spread_too_wide"
+            if self.settings.limit_price_offset_bps > self.settings.max_slippage_bps:
+                return False, "slippage_too_high"
             if quote_imbalance < self.settings.min_quote_imbalance:
                 return False, "quote_imbalance_too_weak"
         if vol > 0.035:
@@ -29,6 +31,8 @@ class RuleFilter:
             return False, "spread_too_wide"
         if range_pct > 0.06:
             return False, "recent_candle_extreme_range"
+        if self.settings.scalping_mode_enabled:
+            return True, "allowed"
         if ema_slow_distance < 0 and buy_probability < self.settings.min_buy_probability + 0.05:
             return False, "below_slow_ema_with_marginal_confidence"
         return True, "allowed"

@@ -30,11 +30,16 @@ class Settings(BaseSettings):
     alpaca_secret_key: str = ""
     alpaca_paper_base_url: str = "https://paper-api.alpaca.markets"
     alpaca_data_base_url: str = "https://data.alpaca.markets"
+    alpaca_rate_limit_enabled: bool = True
+    alpaca_max_calls_per_minute: int = 160
 
     symbol: str = ALLOWED_SYMBOL
     timeframe: str = "15Min"
     lookback_bars: int = 500
     scan_interval_seconds: int = 60
+    market_bars_cache_seconds: int = 20
+    position_cache_seconds: int = 5
+    quote_cache_seconds: int = 0
 
     database_url: str = "sqlite:///./data/trading.db"
     model_dir: str = "models"
@@ -58,6 +63,20 @@ class Settings(BaseSettings):
     max_daily_trades: int = 30
     max_consecutive_losses: int = 3
     min_seconds_between_trades: int = 30
+
+    scalping_entry_dip_pct: float = 0.001
+    scalping_take_profit_pct: float = 0.003
+    scalping_stop_loss_pct: float = 0.002
+    scalping_trailing_stop_pct: float = 0.0015
+    scalping_min_momentum_pct: float = -0.0005
+    scalping_max_position_seconds: int = 180
+    scalping_buy_probability_floor: float = 0.50
+    scalping_sell_on_weak_quote: bool = True
+    scalping_quote_imbalance_exit: float = -0.20
+
+    order_in_flight_timeout_seconds: int = 15
+    order_status_check_enabled: bool = True
+    order_status_check_delay_seconds: float = 1
 
     taker_fee_bps: float = 25
     maker_fee_bps: float = 15
@@ -111,6 +130,28 @@ class Settings(BaseSettings):
     def backtest_cost_bps_must_be_non_negative(cls, value: float) -> float:
         if value < 0:
             raise ValueError("Backtest fee and slippage bps values must be non-negative.")
+        return value
+
+    @field_validator(
+        "alpaca_max_calls_per_minute",
+        "market_bars_cache_seconds",
+        "position_cache_seconds",
+        "quote_cache_seconds",
+        "order_in_flight_timeout_seconds",
+        "order_status_check_delay_seconds",
+        "scalping_max_position_seconds",
+    )
+    @classmethod
+    def runtime_timing_values_must_be_non_negative(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("Runtime timing and rate limit values must be non-negative.")
+        return value
+
+    @field_validator("alpaca_max_calls_per_minute")
+    @classmethod
+    def alpaca_rate_limit_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("ALPACA_MAX_CALLS_PER_MINUTE must be positive.")
         return value
 
     @model_validator(mode="after")

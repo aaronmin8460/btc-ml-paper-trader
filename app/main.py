@@ -73,11 +73,18 @@ async def run_once() -> dict:
 
 
 @app.get("/debug/latest-bars", dependencies=[Depends(require_admin)])
-async def debug_latest_bars() -> dict:
-    bars = await MarketDataClient(settings).fetch_bars(settings.symbol)
+async def debug_latest_bars(force_refresh: bool = False) -> dict:
+    market_data = MarketDataClient(settings)
+    try:
+        bars = await market_data.fetch_bars(settings.symbol, force_refresh=force_refresh)
+    except TypeError:
+        bars = await market_data.fetch_bars(settings.symbol)
     first_timestamp = bars["timestamp"].iloc[0] if not bars.empty else None
     latest_timestamp = bars["timestamp"].iloc[-1] if not bars.empty else None
     latest_close = float(bars["close"].iloc[-1]) if not bars.empty else None
+    cache_age_seconds = None
+    if hasattr(market_data, "bars_cache_age_seconds"):
+        cache_age_seconds = market_data.bars_cache_age_seconds(symbol=settings.symbol)
     return {
         "symbol": settings.symbol,
         "timeframe": settings.timeframe,
@@ -86,6 +93,7 @@ async def debug_latest_bars() -> dict:
         "latest_timestamp": serialize_timestamp(latest_timestamp),
         "current_utc_time": iso_utc_now(),
         "latest_close": latest_close,
+        "cache_age_seconds": cache_age_seconds,
     }
 
 

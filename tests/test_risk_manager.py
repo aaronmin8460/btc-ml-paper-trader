@@ -129,3 +129,20 @@ def test_stop_loss_and_take_profit_force_sell_behavior_remains_intact():
     should_sell, reason = risk.should_force_sell(position=position, latest_price=66500, now=now)
     assert should_sell is True
     assert reason == "take_profit"
+
+
+def test_scalping_force_sell_uses_scalping_thresholds():
+    risk = RiskManager(
+        Settings(
+            _env_file=None,
+            scalping_mode_enabled=True,
+            scalping_stop_loss_pct=0.002,
+            scalping_take_profit_pct=0.003,
+        )
+    )
+    position = PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000)
+    now = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
+
+    should_sell, reason = risk.should_force_sell(position=position, latest_price=65196, now=now)
+    assert should_sell is True
+    assert reason == "scalping_take_profit"
