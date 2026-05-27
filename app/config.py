@@ -41,11 +41,28 @@ class Settings(BaseSettings):
     log_dir: str = "logs"
 
     order_notional_usd: float = 25
+    order_type: str = "market"
+    time_in_force: str = "gtc"
+    limit_price_offset_bps: float = 2
     max_position_notional_usd: float = 100
     max_total_exposure_usd: float = 100
     max_daily_loss_usd: float = 20
     max_drawdown_pct: float = 0.05
     max_open_positions: int = 1
+
+    scalping_mode_enabled: bool = False
+    max_spread_bps: float = 8
+    max_slippage_bps: float = 10
+    min_quote_imbalance: float = -0.25
+    max_trades_per_hour: int = 10
+    max_daily_trades: int = 30
+    max_consecutive_losses: int = 3
+    min_seconds_between_trades: int = 30
+
+    taker_fee_bps: float = 25
+    maker_fee_bps: float = 15
+    slippage_bps: float = 10
+    backtest_use_taker_fees: bool = True
 
     min_buy_probability: float = 0.58
     min_sell_probability: float = 0.55
@@ -71,6 +88,29 @@ class Settings(BaseSettings):
     def symbol_must_be_btc_usd(cls, value: str) -> str:
         if value != ALLOWED_SYMBOL:
             raise ValueError("This project is hard-limited to BTC/USD only.")
+        return value
+
+    @field_validator("order_type")
+    @classmethod
+    def order_type_must_be_supported(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"market", "limit"}:
+            raise ValueError("ORDER_TYPE must be market or limit.")
+        return normalized
+
+    @field_validator("time_in_force")
+    @classmethod
+    def time_in_force_must_be_supported(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"gtc", "ioc"}:
+            raise ValueError("TIME_IN_FORCE must be gtc or ioc.")
+        return normalized
+
+    @field_validator("taker_fee_bps", "maker_fee_bps", "slippage_bps")
+    @classmethod
+    def backtest_cost_bps_must_be_non_negative(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("Backtest fee and slippage bps values must be non-negative.")
         return value
 
     @model_validator(mode="after")

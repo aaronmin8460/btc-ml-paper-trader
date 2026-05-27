@@ -52,6 +52,9 @@ class FakeBroker:
         self.events.append("submit_order")
         return self.order_response
 
+    async def submit_order(self, **kwargs):
+        return await self.submit_market_order(**kwargs)
+
 
 class FakeNotifier:
     def __init__(self, events: list[str] | None = None, fail: bool = False) -> None:
@@ -77,6 +80,12 @@ class FakeNotifier:
         self.events.append("error_alert")
         self.calls.append(("error", args))
 
+    async def risk_alert(self, *args):
+        if self.fail:
+            raise RuntimeError("discord failed")
+        self.events.append("risk_alert")
+        self.calls.append(("risk", args))
+
 
 class RaisingNotifier:
     async def signal_alert(self, *args):
@@ -87,6 +96,9 @@ class RaisingNotifier:
 
     async def error_alert(self, *args):
         raise AssertionError("Discord error alert should not be called")
+
+    async def risk_alert(self, *args):
+        raise AssertionError("Discord risk alert should not be called")
 
 
 class FakeSession:
@@ -100,6 +112,7 @@ class FakeSession:
 class FakeRepository:
     signals = []
     orders = []
+    trade_frequency = None
 
     def __init__(self, db) -> None:
         pass
@@ -108,12 +121,16 @@ class FakeRepository:
     def reset(cls) -> None:
         cls.signals = []
         cls.orders = []
+        cls.trade_frequency = None
 
     def add_signal(self, *args) -> None:
         self.signals.append(args)
 
     def add_order(self, **kwargs) -> None:
         self.orders.append(kwargs)
+
+    def trade_frequency_state(self):
+        return self.trade_frequency
 
 
 @pytest.fixture
@@ -125,8 +142,10 @@ def trader_factory(monkeypatch):
         notifier=None,
         events: list[str] | None = None,
         market_error: Exception | None = None,
+        trade_frequency=None,
     ) -> Trader:
         FakeRepository.reset()
+        FakeRepository.trade_frequency = trade_frequency
         monkeypatch.setattr("app.services.trader.init_db", lambda: None)
         monkeypatch.setattr("app.services.trader.SessionLocal", FakeSession)
         monkeypatch.setattr("app.services.trader.Repository", FakeRepository)
@@ -243,6 +262,27 @@ async def test_error_alert_called_when_run_once_raises(trader_factory):
     assert args[0] == "trader.run_once"
     assert isinstance(args[1], RuntimeError)
     assert str(args[1]) == "market data failed"
+
+
+@pytest.mark.anyio
+async def test_kill_switch_block_sends_risk_alert(trader_factory):
+    settings = Settings(
+        _env_file=None,
+        discord_alerts_enabled=True,
+        discord_webhook_url="https://discord.example/webhook",
+        discord_alert_on_signal=True,
+        discord_alert_on_hold=False,
+    )
+    notifier = FakeNotifier()
+    trader = trader_factory(
+        settings=settings,
+        decision=Decision("BTC/USD", "hold", "max_trades_per_hour_reached"),
+        notifier=notifier,
+    )
+
+    await trader.run_once()
+
+    assert notifier.calls == [("risk", ("max_trades_per_hour_reached",))]
 
 
 @pytest.mark.anyio

@@ -84,6 +84,9 @@ class DiscordNotifier:
         error_type = type(error).__name__ if isinstance(error, Exception) else "Error"
         await self.send(f"Error in {where}: {error_type}: {error}")
 
+    async def risk_alert(self, reason: str) -> None:
+        await self.send(f"Risk block: {reason}")
+
     async def model_alert(
         self,
         model_path: str,

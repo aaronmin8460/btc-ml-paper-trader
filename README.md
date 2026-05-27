@@ -17,9 +17,10 @@ SYMBOL=BTC/USD
 
 There is no live-trading switch. The Alpaca broker client uses only the paper API base URL and hard-validates every order request before submission.
 
-## Setup
+## Local setup
 
 ```bash
+git clone https://github.com/aaronmin8460/btc-ml-paper-trader.git
 cd btc-ml-paper-trader
 python3.12 -m venv .venv
 source .venv/bin/activate
@@ -28,6 +29,262 @@ cp .env.example .env
 ```
 
 Add Alpaca paper credentials to `.env` if you want real paper account data or paper orders. Without credentials, the bot can still train and produce signals using deterministic synthetic BTC-like bars for local development.
+
+Keep these defaults for local safety:
+
+```env
+PAPER_TRADING_ONLY=true
+TRADING_ENABLED=false
+AUTO_TRADE_ENABLED=false
+SYMBOL=BTC/USD
+```
+
+## Local dry-run
+
+Run one BTC/USD decision locally without submitting an order:
+
+```bash
+source .venv/bin/activate
+TRADING_ENABLED=false AUTO_TRADE_ENABLED=false python scripts/run_once.py
+```
+
+With `TRADING_ENABLED=false`, the bot fetches or synthesizes BTC/USD data, produces a signal, and does not submit a paper order.
+
+## Local API run
+
+Start the FastAPI server locally:
+
+```bash
+source .venv/bin/activate
+APP_ENV=development PORT=8000 API_ADMIN_TOKEN=replace-with-a-local-token python scripts/run_api.py
+```
+
+Check the local health endpoint:
+
+```bash
+curl -sS http://localhost:8000/health
+```
+
+Run one protected API decision locally:
+
+```bash
+curl -sS -X POST http://localhost:8000/run-once \
+  -H 'X-Admin-Token: replace-with-a-local-token'
+```
+
+## Discord webhook setup
+
+Discord alerts are optional. The app runs with no Discord environment variables configured.
+
+1. In Discord, create a webhook for the channel that should receive bot alerts.
+2. Copy the webhook URL.
+3. Store it only in your local `.env` or Railway environment variables.
+4. Never commit the webhook URL.
+
+Local Discord alert configuration:
+
+```env
+DISCORD_WEBHOOK_URL=replace-with-your-discord-webhook-url
+DISCORD_ALERTS_ENABLED=true
+DISCORD_ALERT_ON_HOLD=false
+DISCORD_ALERT_ON_SIGNAL=true
+DISCORD_ALERT_ON_ORDER=true
+DISCORD_ALERT_ON_ERROR=true
+DISCORD_ALERT_ON_MODEL=false
+```
+
+Send a local test alert after starting the API:
+
+```bash
+curl -sS -X POST http://localhost:8000/alerts/discord/test \
+  -H 'X-Admin-Token: replace-with-a-local-token'
+```
+
+If Discord is disabled, the endpoint returns:
+
+```json
+{"sent":false,"reason":"discord_disabled"}
+```
+
+## Railway deployment
+
+This FastAPI server is deployable on Railway with the included `railway.toml`.
+
+Railway should use Nixpacks and start the app with:
+
+```bash
+python scripts/run_api.py
+```
+
+The server binds to `0.0.0.0` and reads Railway's `PORT` environment variable. In production, set `APP_ENV=production` so reload stays disabled.
+
+Recommended Railway steps:
+
+1. Create a new Railway project from this GitHub repository.
+2. Add the environment variables from the sections below.
+3. Attach a Railway Volume if using SQLite persistence.
+4. Deploy with exactly one replica.
+5. Verify `/health`.
+6. Test Discord alerts.
+7. Run `/run-once` manually before enabling automatic paper trading.
+
+## Railway environment variables
+
+Use Railway's Variables UI. Values below are examples or placeholders; do not paste real keys into the README or commit them to git.
+
+Minimum safe deployment:
+
+```env
+APP_ENV=production
+PAPER_TRADING_ONLY=true
+TRADING_ENABLED=false
+AUTO_TRADE_ENABLED=false
+SYMBOL=BTC/USD
+API_ADMIN_TOKEN=replace-with-a-long-random-secret
+ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+```
+
+Add Alpaca paper credentials only as Railway variables:
+
+```env
+ALPACA_API_KEY=replace-with-your-alpaca-paper-key
+ALPACA_SECRET_KEY=replace-with-your-alpaca-paper-secret
+```
+
+Optional Discord variables:
+
+```env
+DISCORD_WEBHOOK_URL=replace-with-your-discord-webhook-url
+DISCORD_ALERTS_ENABLED=true
+DISCORD_ALERT_ON_HOLD=false
+DISCORD_ALERT_ON_SIGNAL=true
+DISCORD_ALERT_ON_ORDER=true
+DISCORD_ALERT_ON_ERROR=true
+DISCORD_ALERT_ON_MODEL=false
+```
+
+Recommended BTC/USD scalping paper-trading variables:
+
+```env
+TIMEFRAME=1Min
+LOOKBACK_BARS=1500
+SCAN_INTERVAL_SECONDS=5
+ORDER_NOTIONAL_USD=10
+STOP_LOSS_PCT=0.0025
+TAKE_PROFIT_PCT=0.006
+TRAILING_STOP_PCT=0.003
+MAX_HOLDING_MINUTES=15
+```
+
+## Railway Volume setup for SQLite persistence
+
+Local development can use SQLite at the default path:
+
+```env
+DATABASE_URL=sqlite:///./data/trading.db
+```
+
+For Railway SQLite persistence:
+
+1. Add a Railway Volume to the service.
+2. Mount it at `/data`.
+3. Set these Railway variables:
+
+```env
+DATABASE_URL=sqlite:////data/trading.db
+MODEL_DIR=/data/models
+LOG_DIR=/data/logs
+```
+
+PostgreSQL can be used later for production analytics, but it is not required for the paper-trading deployment:
+
+```env
+DATABASE_URL=postgresql+psycopg://replace-with-user:replace-with-password@replace-with-host:5432/replace-with-database
+```
+
+## Safe first deployment
+
+Deploy first with trading and automatic scheduling disabled:
+
+```env
+TRADING_ENABLED=false
+AUTO_TRADE_ENABLED=false
+```
+
+This lets you verify health, config masking, Discord alerts, and one manual `/run-once` without submitting paper orders.
+
+## Testing deployed server
+
+Set your Railway URL and admin token in your shell:
+
+```bash
+export API_URL="https://replace-with-your-railway-domain"
+export ADMIN_TOKEN="replace-with-your-api-admin-token"
+```
+
+Health check:
+
+```bash
+curl -sS "$API_URL/health"
+```
+
+Safe config check. This must not expose Alpaca keys, the admin token, or the Discord webhook URL:
+
+```bash
+curl -sS "$API_URL/config/safe"
+```
+
+Discord test alert:
+
+```bash
+curl -sS -X POST "$API_URL/alerts/discord/test" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Manual run-once test:
+
+```bash
+curl -sS -X POST "$API_URL/run-once" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Expected safety signals:
+
+- `/health` returns `status: ok`, `paper_trading_only: true`, and `symbol: BTC/USD`.
+- `/config/safe` masks secrets with `***`.
+- `/alerts/discord/test` returns either `{"sent":true}` or `{"sent":false,"reason":"discord_disabled"}`.
+- `/run-once` returns a BTC/USD decision. With `TRADING_ENABLED=false`, `order` should be `null`.
+
+## Enabling automatic paper trading
+
+After the safe first deployment succeeds, enable paper trading and the in-process scheduler:
+
+```env
+TRADING_ENABLED=true
+AUTO_TRADE_ENABLED=true
+```
+
+Keep these safety variables unchanged:
+
+```env
+PAPER_TRADING_ONLY=true
+SYMBOL=BTC/USD
+ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
+```
+
+Redeploy after changing Railway variables. The scheduler runs every `SCAN_INTERVAL_SECONDS` and calls `Trader.run_once()`.
+
+## Important safety warnings
+
+- Use one Railway replica only. The app has an in-process scheduler, and multiple replicas can duplicate scans.
+- Keep `API_ADMIN_TOKEN` secret.
+- Never commit Alpaca keys.
+- Never commit the Discord webhook URL.
+- This project is paper-trading-only.
+- This project is BTC/USD-only.
+- This project is long-only.
+- Do not add live trading, short selling, margin trading, or multi-symbol trading.
 
 ## BTC-Only Enforcement
 
@@ -66,107 +323,47 @@ The trainer builds leakage-safe OHLCV features, applies triple-barrier labels, r
 
 Feature columns are tracked and saved with the model. Random train/test splits are avoided; validation is walk-forward.
 
-## Run Once
+## Order Execution
 
-```bash
-python scripts/run_once.py
-```
-
-With `TRADING_ENABLED=false`, this produces a BTC/USD signal and does not submit a paper order.
-
-To allow a manual paper order through the API, set:
+Orders default to market/GTC paper orders:
 
 ```env
-TRADING_ENABLED=true
-AUTO_TRADE_ENABLED=false
-API_ADMIN_TOKEN=change-me
+ORDER_TYPE=market
+TIME_IN_FORCE=gtc
+LIMIT_PRICE_OFFSET_BPS=2
 ```
 
-Then call:
+Optional limit/IOC paper orders can be enabled with `ORDER_TYPE=limit` and `TIME_IN_FORCE=ioc`. Limit prices are derived from the latest BTC/USD quote with `LIMIT_PRICE_OFFSET_BPS`; if a valid quote is unavailable, the order is blocked instead of falling back to market execution.
 
-```bash
-python scripts/run_api.py
-curl -X POST http://localhost:8000/run-once -H 'X-Admin-Token: change-me'
-```
+## Scalping Configuration
 
-Only BTC/USD paper market orders can pass the broker guard.
+Scalping mode is a configuration profile for faster BTC/USD paper-trading experiments. It is disabled by default and these settings are not yet enforced in strategy logic; they are available for a later risk/strategy phase without changing the current trading behavior.
 
-## Automatic Paper Trading
-
-Set:
+Recommended paper-trading settings for a scalping experiment:
 
 ```env
-TRADING_ENABLED=true
-AUTO_TRADE_ENABLED=true
-API_ADMIN_TOKEN=change-me
+SCALPING_MODE_ENABLED=true
+TIMEFRAME=1Min
+LOOKBACK_BARS=1500
+SCAN_INTERVAL_SECONDS=5
+ORDER_NOTIONAL_USD=10
+STOP_LOSS_PCT=0.0025
+TAKE_PROFIT_PCT=0.006
+TRAILING_STOP_PCT=0.003
+MAX_HOLDING_MINUTES=15
 ```
 
-Start the API:
-
-```bash
-python scripts/run_api.py
-```
-
-The in-process scheduler runs every `SCAN_INTERVAL_SECONDS`, catches exceptions, logs runtime errors, and calls `Trader.run_once()`.
-
-## Railway Deployment
-
-This FastAPI server can be deployed to Railway or a similar platform with the included `railway.toml`. Railway should use Nixpacks automatically and start the app with:
-
-```bash
-python scripts/run_api.py
-```
-
-The server binds to `0.0.0.0` and reads the platform-provided `PORT` environment variable. Local development still defaults to port `8000`.
-
-Local development can use the default SQLite database:
+The scalping guard configuration is intentionally conservative by default:
 
 ```env
-DATABASE_URL=sqlite:///./data/trading.db
+MAX_SPREAD_BPS=8
+MAX_SLIPPAGE_BPS=10
+MIN_QUOTE_IMBALANCE=-0.25
+MAX_TRADES_PER_HOUR=10
+MAX_DAILY_TRADES=30
+MAX_CONSECUTIVE_LOSSES=3
+MIN_SECONDS_BETWEEN_TRADES=30
 ```
-
-Recommended Railway steps:
-
-1. Create a new Railway project from this GitHub repository.
-2. Add the required environment variables in Railway.
-3. Deploy with one replica/instance only.
-4. Confirm the health check at `/health`.
-
-Required environment variables for deployment:
-
-```env
-APP_ENV=production
-PAPER_TRADING_ONLY=true
-TRADING_ENABLED=false
-AUTO_TRADE_ENABLED=false
-SYMBOL=BTC/USD
-API_ADMIN_TOKEN=change-me
-```
-
-Add Alpaca paper credentials only if you want the deployment to read real paper account data or submit paper orders:
-
-```env
-ALPACA_API_KEY=...
-ALPACA_SECRET_KEY=...
-ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
-ALPACA_DATA_BASE_URL=https://data.alpaca.markets
-```
-
-For SQLite on Railway, attach a Railway Volume mounted at `/data` and use:
-
-```env
-DATABASE_URL=sqlite:////data/trading.db
-MODEL_DIR=/data/models
-LOG_DIR=/data/logs
-```
-
-Future production analytics can use PostgreSQL with SQLAlchemy's psycopg driver, for example:
-
-```env
-DATABASE_URL=postgresql+psycopg://user:password@host:5432/database
-```
-
-Keep `PAPER_TRADING_ONLY=true` and `SYMBOL=BTC/USD`. The app rejects live trading URLs, non-BTC/USD symbols, and configurations with more than one open position. Do not run more than one Railway replica/instance: automatic paper trading uses an in-process scheduler, so multiple instances could run duplicate scans.
 
 ## API
 
@@ -175,9 +372,11 @@ Keep `PAPER_TRADING_ONLY=true` and `SYMBOL=BTC/USD`. The app rejects live tradin
 - `GET /position`
 - `GET /signals/latest`
 - `GET /orders`
+- `GET /debug/latest-bars`
 - `POST /run-once`
 - `POST /auto/start`
 - `POST /auto/stop`
+- `POST /alerts/discord/test`
 - `POST /train`
 - `POST /backtest`
 
@@ -236,6 +435,17 @@ The script fetches or synthesizes BTC/USD bars, builds features and labels, runs
 logs/backtest_report.json
 ```
 
+Backtest cost assumptions are configurable:
+
+```env
+TAKER_FEE_BPS=25
+MAKER_FEE_BPS=15
+SLIPPAGE_BPS=10
+BACKTEST_USE_TAKER_FEES=true
+```
+
+The report separates gross and net return metrics. Net metrics subtract configured round-trip fees, configured round-trip slippage, and available `orderbook_spread` costs; if there is not enough validation data, the report returns a clear reason instead of profitability metrics.
+
 ## Logs
 
 Structured JSONL events are written to:
@@ -253,4 +463,3 @@ pytest
 ```
 
 Coverage focuses on BTC-only enforcement, long-only behavior, safe defaults, feature generation, leakage resistance, model training output, decision thresholds, and risk blocks.
-# btc-ml-paper-trader

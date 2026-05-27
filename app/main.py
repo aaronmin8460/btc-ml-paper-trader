@@ -20,6 +20,10 @@ def serialize_model(row) -> dict:
     return {key: value for key, value in row.__dict__.items() if not key.startswith("_")}
 
 
+def serialize_timestamp(value) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
 def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
     token = settings.api_admin_token
     if not token or x_admin_token != token:
@@ -66,6 +70,23 @@ async def orders() -> list[dict]:
 @app.post("/run-once", dependencies=[Depends(require_admin)])
 async def run_once() -> dict:
     return await trader.run_once()
+
+
+@app.get("/debug/latest-bars", dependencies=[Depends(require_admin)])
+async def debug_latest_bars() -> dict:
+    bars = await MarketDataClient(settings).fetch_bars(settings.symbol)
+    first_timestamp = bars["timestamp"].iloc[0] if not bars.empty else None
+    latest_timestamp = bars["timestamp"].iloc[-1] if not bars.empty else None
+    latest_close = float(bars["close"].iloc[-1]) if not bars.empty else None
+    return {
+        "symbol": settings.symbol,
+        "timeframe": settings.timeframe,
+        "count": len(bars),
+        "first_timestamp": serialize_timestamp(first_timestamp),
+        "latest_timestamp": serialize_timestamp(latest_timestamp),
+        "current_utc_time": iso_utc_now(),
+        "latest_close": latest_close,
+    }
 
 
 @app.post("/auto/start", dependencies=[Depends(require_admin)])

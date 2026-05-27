@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -27,6 +28,43 @@ def test_discord_settings_are_disabled_by_default(monkeypatch):
     assert settings.discord_alert_on_order is True
     assert settings.discord_alert_on_error is True
     assert settings.discord_alert_on_model is False
+
+
+def test_scalping_settings_load_conservative_defaults():
+    settings = Settings(_env_file=None)
+
+    assert settings.order_type == "market"
+    assert settings.time_in_force == "gtc"
+    assert settings.limit_price_offset_bps == 2
+    assert settings.scalping_mode_enabled is False
+    assert settings.max_spread_bps == 8
+    assert settings.max_slippage_bps == 10
+    assert settings.min_quote_imbalance == -0.25
+    assert settings.max_trades_per_hour == 10
+    assert settings.max_daily_trades == 30
+    assert settings.max_consecutive_losses == 3
+    assert settings.min_seconds_between_trades == 30
+    assert settings.taker_fee_bps == 25
+    assert settings.maker_fee_bps == 15
+    assert settings.slippage_bps == 10
+    assert settings.backtest_use_taker_fees is True
+
+
+def test_config_still_rejects_unsafe_symbol_and_non_paper_mode():
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, symbol="ETH/USD")
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, paper_trading_only=False)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, order_type="stop")
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, time_in_force="day")
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, taker_fee_bps=-1)
 
 
 def test_safe_dict_masks_discord_webhook_url():

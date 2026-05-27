@@ -6,7 +6,7 @@ import pandas as pd
 from app.broker.execution_guard import assert_btc_only
 from app.config import ALLOWED_SYMBOL, Settings, get_settings
 from app.risk.position_sizer import fixed_notional
-from app.risk.risk_manager import PositionState, RiskManager
+from app.risk.risk_manager import PositionState, RiskManager, TradeFrequencyState
 from app.strategy.rule_filter import RuleFilter
 from app.utils.time import utc_now
 
@@ -28,7 +28,15 @@ class DecisionEngine:
         self.risk = RiskManager(self.settings)
         self.rules = RuleFilter(self.settings)
 
-    def decide(self, *, prediction: dict, feature_row: pd.Series, position: PositionState, trading_enabled: bool | None = None) -> Decision:
+    def decide(
+        self,
+        *,
+        prediction: dict,
+        feature_row: pd.Series,
+        position: PositionState,
+        trading_enabled: bool | None = None,
+        trade_frequency: TradeFrequencyState | None = None,
+    ) -> Decision:
         symbol = prediction.get("symbol", ALLOWED_SYMBOL)
         assert_btc_only(symbol, context="strategy_decision")
         buy_probability = float(prediction["buy_probability"])
@@ -54,7 +62,12 @@ class DecisionEngine:
             if not allowed:
                 return Decision(symbol, "hold", rule_reason)
             notional = fixed_notional(self.settings)
-            approved, risk_reason = self.risk.approve_buy(notional=notional, position=position, latest_price=latest_price)
+            approved, risk_reason = self.risk.approve_buy(
+                notional=notional,
+                position=position,
+                latest_price=latest_price,
+                trade_frequency=trade_frequency,
+            )
             if not approved:
                 return Decision(symbol, "hold", risk_reason)
             if trading_enabled is False:

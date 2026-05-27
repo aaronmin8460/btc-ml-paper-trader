@@ -13,6 +13,14 @@ from app.risk.risk_manager import PositionState
 from app.strategy.decision_engine import Decision, DecisionEngine
 
 
+KILL_SWITCH_REASONS = {
+    "max_trades_per_hour_reached",
+    "max_daily_trades_reached",
+    "max_consecutive_losses_reached",
+    "trade_cooldown_active",
+}
+
+
 class Trader:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -46,23 +54,26 @@ class Trader:
             prediction = self.predictor.predict(bars, quote=quote)
             feature_row = latest_feature_row(bars, quote=quote).iloc[-1]
             position = await self.get_position_state()
-            decision = self.decision_engine.decide(
-                prediction=prediction,
-                feature_row=feature_row,
-                position=position,
-                trading_enabled=self.settings.trading_enabled,
-            )
-            self.logger.event(
-                "signal",
-                symbol=decision.symbol,
-                action=decision.action,
-                reason=decision.reason,
-                buy_probability=prediction["buy_probability"],
-                sell_probability=prediction["sell_probability"],
-            )
-            await self._send_signal_alert(decision, prediction)
             with SessionLocal() as db:
                 repo = Repository(db)
+                trade_frequency = repo.trade_frequency_state()
+                decision = self.decision_engine.decide(
+                    prediction=prediction,
+                    feature_row=feature_row,
+                    position=position,
+                    trading_enabled=self.settings.trading_enabled,
+                    trade_frequency=trade_frequency,
+                )
+                self.logger.event(
+                    "signal",
+                    symbol=decision.symbol,
+                    action=decision.action,
+                    reason=decision.reason,
+                    buy_probability=prediction["buy_probability"],
+                    sell_probability=prediction["sell_probability"],
+                )
+                await self._send_signal_alert(decision, prediction)
+                await self._send_risk_alert(decision)
                 repo.add_signal(
                     decision.action,
                     prediction["buy_probability"],
@@ -71,12 +82,14 @@ class Trader:
                 )
                 order_response = None
                 if decision.action in {"buy", "sell"}:
-                    order_response = await self.broker.submit_market_order(
+                    order_response = await self.broker.submit_order(
                         symbol=decision.symbol,
                         side=decision.action,
                         notional=decision.notional,
                         qty=decision.qty,
                         current_position_qty=position.qty,
+                        quote=quote,
+                        latest_price=float(feature_row["close"]),
                     )
                     await self._send_order_alert(decision, order_response)
                     repo.add_order(
@@ -132,6 +145,16 @@ class Trader:
             await self.notifier.error_alert(where, error)
         except Exception as exc:
             self._log_discord_alert_failure("error", exc)
+
+    async def _send_risk_alert(self, decision: Decision) -> None:
+        if decision.action != "hold" or decision.reason not in KILL_SWITCH_REASONS:
+            return
+        if not self._discord_alerts_enabled():
+            return
+        try:
+            await self.notifier.risk_alert(decision.reason)
+        except Exception as exc:
+            self._log_discord_alert_failure("risk", exc)
 
     def _log_discord_alert_failure(self, alert_type: str, error: Exception) -> None:
         try:

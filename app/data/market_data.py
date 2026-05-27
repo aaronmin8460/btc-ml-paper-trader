@@ -1,3 +1,5 @@
+import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -8,6 +10,116 @@ import pandas as pd
 
 from app.broker.execution_guard import assert_btc_only
 from app.config import ALLOWED_SYMBOL, Settings, get_settings
+
+
+MAX_ALPACA_BARS_PER_REQUEST = 10_000
+TIMEFRAME_PATTERN = re.compile(r"^(?P<count>\d+)\s*(?P<unit>min|hour|day)s?$", re.IGNORECASE)
+
+
+class StaleMarketDataError(RuntimeError):
+    pass
+
+
+def parse_timeframe_duration(timeframe: str) -> timedelta:
+    normalized = timeframe.strip().strip("\"'")
+    match = TIMEFRAME_PATTERN.fullmatch(normalized)
+    if not match:
+        raise ValueError(f"Unsupported timeframe: {timeframe!r}")
+
+    count = int(match.group("count"))
+    if count <= 0:
+        raise ValueError(f"Unsupported timeframe: {timeframe!r}")
+
+    unit = match.group("unit").lower()
+    if unit == "min":
+        return timedelta(minutes=count)
+    if unit == "hour":
+        return timedelta(hours=count)
+    if unit == "day":
+        return timedelta(days=count)
+    raise ValueError(f"Unsupported timeframe: {timeframe!r}")
+
+
+def stale_threshold_for_timeframe(timeframe: str) -> timedelta:
+    duration = parse_timeframe_duration(timeframe)
+    if duration < timedelta(hours=1):
+        return max(timedelta(minutes=10), duration * 2)
+    if duration < timedelta(days=1):
+        return max(timedelta(hours=3), duration * 2)
+    return timedelta(days=2)
+
+
+def request_limit_with_buffer(desired_limit: int) -> int:
+    if desired_limit <= 0:
+        raise ValueError("limit must be positive")
+    buffer_bars = max(5, min(100, int(desired_limit * 0.10)))
+    return min(desired_limit + buffer_bars, MAX_ALPACA_BARS_PER_REQUEST)
+
+
+def calculate_request_start(end: datetime, timeframe: str, desired_limit: int) -> datetime:
+    return end - (parse_timeframe_duration(timeframe) * request_limit_with_buffer(desired_limit))
+
+
+def validate_bars_are_fresh(bars: pd.DataFrame, timeframe: str, *, now: datetime | None = None) -> None:
+    current_time = pd.Timestamp(now or datetime.now(UTC))
+    if current_time.tzinfo is None:
+        current_time = current_time.tz_localize("UTC")
+    else:
+        current_time = current_time.tz_convert("UTC")
+
+    if bars.empty:
+        raise StaleMarketDataError(
+            "No Alpaca bars fetched; "
+            f"latest_timestamp=None current_utc_time={current_time.isoformat()} "
+            f"timeframe={timeframe} bars_fetched=0"
+        )
+
+    latest_timestamp = pd.Timestamp(bars["timestamp"].iloc[-1])
+    if latest_timestamp.tzinfo is None:
+        latest_timestamp = latest_timestamp.tz_localize("UTC")
+    else:
+        latest_timestamp = latest_timestamp.tz_convert("UTC")
+
+    if current_time - latest_timestamp > stale_threshold_for_timeframe(timeframe):
+        raise StaleMarketDataError(
+            "Latest Alpaca bar is stale; "
+            f"latest_timestamp={latest_timestamp.isoformat()} "
+            f"current_utc_time={current_time.isoformat()} "
+            f"timeframe={timeframe} bars_fetched={len(bars)}"
+        )
+
+
+def _timestamp_to_iso(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    return pd.Timestamp(value).isoformat()
+
+
+def _log_bars_fetched(
+    *,
+    symbol: str,
+    timeframe: str,
+    requested_start: datetime | None,
+    requested_end: datetime | None,
+    desired_limit: int,
+    bars: pd.DataFrame,
+) -> None:
+    payload = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "requested_start": requested_start.isoformat() if requested_start else None,
+        "requested_end": requested_end.isoformat() if requested_end else None,
+        "desired_limit": desired_limit,
+        "actual_bars_fetched": len(bars),
+        "first_timestamp": _timestamp_to_iso(bars["timestamp"].iloc[0]) if not bars.empty else None,
+        "latest_timestamp": _timestamp_to_iso(bars["timestamp"].iloc[-1]) if not bars.empty else None,
+    }
+    try:
+        from app.monitoring.logger import get_logger
+
+        get_logger().event("market_data_bars_fetched", **payload)
+    except Exception:
+        print(json.dumps({"event_type": "market_data_bars_fetched", **payload}, separators=(",", ":")))
 
 
 class MarketDataClient:
@@ -30,16 +142,17 @@ class MarketDataClient:
     ) -> pd.DataFrame:
         assert_btc_only(symbol, context="market_data_fetch_bars")
         timeframe = timeframe or self.settings.timeframe
-        limit = limit or self.settings.lookback_bars
+        desired_limit = self.settings.lookback_bars if limit is None else limit
+        request_limit = request_limit_with_buffer(desired_limit)
         if self.settings.alpaca_api_key and self.settings.alpaca_secret_key:
             end = datetime.now(UTC)
-            start = end - timedelta(days=max(10, int(limit * 20 / 24)))
+            start = end - (parse_timeframe_duration(timeframe) * request_limit)
             params = {
                 "symbols": symbol,
                 "timeframe": timeframe,
                 "start": start.isoformat(),
                 "end": end.isoformat(),
-                "limit": limit,
+                "limit": request_limit,
             }
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(
@@ -49,8 +162,27 @@ class MarketDataClient:
                 )
                 response.raise_for_status()
                 data = response.json().get("bars", {}).get(symbol, [])
-                return self._bars_to_frame(data)
-        return self.synthetic_btc_bars(limit=max(limit, self.settings.min_training_rows + 80))
+                fetched_bars = self._bars_to_frame(data)
+                _log_bars_fetched(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    requested_start=start,
+                    requested_end=end,
+                    desired_limit=desired_limit,
+                    bars=fetched_bars,
+                )
+                validate_bars_are_fresh(fetched_bars, timeframe)
+                return fetched_bars.tail(desired_limit).reset_index(drop=True)
+        bars = self.synthetic_btc_bars(limit=desired_limit)
+        _log_bars_fetched(
+            symbol=symbol,
+            timeframe=timeframe,
+            requested_start=None,
+            requested_end=None,
+            desired_limit=desired_limit,
+            bars=bars,
+        )
+        return bars
 
     async def fetch_latest_quote(self, symbol: str = ALLOWED_SYMBOL) -> dict[str, Any]:
         assert_btc_only(symbol, context="market_data_fetch_latest_quote")

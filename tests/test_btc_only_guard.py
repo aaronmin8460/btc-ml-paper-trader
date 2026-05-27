@@ -16,7 +16,7 @@ def test_btc_only_guard_allows_btc_usd():
 
 def test_config_rejects_non_btc_symbol():
     with pytest.raises(ValueError):
-        Settings(symbol="ETH/USD")
+        Settings(_env_file=None, symbol="ETH/USD")
 
 
 def test_sell_cannot_happen_without_position():
@@ -25,7 +25,7 @@ def test_sell_cannot_happen_without_position():
 
 
 def test_env_defaults_are_safe():
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.trading_enabled is False
     assert settings.auto_trade_enabled is False
     assert settings.paper_trading_only is True
