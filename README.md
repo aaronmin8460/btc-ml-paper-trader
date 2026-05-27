@@ -81,6 +81,8 @@ Discord alerts are optional. The app runs with no Discord environment variables 
 3. Store it only in your local `.env` or Railway environment variables.
 4. Never commit the webhook URL.
 
+Alerts are sent as rich Discord embeds for signals, paper orders, risk guards, runtime errors, model validation, and the `/alerts/discord/test` endpoint. The legacy plain text sender remains available internally for compatibility. Mention parsing is disabled in webhook payloads so bot alerts cannot ping users or roles.
+
 Local Discord alert configuration:
 
 ```env
@@ -481,6 +483,12 @@ cd frontend
 npm run dev
 ```
 
+Open the Vite dashboard at:
+
+```text
+http://localhost:5173/dashboard-ui/
+```
+
 By default, the frontend calls the same origin. During local Vite development, `vite.config.ts` proxies API paths to `http://localhost:8000`, so `VITE_API_BASE_URL` can be left unset.
 
 To point the dashboard at a deployed API, set `VITE_API_BASE_URL`:
@@ -497,6 +505,51 @@ cd frontend
 npm run build
 ```
 
+The production build writes static files to:
+
+```text
+frontend/dist
+```
+
+When `frontend/dist/index.html` exists, FastAPI serves the built dashboard at:
+
+```text
+http://YOUR_API_HOST:8000/dashboard-ui
+```
+
+If `frontend/dist` is missing, the backend still starts normally and all API routes continue to work. This keeps local backend development independent from the frontend build.
+
+AWS/Lightsail production flow:
+
+```bash
+cd ~/btc-ml-paper-trader
+git pull
+
+cd frontend
+npm install
+npm run build
+
+cd ..
+sudo docker compose up -d --build --force-recreate
+```
+
+The Docker build copies the repository into the image. If `frontend/dist` exists before `docker compose up --build`, FastAPI can serve it from `/dashboard-ui`. `frontend/node_modules` is ignored by Docker and Git.
+
+Required backend environment variables are still the normal paper-trading settings:
+
+```env
+APP_ENV=production
+PAPER_TRADING_ONLY=true
+API_ADMIN_TOKEN=replace-with-a-long-random-secret
+ALPACA_API_KEY=replace-with-your-alpaca-paper-key
+ALPACA_SECRET_KEY=replace-with-your-alpaca-paper-secret
+ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+SYMBOL=BTC/USD
+```
+
+The dashboard static files do not contain the admin token. Users enter `API_ADMIN_TOKEN` in the private access screen; protected API requests send it as `X-Admin-Token`.
+
 Admin token login:
 
 - The dashboard first shows a private access screen.
@@ -504,6 +557,7 @@ Admin token login:
 - The token is stored only in `sessionStorage`, not `localStorage`.
 - The token is cleared when you click logout or close the browser tab/session.
 - Do not expose the admin token in public frontend config, screenshots, logs, or browser bundles.
+- In production, protect the server with HTTPS and restrict port `8000` to trusted IPs or place it behind a reverse proxy such as Nginx/Caddy.
 
 If dashboard API data is missing, charts and tables show empty states instead of fake performance data.
 

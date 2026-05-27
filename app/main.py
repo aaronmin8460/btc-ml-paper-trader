@@ -166,17 +166,18 @@ async def test_discord_alert() -> dict:
     if not notifier.enabled:
         return {"sent": False, "reason": "discord_disabled"}
 
-    message = "\n".join(
-        [
-            "Discord test alert",
-            "App: btc-ml-paper-trader",
-            f"Environment: {settings.app_env}",
-            f"Symbol: {settings.symbol}",
-            f"Paper trading only: {settings.paper_trading_only}",
-            f"Timestamp: {iso_utc_now()}",
-        ]
+    await notifier.send_embed(
+        title="Discord Test Alert",
+        fields=[
+            {"name": "App", "value": "btc-ml-paper-trader", "inline": True},
+            {"name": "Environment", "value": settings.app_env, "inline": True},
+            {"name": "Symbol", "value": settings.symbol, "inline": True},
+            {"name": "Paper Trading Only", "value": str(settings.paper_trading_only), "inline": True},
+            {"name": "Timestamp", "value": iso_utc_now(), "inline": False},
+        ],
+        color=0xF7931A,
+        footer="BTC/USD paper trading dashboard",
     )
-    await notifier.send(message)
     return {"sent": True}
 
 

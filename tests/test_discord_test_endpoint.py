@@ -10,10 +10,14 @@ class DisabledNotifier:
         self.settings = settings
         self.enabled = False
         self.sent_messages = []
+        self.sent_embeds = []
         self.instances.append(self)
 
     async def send(self, content: str) -> None:
         self.sent_messages.append(content)
+
+    async def send_embed(self, *args, **kwargs) -> None:
+        self.sent_embeds.append((args, kwargs))
 
 
 class EnabledNotifier:
@@ -23,10 +27,14 @@ class EnabledNotifier:
         self.settings = settings
         self.enabled = True
         self.sent_messages = []
+        self.sent_embeds = []
         self.instances.append(self)
 
     async def send(self, content: str) -> None:
         self.sent_messages.append(content)
+
+    async def send_embed(self, *args, **kwargs) -> None:
+        self.sent_embeds.append((args, kwargs))
 
 
 def test_discord_test_endpoint_requires_admin_token(monkeypatch):
@@ -63,6 +71,7 @@ def test_discord_test_endpoint_returns_disabled(monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"sent": False, "reason": "discord_disabled"}
     assert DisabledNotifier.instances[0].sent_messages == []
+    assert DisabledNotifier.instances[0].sent_embeds == []
     assert "webhook-secret" not in response.text
 
 
@@ -87,13 +96,17 @@ def test_discord_test_endpoint_calls_notifier_when_enabled(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"sent": True}
-    sent_messages = EnabledNotifier.instances[0].sent_messages
-    assert len(sent_messages) == 1
-    message = sent_messages[0]
-    assert "App: btc-ml-paper-trader" in message
-    assert "Environment: test" in message
-    assert "Symbol: BTC/USD" in message
-    assert "Paper trading only: True" in message
-    assert "Timestamp:" in message
-    assert "webhook-secret" not in message
+    assert EnabledNotifier.instances[0].sent_messages == []
+    sent_embeds = EnabledNotifier.instances[0].sent_embeds
+    assert len(sent_embeds) == 1
+    args, kwargs = sent_embeds[0]
+    assert args == ()
+    assert kwargs["title"] == "Discord Test Alert"
+    fields = {item["name"]: item["value"] for item in kwargs["fields"]}
+    assert fields["App"] == "btc-ml-paper-trader"
+    assert fields["Environment"] == "test"
+    assert fields["Symbol"] == "BTC/USD"
+    assert fields["Paper Trading Only"] == "True"
+    assert "Timestamp" in fields
+    assert "webhook-secret" not in str(kwargs)
     assert "webhook-secret" not in response.text
