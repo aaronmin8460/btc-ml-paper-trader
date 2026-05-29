@@ -48,6 +48,16 @@ class AccountState:
     paper: bool | None = None
 
 
+@dataclass(frozen=True)
+class ProfitGuardState:
+    profit_guard_enabled: bool
+    min_net_exit_profit_pct: float
+    current_unrealized_pnl_pct: float | None
+    profit_guard_exit_allowed: bool
+    estimated_exit_price: float | None
+    minimum_profitable_exit_price: float | None
+
+
 class RiskManager:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -123,20 +133,24 @@ class RiskManager:
         if not position.has_position:
             return False, "no_position"
         entry = position.avg_entry_price
-        stop_loss_pct = self.settings.scalping_stop_loss_pct if self.settings.scalping_mode_enabled else self.settings.stop_loss_pct
         take_profit_pct = self.settings.scalping_take_profit_pct if self.settings.scalping_mode_enabled else self.settings.take_profit_pct
         trailing_stop_pct = self.settings.scalping_trailing_stop_pct if self.settings.scalping_mode_enabled else self.settings.trailing_stop_pct
-        stop_reason = "scalping_stop_loss" if self.settings.scalping_mode_enabled else "stop_loss"
+        emergency_reason = "scalping_emergency_stop_loss" if self.settings.scalping_mode_enabled else "emergency_stop_loss"
         take_profit_reason = "scalping_take_profit" if self.settings.scalping_mode_enabled else "take_profit"
         trailing_reason = "scalping_trailing_stop" if self.settings.scalping_mode_enabled else "trailing_stop"
         max_position_reason = "scalping_max_position_seconds" if self.settings.scalping_mode_enabled else "max_holding_time"
 
-        if latest_price <= entry * (1 - stop_loss_pct):
-            return True, stop_reason
+        if entry <= 0 or latest_price <= 0:
+            return False, "hold"
+        if latest_price <= entry * (1 - self.settings.emergency_stop_loss_pct):
+            if self.settings.allow_emergency_stop_loss:
+                return True, emergency_reason
+            return False, "profit_guard_holding_at_loss"
         if latest_price >= entry * (1 + take_profit_pct):
             return True, take_profit_reason
         high = max(position.highest_price or entry, latest_price)
-        if latest_price <= high * (1 - trailing_stop_pct):
+        trailing_armed = high >= entry * (1 + self.settings.trailing_stop_arm_profit_pct)
+        if trailing_armed and latest_price <= high * (1 - trailing_stop_pct):
             return True, trailing_reason
         if position.opened_at:
             max_holding = (
@@ -152,6 +166,93 @@ class RiskManager:
         if not position.has_position:
             return self._block("sell_without_position")
         return True, "approved"
+
+    def approve_profit_guarded_sell(
+        self,
+        position: PositionState,
+        *,
+        expected_exit_price: float,
+        requires_profit: bool = True,
+        emergency: bool = False,
+    ) -> tuple[bool, str]:
+        approved, reason = self.check_profit_guarded_sell(
+            position,
+            expected_exit_price=expected_exit_price,
+            requires_profit=requires_profit,
+            emergency=emergency,
+        )
+        if not approved:
+            return self._block(reason)
+        return True, reason
+
+    def check_profit_guarded_sell(
+        self,
+        position: PositionState,
+        *,
+        expected_exit_price: float,
+        requires_profit: bool = True,
+        emergency: bool = False,
+    ) -> tuple[bool, str]:
+        if emergency:
+            return True, "approved"
+        if not self.settings.profit_only_exit_enabled or not requires_profit:
+            return True, "approved"
+        entry = position.avg_entry_price
+        if entry <= 0 or expected_exit_price <= 0:
+            return False, "invalid_price"
+        minimum_exit_price = self.minimum_profitable_exit_price(entry)
+        if expected_exit_price >= minimum_exit_price:
+            return True, "approved"
+        if expected_exit_price < entry:
+            return False, "profit_guard_holding_at_loss"
+        return False, "profit_guard_holding_until_profitable"
+
+    def profit_guard_snapshot(
+        self,
+        position: PositionState,
+        *,
+        estimated_exit_price: float | None,
+    ) -> ProfitGuardState:
+        entry = position.avg_entry_price
+        minimum_exit_price = self.minimum_profitable_exit_price(entry) if position.has_position and entry > 0 else None
+        unrealized_pct = None
+        if position.has_position and entry > 0 and estimated_exit_price is not None and estimated_exit_price > 0:
+            unrealized_pct = (estimated_exit_price - entry) / entry
+        exit_allowed = False
+        if position.has_position and estimated_exit_price is not None and estimated_exit_price > 0:
+            approved, _ = self.check_profit_guarded_sell(
+                position,
+                expected_exit_price=estimated_exit_price,
+                requires_profit=True,
+                emergency=False,
+            )
+            exit_allowed = approved
+        return ProfitGuardState(
+            profit_guard_enabled=self.settings.profit_only_exit_enabled,
+            min_net_exit_profit_pct=self.settings.min_net_exit_profit_pct,
+            current_unrealized_pnl_pct=unrealized_pct,
+            profit_guard_exit_allowed=exit_allowed,
+            estimated_exit_price=estimated_exit_price,
+            minimum_profitable_exit_price=minimum_exit_price,
+        )
+
+    def minimum_profitable_exit_price(self, avg_entry_price: float) -> float:
+        profit_threshold = self.settings.min_net_exit_profit_pct + (self.settings.exit_profit_buffer_bps / 10_000)
+        return avg_entry_price * (1 + profit_threshold)
+
+    def estimated_exit_price(self, *, quote: dict[str, Any] | None, latest_price: float | None) -> float | None:
+        bid = _quote_float(quote, "bid_price", "bp", "bid")
+        ask = _quote_float(quote, "ask_price", "ap", "ask")
+        mid = _quote_float(quote, "mid_price", "mid")
+        if mid is None and bid is not None and ask is not None:
+            mid = (bid + ask) / 2
+        reference = bid or mid or _safe_positive_float(latest_price)
+        if reference is None:
+            return None
+        if self.settings.order_type == "limit":
+            offset = max(0.0, self.settings.limit_price_offset_bps) / 10_000
+            return round(reference * (1 - offset), 2)
+        return reference
 
     def _approve_order_attempt_frequency(self, state: TradeFrequencyState) -> tuple[bool, str]:
         if state.trades_last_hour >= self.settings.max_order_attempts_per_hour:
@@ -221,3 +322,18 @@ def _safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _safe_positive_float(value: Any) -> float | None:
+    parsed = _safe_float(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _quote_float(quote: dict[str, Any] | None, *keys: str) -> float | None:
+    if not quote:
+        return None
+    for key in keys:
+        parsed = _safe_positive_float(quote.get(key))
+        if parsed is not None:
+            return parsed
+    return None

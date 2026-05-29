@@ -38,12 +38,19 @@ KILL_SWITCH_REASONS = {
     "model_not_profitable_after_costs",
 }
 
+PROFIT_GUARD_HOLD_REASONS = {
+    "profit_guard_holding_until_profitable",
+    "profit_guard_holding_at_loss",
+}
+
+RISK_ALERT_REASONS = KILL_SWITCH_REASONS | PROFIT_GUARD_HOLD_REASONS
+
 HARD_RISK_EXIT_REASONS = {
-    "stop_loss",
+    "emergency_stop_loss",
     "take_profit",
     "trailing_stop",
     "max_holding_time",
-    "scalping_stop_loss",
+    "scalping_emergency_stop_loss",
     "scalping_take_profit",
     "scalping_trailing_stop",
     "scalping_max_position_seconds",
@@ -398,7 +405,7 @@ class Trader:
             self._log_discord_alert_failure("error", exc)
 
     async def _send_risk_alert(self, decision: Decision) -> None:
-        if decision.action != "hold" or decision.reason not in KILL_SWITCH_REASONS:
+        if decision.action != "hold" or decision.reason not in RISK_ALERT_REASONS:
             return
         if not self._discord_alerts_enabled():
             return

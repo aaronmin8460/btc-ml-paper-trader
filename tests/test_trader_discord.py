@@ -377,7 +377,15 @@ async def test_error_alert_called_when_run_once_raises(trader_factory):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("reason", ["max_trades_per_hour_reached", "max_order_attempts_per_hour_reached"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "max_trades_per_hour_reached",
+        "max_order_attempts_per_hour_reached",
+        "profit_guard_holding_until_profitable",
+        "profit_guard_holding_at_loss",
+    ],
+)
 async def test_kill_switch_block_sends_risk_alert(trader_factory, reason):
     settings = Settings(
         _env_file=None,
@@ -571,7 +579,7 @@ async def test_hard_risk_exit_sell_bypasses_duplicate_bar_guard(trader_factory):
     trader._remember_order_attempt_bar(first, "2026-05-29T12:00:00+00:00")
 
     decision, acquired = await trader._guard_order_decision(
-        Decision("BTC/USD", "sell", "scalping_stop_loss", qty=0.01),
+        Decision("BTC/USD", "sell", "scalping_emergency_stop_loss", qty=0.01),
         PositionState(qty=0.01),
         latest_bar_timestamp="2026-05-29T12:00:00+00:00",
     )

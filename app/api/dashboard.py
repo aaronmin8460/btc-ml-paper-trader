@@ -13,7 +13,7 @@ from app.db.database import SessionLocal
 from app.db.models import AccountSnapshot, Order, Signal, Trade
 from app.db.repository import Repository
 from app.ml.registry import ModelRegistry
-from app.risk.risk_manager import PositionState, account_state_from_payload
+from app.risk.risk_manager import PositionState, RiskManager, account_state_from_payload
 from app.utils.rate_limiter import get_alpaca_rate_limiter
 from app.utils.time import iso_utc_now
 
@@ -46,6 +46,8 @@ RISK_BLOCK_REASONS = {
     "order_notional_exceeds_total_exposure",
     "configured_order_notional_too_large",
     "model_unavailable",
+    "profit_guard_holding_until_profitable",
+    "profit_guard_holding_at_loss",
 }
 
 
@@ -71,6 +73,7 @@ async def dashboard_summary(request: Request) -> dict:
     account_summary = await _account_summary(broker)
     market_summary = await _market_snapshot(settings, market)
     trade_metrics = _trade_metrics(trades, position)
+    profit_guard = _profit_guard_summary(settings, position, market_summary)
     api_budget = get_alpaca_rate_limiter(settings).snapshot()
     latest_model = _latest_model_summary(latest_model_run[0] if latest_model_run else None)
 
@@ -84,6 +87,7 @@ async def dashboard_summary(request: Request) -> dict:
         "latest_btc_price": market_summary.get("latest_close"),
         "latest_signal": _serialize_signal(latest_signal) if latest_signal else None,
         "current_position": _serialize_position(position),
+        **profit_guard,
         "alpaca_account": account_summary,
         "alpaca_calls_last_minute": api_budget.get("calls_last_minute"),
         "alpaca_budget_remaining": api_budget.get("budget_remaining"),
@@ -288,6 +292,22 @@ def _trade_metrics(trades: list[Trade], position: PositionState) -> dict:
         "best_trade_pnl": max(pnl_values) if pnl_values else None,
         "worst_trade_pnl": min(pnl_values) if pnl_values else None,
         "max_drawdown": _max_drawdown(pnl_values) if pnl_values else None,
+    }
+
+
+def _profit_guard_summary(settings: Settings, position: PositionState, market_summary: dict) -> dict:
+    risk = RiskManager(settings)
+    quote = market_summary.get("latest_quote") if isinstance(market_summary.get("latest_quote"), dict) else None
+    latest_price = market_summary.get("mid_price") or market_summary.get("latest_close")
+    estimated_exit_price = risk.estimated_exit_price(quote=quote, latest_price=_safe_float(latest_price))
+    snapshot = risk.profit_guard_snapshot(position, estimated_exit_price=estimated_exit_price)
+    return {
+        "profit_guard_enabled": snapshot.profit_guard_enabled,
+        "min_net_exit_profit_pct": snapshot.min_net_exit_profit_pct,
+        "current_unrealized_pnl_pct": snapshot.current_unrealized_pnl_pct,
+        "profit_guard_exit_allowed": snapshot.profit_guard_exit_allowed,
+        "estimated_exit_price": snapshot.estimated_exit_price,
+        "minimum_profitable_exit_price": snapshot.minimum_profitable_exit_price,
     }
 
 

@@ -83,6 +83,15 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.scalping_sell_on_weak_quote is True
     assert settings.scalping_quote_imbalance_exit == -0.10
     assert settings.min_hold_seconds_before_weak_quote_exit == 30
+    assert settings.profit_only_exit_enabled is True
+    assert settings.min_net_exit_profit_pct == 0.002
+    assert settings.exit_profit_buffer_bps == 5
+    assert settings.allow_emergency_stop_loss is True
+    assert settings.emergency_stop_loss_pct == 0.006
+    assert settings.trailing_stop_arm_profit_pct == 0.002
+    assert settings.model_sell_requires_profit is True
+    assert settings.weak_quote_sell_requires_profit is True
+    assert settings.max_holding_sell_requires_profit is True
     assert settings.allow_fallback_trading is False
     assert settings.order_in_flight_timeout_seconds == 15
     assert settings.order_status_check_enabled is True
@@ -124,6 +133,12 @@ def test_conservative_paper_scalping_profile_values_load():
         ioc_cancel_cooldown_seconds=120,
         ioc_cancel_escalation_cooldown_seconds=600,
         min_hold_seconds_before_weak_quote_exit=30,
+        profit_only_exit_enabled=True,
+        min_net_exit_profit_pct=0.002,
+        exit_profit_buffer_bps=5,
+        trailing_stop_arm_profit_pct=0.002,
+        allow_emergency_stop_loss=True,
+        emergency_stop_loss_pct=0.006,
         discord_alert_on_signal=False,
         discord_alert_on_order=True,
         discord_alert_on_error=True,
@@ -149,11 +164,59 @@ def test_conservative_paper_scalping_profile_values_load():
     assert settings.ioc_cancel_cooldown_seconds == 120
     assert settings.ioc_cancel_escalation_cooldown_seconds == 600
     assert settings.min_hold_seconds_before_weak_quote_exit == 30
+    assert settings.profit_only_exit_enabled is True
+    assert settings.min_net_exit_profit_pct == 0.002
+    assert settings.exit_profit_buffer_bps == 5
+    assert settings.trailing_stop_arm_profit_pct == 0.002
+    assert settings.allow_emergency_stop_loss is True
+    assert settings.emergency_stop_loss_pct == 0.006
     assert settings.discord_alert_on_signal is False
     assert settings.circuit_breaker_enabled is True
     assert settings.max_same_risk_blocks_before_pause == 20
     assert settings.max_runtime_errors_before_pause == 10
     assert settings.circuit_breaker_window_seconds == 900
+
+
+def test_active_profit_guarded_paper_scalping_profile_values_load():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        scan_interval_seconds=1,
+        min_seconds_between_trades=10,
+        max_trades_per_hour=60,
+        max_daily_trades=300,
+        max_order_attempts_per_hour=120,
+        max_order_attempts_per_day=500,
+        scalping_buy_probability_floor=0.58,
+        scalping_confidence_gap_required=0.08,
+        min_quote_imbalance=-0.005,
+        max_spread_bps=6,
+        profit_only_exit_enabled=True,
+        min_net_exit_profit_pct=0.002,
+        exit_profit_buffer_bps=5,
+        scalping_sell_on_weak_quote=False,
+        trailing_stop_arm_profit_pct=0.002,
+        allow_emergency_stop_loss=True,
+        emergency_stop_loss_pct=0.006,
+    )
+
+    assert settings.scan_interval_seconds == 1
+    assert settings.min_seconds_between_trades == 10
+    assert settings.max_trades_per_hour == 60
+    assert settings.max_daily_trades == 300
+    assert settings.max_order_attempts_per_hour == 120
+    assert settings.max_order_attempts_per_day == 500
+    assert settings.scalping_buy_probability_floor == 0.58
+    assert settings.scalping_confidence_gap_required == 0.08
+    assert settings.min_quote_imbalance == -0.005
+    assert settings.max_spread_bps == 6
+    assert settings.profit_only_exit_enabled is True
+    assert settings.min_net_exit_profit_pct == 0.002
+    assert settings.exit_profit_buffer_bps == 5
+    assert settings.scalping_sell_on_weak_quote is False
+    assert settings.trailing_stop_arm_profit_pct == 0.002
+    assert settings.allow_emergency_stop_loss is True
+    assert settings.emergency_stop_loss_pct == 0.006
 
 
 def test_config_still_rejects_unsafe_symbol_and_non_paper_mode():

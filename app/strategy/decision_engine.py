@@ -12,6 +12,9 @@ from app.strategy.rule_filter import RuleFilter
 from app.utils.time import utc_now
 
 Action = Literal["buy", "sell", "hold"]
+EMERGENCY_EXIT_REASONS = {"emergency_stop_loss", "scalping_emergency_stop_loss"}
+MAX_HOLDING_EXIT_REASONS = {"max_holding_time", "scalping_max_position_seconds"}
+PROFIT_GUARD_HOLD_REASONS = {"profit_guard_holding_until_profitable", "profit_guard_holding_at_loss"}
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,8 @@ class DecisionEngine:
         buy_probability = float(prediction["buy_probability"])
         sell_probability = float(prediction["sell_probability"])
         latest_price = float(feature_row["close"])
+        market_price = _quote_mid_price(quote) or latest_price
+        expected_exit_price = self.risk.estimated_exit_price(quote=quote, latest_price=market_price) or 0.0
 
         if self.settings.scalping_mode_enabled:
             return self._decide_scalping(
@@ -61,7 +66,8 @@ class DecisionEngine:
                 trading_enabled=trading_enabled,
                 trade_frequency=filled_trade_frequency or trade_frequency,
                 order_attempt_frequency=order_attempt_frequency,
-                latest_price=_quote_mid_price(quote) or latest_price,
+                latest_price=market_price,
+                expected_exit_price=expected_exit_price,
                 api_budget=api_budget,
                 account_state=account_state,
                 recent_ioc_canceled_buys=recent_ioc_canceled_buys,
@@ -72,17 +78,30 @@ class DecisionEngine:
                 ),
             )
 
-        force_sell, sell_reason = self.risk.should_force_sell(position=position, latest_price=latest_price, now=utc_now())
+        force_sell, sell_reason = self.risk.should_force_sell(position=position, latest_price=market_price, now=utc_now())
+        if sell_reason in PROFIT_GUARD_HOLD_REASONS:
+            return Decision(symbol, "hold", sell_reason)
         if force_sell:
-            approved, reason = self.risk.approve_sell(position)
-            return Decision(symbol, "sell" if approved else "hold", sell_reason if approved else reason, qty=position.qty if approved else None)
+            return self._sell_decision(
+                symbol=symbol,
+                position=position,
+                reason=sell_reason,
+                expected_exit_price=expected_exit_price,
+                requires_profit=self._sell_reason_requires_profit(sell_reason),
+                emergency=sell_reason in EMERGENCY_EXIT_REASONS,
+            )
 
         sell_gap = sell_probability - buy_probability
         if position.has_position and sell_probability >= self.settings.min_sell_probability and sell_gap >= self.settings.confidence_gap_required:
             if _model_unavailable(prediction, self.settings):
                 return Decision(symbol, "hold", "model_unavailable")
-            approved, reason = self.risk.approve_sell(position)
-            return Decision(symbol, "sell" if approved else "hold", "ml_sell_signal" if approved else reason, qty=position.qty if approved else None)
+            return self._sell_decision(
+                symbol=symbol,
+                position=position,
+                reason="ml_sell_signal",
+                expected_exit_price=expected_exit_price,
+                requires_profit=self.settings.model_sell_requires_profit,
+            )
 
         if not position.has_position:
             if _model_unavailable(prediction, self.settings):
@@ -123,6 +142,7 @@ class DecisionEngine:
         trade_frequency: TradeFrequencyState | None,
         order_attempt_frequency: TradeFrequencyState | None,
         latest_price: float,
+        expected_exit_price: float,
         api_budget: dict | None,
         account_state: AccountState | None,
         recent_ioc_canceled_buys: int,
@@ -134,9 +154,17 @@ class DecisionEngine:
 
         now = utc_now()
         force_sell, sell_reason = self.risk.should_force_sell(position=position, latest_price=latest_price, now=now)
+        if sell_reason in PROFIT_GUARD_HOLD_REASONS:
+            return Decision(symbol, "hold", sell_reason)
         if force_sell:
-            approved, reason = self.risk.approve_sell(position)
-            return Decision(symbol, "sell" if approved else "hold", sell_reason if approved else reason, qty=position.qty if approved else None)
+            return self._sell_decision(
+                symbol=symbol,
+                position=position,
+                reason=sell_reason,
+                expected_exit_price=expected_exit_price,
+                requires_profit=self._sell_reason_requires_profit(sell_reason),
+                emergency=sell_reason in EMERGENCY_EXIT_REASONS,
+            )
 
         spread = float(feature_row.get("orderbook_spread", 0) or 0)
         spread_bps = spread * 10_000
@@ -154,8 +182,13 @@ class DecisionEngine:
                     return Decision(symbol, "hold", "weak_quote_exit_min_hold_active")
                 if model_unavailable:
                     return Decision(symbol, "hold", "model_unavailable")
-                approved, reason = self.risk.approve_sell(position)
-                return Decision(symbol, "sell" if approved else "hold", "scalping_weak_quote_exit" if approved else reason, qty=position.qty if approved else None)
+                return self._sell_decision(
+                    symbol=symbol,
+                    position=position,
+                    reason="scalping_weak_quote_exit",
+                    expected_exit_price=expected_exit_price,
+                    requires_profit=self.settings.weak_quote_sell_requires_profit,
+                )
             return Decision(symbol, "hold", "scalping_holding_position")
 
         if _api_hard_budget_exhausted(api_budget):
@@ -213,6 +246,36 @@ class DecisionEngine:
             return Decision(symbol, "hold", "trading_disabled")
         return Decision(symbol, "buy", "scalping_dip_entry" if dip_confirmed else "scalping_quote_entry", notional=notional)
 
+    def _sell_decision(
+        self,
+        *,
+        symbol: str,
+        position: PositionState,
+        reason: str,
+        expected_exit_price: float,
+        requires_profit: bool = True,
+        emergency: bool = False,
+    ) -> Decision:
+        approved, risk_reason = self.risk.approve_sell(position)
+        if not approved:
+            return Decision(symbol, "hold", risk_reason)
+        approved, guard_reason = self.risk.approve_profit_guarded_sell(
+            position,
+            expected_exit_price=expected_exit_price,
+            requires_profit=requires_profit,
+            emergency=emergency,
+        )
+        if not approved:
+            return Decision(symbol, "hold", guard_reason)
+        return Decision(symbol, "sell", reason, qty=position.qty)
+
+    def _sell_reason_requires_profit(self, reason: str) -> bool:
+        if reason in EMERGENCY_EXIT_REASONS:
+            return False
+        if reason in MAX_HOLDING_EXIT_REASONS:
+            return self.settings.max_holding_sell_requires_profit
+        return True
+
 
 def _api_hard_budget_exhausted(api_budget: dict | None) -> bool:
     if not api_budget:
@@ -237,7 +300,9 @@ def _quote_mid_price(quote: dict | None) -> float | None:
     return _quote_float(quote, "mid_price", "mid")
 
 
-def _quote_float(quote: dict, *keys: str) -> float | None:
+def _quote_float(quote: dict | None, *keys: str) -> float | None:
+    if not quote:
+        return None
     for key in keys:
         value = quote.get(key)
         if value is None or value == "":

@@ -178,6 +178,12 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["paper_trading_only"] is True
     assert body["scheduler_running"] is True
     assert body["latest_btc_price"] == 101.5
+    assert body["profit_guard_enabled"] is True
+    assert body["min_net_exit_profit_pct"] == 0.002
+    assert body["current_unrealized_pnl_pct"] is None
+    assert body["profit_guard_exit_allowed"] is False
+    assert body["estimated_exit_price"] == pytest.approx(100.98)
+    assert body["minimum_profitable_exit_price"] is None
     assert body["total_orders"] == 0
     assert body["total_trades"] == 0
     assert body["closed_trades"] == 0

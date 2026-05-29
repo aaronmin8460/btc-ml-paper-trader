@@ -53,6 +53,15 @@ MAX_RECENT_IOC_CANCELS=3
 IOC_CANCEL_COOLDOWN_SECONDS=120
 IOC_CANCEL_ESCALATION_COOLDOWN_SECONDS=600
 MIN_HOLD_SECONDS_BEFORE_WEAK_QUOTE_EXIT=30
+PROFIT_ONLY_EXIT_ENABLED=true
+MIN_NET_EXIT_PROFIT_PCT=0.002
+EXIT_PROFIT_BUFFER_BPS=5
+ALLOW_EMERGENCY_STOP_LOSS=true
+EMERGENCY_STOP_LOSS_PCT=0.006
+TRAILING_STOP_ARM_PROFIT_PCT=0.002
+MODEL_SELL_REQUIRES_PROFIT=true
+WEAK_QUOTE_SELL_REQUIRES_PROFIT=true
+MAX_HOLDING_SELL_REQUIRES_PROFIT=true
 DISCORD_ALERT_ON_SIGNAL=false
 DISCORD_ALERT_ON_ORDER=true
 DISCORD_ALERT_ON_ERROR=true
@@ -254,6 +263,15 @@ MAX_RECENT_IOC_CANCELS=3
 IOC_CANCEL_COOLDOWN_SECONDS=120
 IOC_CANCEL_ESCALATION_COOLDOWN_SECONDS=600
 MIN_HOLD_SECONDS_BEFORE_WEAK_QUOTE_EXIT=30
+PROFIT_ONLY_EXIT_ENABLED=true
+MIN_NET_EXIT_PROFIT_PCT=0.002
+EXIT_PROFIT_BUFFER_BPS=5
+ALLOW_EMERGENCY_STOP_LOSS=true
+EMERGENCY_STOP_LOSS_PCT=0.006
+TRAILING_STOP_ARM_PROFIT_PCT=0.002
+MODEL_SELL_REQUIRES_PROFIT=true
+WEAK_QUOTE_SELL_REQUIRES_PROFIT=true
+MAX_HOLDING_SELL_REQUIRES_PROFIT=true
 DISCORD_ALERT_ON_SIGNAL=false
 DISCORD_ALERT_ON_ORDER=true
 DISCORD_ALERT_ON_ERROR=true
@@ -271,7 +289,7 @@ SCALPING_TRAILING_STOP_PCT=0.0008
 SCALPING_MAX_POSITION_SECONDS=90
 ```
 
-This profile is still paper trading and is not guaranteed profitable. It keeps scalping enabled, but slows the scheduler, requires stronger entries, caps filled-trade frequency and order-attempt frequency separately, cools down after IOC cancels, throttles duplicate Discord risk alerts, and pauses automatic trading if the same risk block or runtime errors repeat too often.
+This profile is still paper trading and is not guaranteed profitable. It keeps scalping enabled, requires stronger entries, caps filled-trade frequency and order-attempt frequency separately, cools down after IOC cancels, blocks non-emergency loss exits with the profit guard, throttles duplicate Discord risk alerts, and pauses automatic trading if the same kill-switch risk block or runtime errors repeat too often.
 
 ## Railway Volume setup for SQLite persistence
 
@@ -526,11 +544,35 @@ SCALPING_TRAILING_STOP_PCT=0.0008
 SCALPING_MAX_POSITION_SECONDS=90
 ```
 
-The bot uses latest quote/mid price for scalping entries, limit prices, stop-loss, take-profit, trailing stop, and weak-quote exits. Cached bars are used as background context for momentum, RSI, SMA distance, and volatility so the bot does not fetch 1500 bars every cycle. Weak-quote exits wait for `MIN_HOLD_SECONDS_BEFORE_WEAK_QUOTE_EXIT`; stop loss, take profit, trailing stop, and max holding exits remain immediately allowed. BUY and non-hard-risk SELL attempts are de-duplicated per latest bar timestamp.
+More active profit-guarded paper scalping settings:
+
+```env
+SCAN_INTERVAL_SECONDS=1
+MIN_SECONDS_BETWEEN_TRADES=10
+MAX_TRADES_PER_HOUR=60
+MAX_DAILY_TRADES=300
+MAX_ORDER_ATTEMPTS_PER_HOUR=120
+MAX_ORDER_ATTEMPTS_PER_DAY=500
+SCALPING_BUY_PROBABILITY_FLOOR=0.58
+SCALPING_CONFIDENCE_GAP_REQUIRED=0.08
+MIN_QUOTE_IMBALANCE=-0.005
+MAX_SPREAD_BPS=6
+PROFIT_ONLY_EXIT_ENABLED=true
+MIN_NET_EXIT_PROFIT_PCT=0.002
+EXIT_PROFIT_BUFFER_BPS=5
+SCALPING_SELL_ON_WEAK_QUOTE=false
+TRAILING_STOP_ARM_PROFIT_PCT=0.002
+ALLOW_EMERGENCY_STOP_LOSS=true
+EMERGENCY_STOP_LOSS_PCT=0.006
+```
+
+The bot uses latest quote/mid price for scalping entries, limit prices, emergency stop-loss, take-profit, trailing stop, and weak-quote exits. Cached bars are used as background context for momentum, RSI, SMA distance, and volatility so the bot does not fetch 1500 bars every cycle. Weak-quote exits wait for `MIN_HOLD_SECONDS_BEFORE_WEAK_QUOTE_EXIT`. With `PROFIT_ONLY_EXIT_ENABLED=true`, model sells, weak-quote sells, trailing-stop sells, and max-holding sells are held until the estimated exit price is at least `avg_entry_price * (1 + MIN_NET_EXIT_PROFIT_PCT + EXIT_PROFIT_BUFFER_BPS / 10000)`, unless an enabled emergency stop-loss is breached. BUY and non-hard-risk SELL attempts are de-duplicated per latest bar timestamp.
+
+If `ALLOW_EMERGENCY_STOP_LOSS=true`, a loss exit is allowed only after the loss exceeds `EMERGENCY_STOP_LOSS_PCT`. If it is false, loss exits hold with `profit_guard_holding_at_loss`. Trailing stops only arm after unrealized profit reaches `TRAILING_STOP_ARM_PROFIT_PCT`.
 
 The shared Alpaca budget tracks calls by endpoint (`latest_quote`, `crypto_bars`, `position`, `account`, `submit_order`, `get_order`). Near the soft target, optional work is skipped first, such as order-status checks or bars refresh. At the hard stop, new buys are blocked with `api_budget_exhausted`; sells that reduce or close BTC exposure are still prioritized.
 
-Short-term scalping can lose money quickly from spread, slippage, and repeated IOC cancellations, even in paper trading. This profile is safer than unrestricted one-second polling, but it is not a profit guarantee. This project does not support live trading; do not point it at a live Alpaca account.
+Short-term scalping can still lose money from spread, slippage, missed fills, and emergency stop-losses, even in paper trading. The profit guard prevents non-emergency loss exits; it is not a profit guarantee. This project does not support live trading; do not point it at a live Alpaca account.
 
 Account-aware buy risk checks are paper-account only:
 
@@ -578,11 +620,11 @@ Protected endpoints require `X-Admin-Token` matching `API_ADMIN_TOKEN`.
 
 ## Dashboard API
 
-The dashboard API provides read-focused backend data for an operator dashboard: bot status, trading status, recent signals, recent paper orders, IOC cancel guard state, realized trade PnL from closed `Trade.pnl` rows, Alpaca paper account snapshots, portfolio/equity history, win rate, average trade PnL, best/worst trade PnL, market freshness, Alpaca API budget telemetry, paper account risk state, latest model promotion metrics, and a dashboard-friendly `/run-once` wrapper. It is for BTC/USD paper-trading analytics only. It does not enable live trading, short selling, margin, or multi-symbol trading.
+The dashboard API provides read-focused backend data for an operator dashboard: bot status, trading status, recent signals, recent paper orders, IOC cancel guard state, realized trade PnL from closed `Trade.pnl` rows, Alpaca paper account snapshots, portfolio/equity history, win rate, average trade PnL, best/worst trade PnL, market freshness, Alpaca API budget telemetry, profit-guard exit status, paper account risk state, latest model promotion metrics, and a dashboard-friendly `/run-once` wrapper. It is for BTC/USD paper-trading analytics only. It does not enable live trading, short selling, margin, or multi-symbol trading.
 
 When Alpaca paper credentials are available, each `run_once` attempts to store a redacted account snapshot with equity, cash, buying power, portfolio value, and currency. Snapshot storage is best-effort and does not interrupt trading decisions. Realized PnL and portfolio history are separate views: `/dashboard/equity-curve` is built from closed trade PnL, while `/dashboard/portfolio-curve` is built from Alpaca paper account snapshots.
 
-`/dashboard/trading-status` includes the latest decision, latest risk reason, IOC cooldown state, model/fallback status, scheduler running flag, and runtime pause reason so the operator can see why automatic trading is running, waiting, blocked, stopped, or paused.
+`/dashboard/summary` includes `profit_guard_enabled`, `min_net_exit_profit_pct`, `current_unrealized_pnl_pct`, `profit_guard_exit_allowed`, `estimated_exit_price`, and `minimum_profitable_exit_price`. `/dashboard/trading-status` includes the latest decision, latest risk reason, IOC cooldown state, model/fallback status, scheduler running flag, and runtime pause reason so the operator can see why automatic trading is running, waiting, blocked, stopped, or paused.
 
 All dashboard endpoints require the admin token. Do not expose `API_ADMIN_TOKEN` in a public frontend, browser bundle, logs, screenshots, or shared command history.
 
@@ -814,7 +856,7 @@ The bot is long-only:
 - No margin.
 - Max one open BTC position.
 
-Risk controls include max order notional, max total exposure, daily loss block, drawdown block, stop loss, take profit, trailing stop, max holding time, and cooldown after loss.
+Risk controls include max order notional, max total exposure, daily loss block, drawdown block, profit-only exit guard, explicit emergency stop-loss, take profit, trailing stop, max holding time, and cooldown after loss.
 
 ## Feature Engineering
 

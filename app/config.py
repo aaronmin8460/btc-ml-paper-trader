@@ -91,6 +91,16 @@ class Settings(BaseSettings):
     scalping_quote_imbalance_exit: float = -0.10
     min_hold_seconds_before_weak_quote_exit: int = 30
 
+    profit_only_exit_enabled: bool = True
+    min_net_exit_profit_pct: float = 0.002
+    exit_profit_buffer_bps: float = 5
+    allow_emergency_stop_loss: bool = True
+    emergency_stop_loss_pct: float = 0.006
+    trailing_stop_arm_profit_pct: float = 0.002
+    model_sell_requires_profit: bool = True
+    weak_quote_sell_requires_profit: bool = True
+    max_holding_sell_requires_profit: bool = True
+
     order_in_flight_timeout_seconds: int = 15
     order_status_check_enabled: bool = True
     order_status_check_delay_seconds: float = 0.5
@@ -192,6 +202,10 @@ class Settings(BaseSettings):
         "max_backtest_drawdown_pct",
         "min_backtest_profit_factor",
         "min_backtest_trades",
+        "min_net_exit_profit_pct",
+        "exit_profit_buffer_bps",
+        "emergency_stop_loss_pct",
+        "trailing_stop_arm_profit_pct",
     )
     @classmethod
     def runtime_timing_values_must_be_non_negative(cls, value: float) -> float:

@@ -125,6 +125,12 @@ export type DashboardSummary = {
   latest_btc_price: number | null;
   latest_signal: DashboardSignal | null;
   current_position: PositionSummary;
+  profit_guard_enabled: boolean;
+  min_net_exit_profit_pct: number;
+  current_unrealized_pnl_pct: number | null;
+  profit_guard_exit_allowed: boolean;
+  estimated_exit_price: number | null;
+  minimum_profitable_exit_price: number | null;
   alpaca_account: AccountSummary;
   alpaca_calls_last_minute: number | null;
   alpaca_budget_remaining: number | null;

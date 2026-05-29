@@ -147,14 +147,21 @@ def test_trade_frequency_limits_do_not_block_position_closing_sell():
     assert reason == "approved"
 
 
-def test_stop_loss_and_take_profit_force_sell_behavior_remains_intact():
-    risk = RiskManager(Settings(_env_file=None, scalping_mode_enabled=False, stop_loss_pct=0.01, take_profit_pct=0.02))
+def test_emergency_stop_loss_and_take_profit_force_sell_behavior_remains_intact():
+    risk = RiskManager(
+        Settings(
+            _env_file=None,
+            scalping_mode_enabled=False,
+            emergency_stop_loss_pct=0.01,
+            take_profit_pct=0.02,
+        )
+    )
     position = PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000)
     now = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
 
     should_sell, reason = risk.should_force_sell(position=position, latest_price=64000, now=now)
     assert should_sell is True
-    assert reason == "stop_loss"
+    assert reason == "emergency_stop_loss"
 
     should_sell, reason = risk.should_force_sell(position=position, latest_price=66500, now=now)
     assert should_sell is True

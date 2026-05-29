@@ -238,8 +238,8 @@ def test_scalping_sell_triggers_on_take_profit():
     assert decision.reason == "scalping_take_profit"
 
 
-def test_scalping_sell_triggers_on_stop_loss():
-    settings = Settings(_env_file=None, scalping_mode_enabled=True, scalping_stop_loss_pct=0.002)
+def test_scalping_sell_triggers_on_emergency_stop_loss():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, emergency_stop_loss_pct=0.002)
     engine = DecisionEngine(settings)
     feature_row = _scalping_feature_row()
     feature_row["close"] = 64800
@@ -252,14 +252,14 @@ def test_scalping_sell_triggers_on_stop_loss():
     )
 
     assert decision.action == "sell"
-    assert decision.reason == "scalping_stop_loss"
+    assert decision.reason == "scalping_emergency_stop_loss"
 
 
 def test_scalping_stop_loss_can_sell_before_weak_quote_min_hold():
     settings = Settings(
         _env_file=None,
         scalping_mode_enabled=True,
-        scalping_stop_loss_pct=0.001,
+        emergency_stop_loss_pct=0.001,
         min_hold_seconds_before_weak_quote_exit=30,
     )
     engine = DecisionEngine(settings)
@@ -281,7 +281,7 @@ def test_scalping_stop_loss_can_sell_before_weak_quote_min_hold():
     )
 
     assert decision.action == "sell"
-    assert decision.reason == "scalping_stop_loss"
+    assert decision.reason == "scalping_emergency_stop_loss"
 
 
 def test_scalping_take_profit_can_sell_before_weak_quote_min_hold():
@@ -306,7 +306,7 @@ def test_scalping_take_profit_can_sell_before_weak_quote_min_hold():
             opened_at=datetime.now(UTC),
         ),
         trading_enabled=True,
-        quote={"bid_price": 65100, "ask_price": 65110},
+        quote={"bid_price": 65200, "ask_price": 65210},
     )
 
     assert decision.action == "sell"
@@ -314,10 +314,15 @@ def test_scalping_take_profit_can_sell_before_weak_quote_min_hold():
 
 
 def test_scalping_sell_triggers_on_max_position_seconds():
-    settings = Settings(_env_file=None, scalping_mode_enabled=True, scalping_max_position_seconds=180)
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        scalping_max_position_seconds=180,
+        scalping_take_profit_pct=0.01,
+    )
     engine = DecisionEngine(settings)
     feature_row = _scalping_feature_row()
-    feature_row["close"] = 65010
+    feature_row["close"] = 65200
 
     decision = engine.decide(
         prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
@@ -325,7 +330,7 @@ def test_scalping_sell_triggers_on_max_position_seconds():
         position=PositionState(
             qty=0.01,
             avg_entry_price=65000,
-            highest_price=65010,
+            highest_price=65200,
             opened_at=datetime.now(UTC) - timedelta(seconds=181),
         ),
         trading_enabled=True,
@@ -346,15 +351,15 @@ def test_scalping_quote_first_sell_triggers_take_profit():
         feature_row=feature_row,
         position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
         trading_enabled=True,
-        quote={"bid_price": 65100, "ask_price": 65110},
+        quote={"bid_price": 65200, "ask_price": 65210},
     )
 
     assert decision.action == "sell"
     assert decision.reason == "scalping_take_profit"
 
 
-def test_scalping_quote_first_sell_triggers_stop_loss():
-    settings = Settings(_env_file=None, scalping_mode_enabled=True, scalping_stop_loss_pct=0.001)
+def test_scalping_quote_first_sell_triggers_emergency_stop_loss():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, emergency_stop_loss_pct=0.001)
     engine = DecisionEngine(settings)
     feature_row = _scalping_feature_row()
     feature_row["close"] = 65000
@@ -368,7 +373,7 @@ def test_scalping_quote_first_sell_triggers_stop_loss():
     )
 
     assert decision.action == "sell"
-    assert decision.reason == "scalping_stop_loss"
+    assert decision.reason == "scalping_emergency_stop_loss"
 
 
 def test_scalping_quote_first_sell_triggers_trailing_stop():
@@ -385,9 +390,9 @@ def test_scalping_quote_first_sell_triggers_trailing_stop():
     decision = engine.decide(
         prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
         feature_row=feature_row,
-        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65200),
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65400),
         trading_enabled=True,
-        quote={"bid_price": 65130, "ask_price": 65140},
+        quote={"bid_price": 65330, "ask_price": 65340},
     )
 
     assert decision.action == "sell"
@@ -412,7 +417,7 @@ def test_api_hard_budget_blocks_buy_but_not_sell():
         position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
         trading_enabled=True,
         api_budget=exhausted_budget,
-        quote={"bid_price": 65100, "ask_price": 65110},
+        quote={"bid_price": 65200, "ask_price": 65210},
     )
 
     assert buy.action == "hold"
@@ -437,7 +442,7 @@ def test_account_drawdown_blocks_buy_but_not_sell():
         position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
         trading_enabled=True,
         account_state=AccountState(available=True, equity=96_000, buying_power=1_000, drawdown_pct=0.04),
-        quote={"bid_price": 65100, "ask_price": 65110},
+        quote={"bid_price": 65200, "ask_price": 65210},
     )
 
     assert buy.action == "hold"
@@ -660,7 +665,7 @@ def test_strong_model_prediction_can_still_buy():
 
 
 def test_fallback_prediction_still_allows_hard_risk_exit():
-    settings = Settings(_env_file=None, scalping_mode_enabled=True, scalping_stop_loss_pct=0.001)
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, emergency_stop_loss_pct=0.001)
     engine = DecisionEngine(settings)
     feature_row = _scalping_feature_row()
     feature_row["close"] = 65000
@@ -679,7 +684,7 @@ def test_fallback_prediction_still_allows_hard_risk_exit():
     )
 
     assert decision.action == "sell"
-    assert decision.reason == "scalping_stop_loss"
+    assert decision.reason == "scalping_emergency_stop_loss"
 
 
 def test_weak_quote_exit_waits_for_minimum_hold_time():
@@ -689,10 +694,11 @@ def test_weak_quote_exit_waits_for_minimum_hold_time():
         scalping_mode_enabled=True,
         min_hold_seconds_before_weak_quote_exit=30,
         max_spread_bps=6,
+        scalping_take_profit_pct=0.01,
     )
     engine = DecisionEngine(settings)
     feature_row = _scalping_feature_row()
-    feature_row["close"] = 65000
+    feature_row["close"] = 65200
     feature_row["orderbook_spread"] = 0.001
 
     early = engine.decide(
@@ -701,7 +707,7 @@ def test_weak_quote_exit_waits_for_minimum_hold_time():
         position=PositionState(
             qty=0.01,
             avg_entry_price=65000,
-            highest_price=65000,
+            highest_price=65200,
             opened_at=now - timedelta(seconds=5),
         ),
         trading_enabled=True,
@@ -712,7 +718,7 @@ def test_weak_quote_exit_waits_for_minimum_hold_time():
         position=PositionState(
             qty=0.01,
             avg_entry_price=65000,
-            highest_price=65000,
+            highest_price=65200,
             opened_at=now - timedelta(seconds=31),
         ),
         trading_enabled=True,
@@ -722,3 +728,185 @@ def test_weak_quote_exit_waits_for_minimum_hold_time():
     assert early.reason == "weak_quote_exit_min_hold_active"
     assert later.action == "sell"
     assert later.reason == "scalping_weak_quote_exit"
+
+
+def test_weak_quote_sell_is_blocked_at_loss():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        scalping_take_profit_pct=0.01,
+        min_hold_seconds_before_weak_quote_exit=0,
+        max_spread_bps=6,
+    )
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 64850
+    feature_row["orderbook_spread"] = 0.001
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "profit_guard_holding_at_loss"
+
+
+def test_weak_quote_sell_is_allowed_at_profit():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        scalping_take_profit_pct=0.01,
+        min_hold_seconds_before_weak_quote_exit=0,
+        max_spread_bps=6,
+    )
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 65200
+    feature_row["orderbook_spread"] = 0.001
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65200),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "sell"
+    assert decision.reason == "scalping_weak_quote_exit"
+
+
+def test_model_sell_is_blocked_at_loss():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=False,
+        min_sell_probability=0.55,
+        confidence_gap_required=0.08,
+    )
+    engine = DecisionEngine(settings)
+    feature_row = _feature_row()
+    feature_row["close"] = 64850
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.1, "sell_probability": 0.9},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "profit_guard_holding_at_loss"
+
+
+def test_emergency_stop_loss_is_allowed_only_when_enabled():
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 64500
+    position = PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000)
+
+    enabled = DecisionEngine(
+        Settings(
+            _env_file=None,
+            scalping_mode_enabled=True,
+            allow_emergency_stop_loss=True,
+            emergency_stop_loss_pct=0.006,
+        )
+    ).decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=position,
+        trading_enabled=True,
+    )
+    disabled = DecisionEngine(
+        Settings(
+            _env_file=None,
+            scalping_mode_enabled=True,
+            allow_emergency_stop_loss=False,
+            emergency_stop_loss_pct=0.006,
+        )
+    ).decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=position,
+        trading_enabled=True,
+    )
+
+    assert enabled.action == "sell"
+    assert enabled.reason == "scalping_emergency_stop_loss"
+    assert disabled.action == "hold"
+    assert disabled.reason == "profit_guard_holding_at_loss"
+
+
+def test_trailing_stop_is_not_armed_before_profit_threshold():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        scalping_take_profit_pct=0.01,
+        scalping_trailing_stop_pct=0.0008,
+        trailing_stop_arm_profit_pct=0.002,
+    )
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 65040
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65100),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "scalping_holding_position"
+
+
+def test_trailing_stop_works_after_profit_threshold():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        scalping_take_profit_pct=0.01,
+        scalping_trailing_stop_pct=0.0008,
+        trailing_stop_arm_profit_pct=0.002,
+    )
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 65330
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65400),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "sell"
+    assert decision.reason == "scalping_trailing_stop"
+
+
+def test_max_holding_sell_is_blocked_at_loss_when_configured():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        scalping_take_profit_pct=0.01,
+        scalping_max_position_seconds=90,
+        max_holding_sell_requires_profit=True,
+    )
+    engine = DecisionEngine(settings)
+    feature_row = _scalping_feature_row()
+    feature_row["close"] = 64850
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.4, "sell_probability": 0.6},
+        feature_row=feature_row,
+        position=PositionState(
+            qty=0.01,
+            avg_entry_price=65000,
+            highest_price=65000,
+            opened_at=datetime.now(UTC) - timedelta(seconds=91),
+        ),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "profit_guard_holding_at_loss"
