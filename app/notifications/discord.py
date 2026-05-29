@@ -173,6 +173,18 @@ class DiscordNotifier:
             footer="Paper trading risk guard",
         )
 
+    async def auto_trading_paused_alert(self, reason: str) -> None:
+        await self.send_embed(
+            title="Auto trading paused",
+            fields=[
+                field("Symbol", ALLOWED_SYMBOL),
+                field("Reason", reason),
+                field("Timestamp", utc_timestamp()),
+            ],
+            color=DISCORD_RED,
+            footer="Runtime circuit breaker",
+        )
+
     async def model_alert(
         self,
         model_path: str,

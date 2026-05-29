@@ -53,6 +53,18 @@ class PositionSnapshot(Base):
     avg_entry_price: Mapped[float] = mapped_column(Float)
 
 
+class AccountSnapshot(Base):
+    __tablename__ = "account_snapshots"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    equity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cash: Mapped[float | None] = mapped_column(Float, nullable=True)
+    buying_power: Mapped[float | None] = mapped_column(Float, nullable=True)
+    portfolio_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    raw_response: Mapped[str] = mapped_column(Text, default="")
+
+
 class Trade(Base):
     __tablename__ = "trades"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

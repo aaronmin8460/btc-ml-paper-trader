@@ -1,25 +1,61 @@
 import type { ReactElement } from 'react';
 import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import type { DashboardOrder, DashboardSignal, EquityPoint } from '../api/client';
+import type { DashboardOrder, DashboardSignal, EquityPoint, PortfolioPoint } from '../api/client';
 import { formatCompactTime, formatUsd } from '../lib/formatters';
 import { Card, CardHeader } from './Card';
 import { EmptyState } from './EmptyState';
 
 export function DashboardCharts({
   equityCurve,
+  portfolioCurve,
   signals,
   orders,
 }: {
   equityCurve: EquityPoint[];
+  portfolioCurve: PortfolioPoint[];
   signals: DashboardSignal[];
   orders: DashboardOrder[];
 }) {
   return (
-    <section className="grid gap-4 xl:grid-cols-3">
+    <section className="grid gap-4 xl:grid-cols-2">
+      <PortfolioCurveChart data={portfolioCurve} />
       <EquityCurveChart data={equityCurve} />
       <SignalProbabilityChart signals={signals} />
       <OrderActivityChart orders={orders} />
     </section>
+  );
+}
+
+function PortfolioCurveChart({ data }: { data: PortfolioPoint[] }) {
+  const points = data
+    .filter((point) => point.timestamp && (point.portfolio_value !== null || point.equity !== null))
+    .map((point) => ({
+      time: formatCompactTime(point.timestamp),
+      portfolio: point.portfolio_value,
+      equity: point.equity,
+      cash: point.cash,
+    }));
+
+  return (
+    <Card className="min-h-[340px]">
+      <CardHeader eyebrow="Alpaca paper account" title="Portfolio Curve" />
+      {points.length === 0 ? (
+        <EmptyState title="No account snapshots yet" message="Portfolio history appears after the backend captures Alpaca paper account snapshots." />
+      ) : (
+        <ChartFrame>
+          <LineChart data={points}>
+            <CartesianGrid stroke="rgba(255,255,255,0.08)" vertical={false} />
+            <XAxis dataKey="time" stroke="#71717a" tickLine={false} />
+            <YAxis stroke="#71717a" tickFormatter={(value) => formatUsd(Number(value), { maximumFractionDigits: 0 })} tickLine={false} />
+            <Tooltip content={<ChartTooltip usd />} />
+            <Legend />
+            <Line dataKey="portfolio" dot={false} name="Portfolio value" stroke="#14b8a6" strokeWidth={2.5} type="monotone" />
+            <Line dataKey="equity" dot={false} name="Equity" stroke="#f7931a" strokeWidth={2.2} type="monotone" />
+            <Line dataKey="cash" dot={false} name="Cash" stroke="#a78bfa" strokeWidth={1.8} type="monotone" />
+          </LineChart>
+        </ChartFrame>
+      )}
+    </Card>
   );
 }
 
@@ -34,16 +70,16 @@ function EquityCurveChart({ data }: { data: EquityPoint[] }) {
 
   return (
     <Card className="min-h-[340px]">
-      <CardHeader eyebrow="Realized PnL" title="Equity Curve" />
+      <CardHeader eyebrow="Closed trades" title="Realized PnL Curve" />
       {points.length === 0 ? (
-        <EmptyState title="No realized trade PnL yet" message="The chart appears after trades with stored pnl values exist." />
+        <EmptyState title="No realized trade PnL yet" message="The chart appears after closed trade PnL values exist." />
       ) : (
         <ChartFrame>
           <LineChart data={points}>
             <CartesianGrid stroke="rgba(255,255,255,0.08)" vertical={false} />
             <XAxis dataKey="time" stroke="#71717a" tickLine={false} />
             <YAxis stroke="#71717a" tickFormatter={(value) => formatUsd(Number(value), { maximumFractionDigits: 0 })} tickLine={false} />
-            <Tooltip content={<ChartTooltip />} />
+            <Tooltip content={<ChartTooltip usd />} />
             <Line dataKey="pnl" dot={false} name="Cumulative PnL" stroke="#f7931a" strokeWidth={2.5} type="monotone" />
             <Line dataKey="drawdown" dot={false} name="Drawdown" stroke="#fb7185" strokeWidth={1.8} type="monotone" />
           </LineChart>
@@ -132,7 +168,19 @@ function ChartFrame({ children }: { children: ReactElement }) {
   );
 }
 
-function ChartTooltip({ active, payload, label, percent }: { active?: boolean; payload?: Array<{ name?: string; value?: number; color?: string }>; label?: string; percent?: boolean }) {
+function ChartTooltip({
+  active,
+  payload,
+  label,
+  percent,
+  usd,
+}: {
+  active?: boolean;
+  payload?: Array<{ name?: string; value?: number; color?: string }>;
+  label?: string;
+  percent?: boolean;
+  usd?: boolean;
+}) {
   if (!active || !payload?.length) return null;
   return (
     <div className="rounded-xl border border-white/10 bg-ink-900/95 p-3 text-xs shadow-xl">
@@ -140,15 +188,16 @@ function ChartTooltip({ active, payload, label, percent }: { active?: boolean; p
       {payload.map((item) => (
         <div key={`${item.name}-${item.value}`} className="flex min-w-36 items-center justify-between gap-4">
           <span style={{ color: item.color }}>{item.name}</span>
-          <span className="font-semibold text-zinc-100">{formatTooltipValue(item.value, percent)}</span>
+          <span className="font-semibold text-zinc-100">{formatTooltipValue(item.value, { percent, usd })}</span>
         </div>
       ))}
     </div>
   );
 }
 
-function formatTooltipValue(value: number | undefined, percent?: boolean): string {
+function formatTooltipValue(value: number | undefined, options: { percent?: boolean; usd?: boolean } = {}): string {
   if (value === undefined || value === null) return '—';
-  if (percent) return `${(value * 100).toFixed(1)}%`;
+  if (options.percent) return `${(value * 100).toFixed(1)}%`;
+  if (options.usd) return formatUsd(value);
   return Number.isInteger(value) ? `${value}` : value.toFixed(4);
 }

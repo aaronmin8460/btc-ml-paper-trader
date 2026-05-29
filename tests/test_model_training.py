@@ -7,6 +7,7 @@ from app.data.dataset_builder import build_training_dataset
 from app.data.feature_engineering import FEATURE_COLUMNS
 from app.data.market_data import MarketDataClient
 from app.ml.model import MLSignalModel
+from app.ml.predict import Predictor
 from app.ml.train import train_model_from_bars
 from app.ml.validation import promotion_decision
 
@@ -25,6 +26,17 @@ def test_labels_drop_rows_where_future_unavailable():
     dataset = build_training_dataset(bars)
     assert len(dataset) < len(bars)
     assert "buy_quality_label" in dataset.columns
+
+
+def test_predictor_marks_fallback_predictions_when_no_model_is_active(tmp_path):
+    settings = Settings(_env_file=None, model_dir=str(tmp_path))
+    bars = MarketDataClient.synthetic_btc_bars(140)
+
+    prediction = Predictor(settings).predict(bars)
+
+    assert prediction["prediction_source"] == "fallback"
+    assert prediction["model_available"] is False
+    assert prediction["model_path"] is None
 
 
 def test_training_rejects_single_class_dataset_without_crashing(tmp_path):

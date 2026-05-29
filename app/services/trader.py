@@ -1,6 +1,8 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
+from app.accounting.trade_accounting import record_filled_order_trade
 from app.broker.alpaca_client import AlpacaClient
 from app.config import ALLOWED_SYMBOL, Settings, get_settings
 from app.data.feature_engineering import latest_feature_row
@@ -16,6 +18,8 @@ from app.utils.rate_limiter import get_alpaca_rate_limiter
 
 
 KILL_SWITCH_REASONS = {
+    "max_order_attempts_per_hour_reached",
+    "max_order_attempts_per_day_reached",
     "max_trades_per_hour_reached",
     "max_daily_trades_reached",
     "max_consecutive_losses_reached",
@@ -30,7 +34,19 @@ KILL_SWITCH_REASONS = {
     "account_data_required_unavailable",
     "buying_power_too_low",
     "recent_ioc_cancels_too_high",
+    "ioc_cancel_cooldown_active",
     "model_not_profitable_after_costs",
+}
+
+HARD_RISK_EXIT_REASONS = {
+    "stop_loss",
+    "take_profit",
+    "trailing_stop",
+    "max_holding_time",
+    "scalping_stop_loss",
+    "scalping_take_profit",
+    "scalping_trailing_stop",
+    "scalping_max_position_seconds",
 }
 
 
@@ -46,6 +62,10 @@ class Trader:
         self._order_lock = asyncio.Lock()
         self._order_lock_started_at: datetime | None = None
         self._position_highest_price = 0.0
+        self._last_risk_alert_reason: str | None = None
+        self._last_risk_alert_sent_at: datetime | None = None
+        self._last_order_attempt_bar_by_side: dict[str, str] = {}
+        self._ioc_cancel_escalated_until: datetime | None = None
 
     async def get_position_state(self) -> PositionState:
         position = await self.broker.get_position(ALLOWED_SYMBOL)
@@ -72,32 +92,39 @@ class Trader:
             quote = await self.market_data.fetch_latest_quote(ALLOWED_SYMBOL)
             prediction = self.predictor.predict(bars, quote=quote)
             feature_row = latest_feature_row(bars, quote=quote).iloc[-1]
+            latest_bar_timestamp = _latest_bar_timestamp(feature_row, prediction)
             position = await self.get_position_state()
             quote_mid_price = _mid_price_from_quote(quote)
             if position.has_position and quote_mid_price is not None:
                 position.highest_price = max(position.highest_price or 0.0, quote_mid_price)
-            account_state = await self._account_state()
+            account_payload = await self._account_payload()
+            account_state = account_state_from_payload(account_payload)
             api_budget = get_alpaca_rate_limiter(self.settings).snapshot()
             with SessionLocal() as db:
                 repo = Repository(db)
-                trade_frequency = repo.trade_frequency_state()
-                recent_ioc_canceled_buys = (
-                    repo.recent_ioc_canceled_buy_count()
-                    if hasattr(repo, "recent_ioc_canceled_buy_count")
-                    else 0
-                )
+                self._store_account_snapshot(repo, account_payload)
+                order_attempt_frequency = self._order_attempt_frequency_state(repo)
+                filled_trade_frequency = self._filled_trade_frequency_state(repo)
+                recent_ioc_canceled_buys, latest_ioc_canceled_buy_at = self._ioc_cancel_state(repo)
                 decision = self.decision_engine.decide(
                     prediction=prediction,
                     feature_row=feature_row,
                     position=position,
                     trading_enabled=self.settings.trading_enabled,
-                    trade_frequency=trade_frequency,
+                    trade_frequency=filled_trade_frequency,
+                    order_attempt_frequency=order_attempt_frequency,
+                    filled_trade_frequency=filled_trade_frequency,
                     quote=quote,
                     api_budget=api_budget,
                     account_state=account_state,
                     recent_ioc_canceled_buys=recent_ioc_canceled_buys,
+                    latest_ioc_canceled_buy_at=latest_ioc_canceled_buy_at,
                 )
-                decision, order_lock_acquired = await self._guard_order_decision(decision, position)
+                decision, order_lock_acquired = await self._guard_order_decision(
+                    decision,
+                    position,
+                    latest_bar_timestamp=latest_bar_timestamp,
+                )
                 self.logger.event(
                     "signal",
                     symbol=decision.symbol,
@@ -120,6 +147,7 @@ class Trader:
                 order_response = None
                 try:
                     if decision.action in {"buy", "sell"}:
+                        self._remember_order_attempt_bar(decision, latest_bar_timestamp)
                         order_response = await self.broker.submit_order(
                             symbol=decision.symbol,
                             side=decision.action,
@@ -131,7 +159,7 @@ class Trader:
                         )
                         self.broker.invalidate_position_cache(decision.symbol)
                         await self._send_order_alert(decision, order_response)
-                        repo.add_order(
+                        order = repo.add_order(
                             side=decision.action,
                             status=order_response.get("status", "submitted"),
                             notional=decision.notional,
@@ -139,6 +167,8 @@ class Trader:
                             broker_order_id=order_response.get("id"),
                             raw_response=order_response,
                         )
+                        if str(order_response.get("status") or "").lower() == "filled":
+                            record_filled_order_trade(repo, order, self.settings)
                 finally:
                     if order_lock_acquired and self._order_lock.locked():
                         self._order_lock.release()
@@ -149,11 +179,47 @@ class Trader:
             raise
 
     async def _account_state(self) -> AccountState:
+        return account_state_from_payload(await self._account_payload())
+
+    async def _account_payload(self) -> dict[str, Any] | None:
+        credentials_available = getattr(self.broker, "credentials_available", lambda: False)
+        if not credentials_available():
+            return None
         try:
-            account = await self.broker.get_account()
+            return await self.broker.get_account()
         except Exception:
-            return AccountState()
-        return account_state_from_payload(account)
+            return None
+
+    def _store_account_snapshot(self, repo: Repository, account_payload: dict[str, Any] | None) -> None:
+        if not account_payload:
+            return
+        try:
+            repo.add_account_snapshot(
+                equity=account_payload.get("equity") or account_payload.get("portfolio_value"),
+                cash=account_payload.get("cash"),
+                buying_power=account_payload.get("buying_power"),
+                portfolio_value=account_payload.get("portfolio_value") or account_payload.get("equity"),
+                currency=account_payload.get("currency"),
+                raw_response=account_payload,
+            )
+        except Exception as exc:
+            try:
+                self.logger.event(
+                    "account_snapshot_failed",
+                    error_type=type(exc).__name__,
+                )
+            except Exception:
+                pass
+
+    def _order_attempt_frequency_state(self, repo: Repository):
+        if hasattr(repo, "order_attempt_frequency_state"):
+            return repo.order_attempt_frequency_state()
+        return repo.trade_frequency_state() if hasattr(repo, "trade_frequency_state") else None
+
+    def _filled_trade_frequency_state(self, repo: Repository):
+        if hasattr(repo, "filled_trade_frequency_state"):
+            return repo.filled_trade_frequency_state()
+        return repo.trade_frequency_state() if hasattr(repo, "trade_frequency_state") else None
 
     def _position_opened_at(self) -> datetime:
         try:
@@ -168,13 +234,80 @@ class Trader:
             pass
         return datetime.now(UTC)
 
-    async def _guard_order_decision(self, decision: Decision, position: PositionState) -> tuple[Decision, bool]:
+    def _ioc_cancel_state(self, repo: Repository) -> tuple[int, datetime | None]:
+        recent_ioc_canceled_buys = (
+            repo.recent_ioc_canceled_count(
+                side="buy",
+                lookback_seconds=self.settings.ioc_cancel_lookback_seconds,
+            )
+            if hasattr(repo, "recent_ioc_canceled_count")
+            else (
+                repo.recent_ioc_canceled_buy_count(
+                    lookback_seconds=self.settings.ioc_cancel_lookback_seconds,
+                )
+                if hasattr(repo, "recent_ioc_canceled_buy_count")
+                else 0
+            )
+        )
+        latest_lookup_seconds = max(
+            self.settings.ioc_cancel_lookback_seconds,
+            self.settings.ioc_cancel_cooldown_seconds,
+            self.settings.ioc_cancel_escalation_cooldown_seconds,
+        )
+        latest_ioc_canceled_buy_at = None
+        if hasattr(repo, "latest_ioc_canceled_order"):
+            latest_ioc_canceled_buy = repo.latest_ioc_canceled_order(
+                side="buy",
+                lookback_seconds=latest_lookup_seconds,
+            )
+            latest_ioc_canceled_buy_at = (
+                _ensure_utc(latest_ioc_canceled_buy.created_at)
+                if latest_ioc_canceled_buy is not None
+                else None
+            )
+        elif hasattr(repo, "latest_ioc_canceled_buy_at"):
+            latest_ioc_canceled_buy_at = repo.latest_ioc_canceled_buy_at(
+                lookback_seconds=latest_lookup_seconds,
+            )
+        now = datetime.now(UTC)
+        if recent_ioc_canceled_buys >= self.settings.max_recent_ioc_cancels:
+            escalation_anchor = latest_ioc_canceled_buy_at or now
+            escalation_until = escalation_anchor + timedelta(
+                seconds=self.settings.ioc_cancel_escalation_cooldown_seconds
+            )
+            self._ioc_cancel_escalated_until = escalation_until if now < escalation_until else None
+        elif self._ioc_cancel_escalated_until is not None:
+            if now < self._ioc_cancel_escalated_until:
+                recent_ioc_canceled_buys = max(
+                    recent_ioc_canceled_buys,
+                    self.settings.max_recent_ioc_cancels,
+                )
+            else:
+                self._ioc_cancel_escalated_until = None
+        return recent_ioc_canceled_buys, latest_ioc_canceled_buy_at
+
+    async def _guard_order_decision(
+        self,
+        decision: Decision,
+        position: PositionState,
+        *,
+        latest_bar_timestamp: str | None = None,
+    ) -> tuple[Decision, bool]:
         if decision.action == "buy" and position.has_position:
             return Decision(decision.symbol, "hold", "already_holding_btc"), False
         if decision.action == "sell" and not position.has_position:
             return Decision(decision.symbol, "hold", "sell_without_position"), False
         if decision.action not in {"buy", "sell"}:
             return decision, False
+        if self._is_duplicate_bar_order_attempt(decision, latest_bar_timestamp):
+            self.logger.event(
+                "order_blocked",
+                symbol=decision.symbol,
+                side=decision.action,
+                reason="duplicate_order_bar",
+                latest_bar_timestamp=latest_bar_timestamp,
+            )
+            return Decision(decision.symbol, "hold", "duplicate_order_bar"), False
         if self._order_lock.locked():
             age_seconds = self._order_lock_age_seconds()
             self.logger.event(
@@ -201,6 +334,16 @@ class Trader:
             return Decision(decision.symbol, "hold", "order_in_flight"), False
         self._order_lock_started_at = datetime.now(UTC)
         return decision, True
+
+    def _is_duplicate_bar_order_attempt(self, decision: Decision, latest_bar_timestamp: str | None) -> bool:
+        if latest_bar_timestamp is None or decision.reason in HARD_RISK_EXIT_REASONS:
+            return False
+        return self._last_order_attempt_bar_by_side.get(decision.action) == latest_bar_timestamp
+
+    def _remember_order_attempt_bar(self, decision: Decision, latest_bar_timestamp: str | None) -> None:
+        if latest_bar_timestamp is None or decision.action not in {"buy", "sell"}:
+            return
+        self._last_order_attempt_bar_by_side[decision.action] = latest_bar_timestamp
 
     def _order_lock_age_seconds(self) -> float | None:
         if self._order_lock_started_at is None:
@@ -259,8 +402,18 @@ class Trader:
             return
         if not self._discord_alerts_enabled():
             return
+        now = datetime.now(UTC)
+        if (
+            self._last_risk_alert_reason == decision.reason
+            and self._last_risk_alert_sent_at is not None
+            and (now - self._last_risk_alert_sent_at).total_seconds()
+            < self.settings.discord_risk_alert_cooldown_seconds
+        ):
+            return
         try:
             await self.notifier.risk_alert(decision.reason)
+            self._last_risk_alert_reason = decision.reason
+            self._last_risk_alert_sent_at = now
         except Exception as exc:
             self._log_discord_alert_failure("risk", exc)
 
@@ -303,3 +456,27 @@ def _mid_price_from_quote(quote: dict) -> float | None:
     if bid is not None and ask is not None:
         return (bid + ask) / 2
     return _float_quote(quote, "mid_price", "mid")
+
+
+def _latest_bar_timestamp(feature_row, prediction: dict) -> str | None:
+    value = None
+    try:
+        value = feature_row.get("timestamp")
+    except AttributeError:
+        value = None
+    if value is None:
+        value = prediction.get("timestamp")
+    if value is None:
+        return None
+    try:
+        return value.isoformat()
+    except AttributeError:
+        return str(value)
+
+
+def _ensure_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

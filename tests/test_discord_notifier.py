@@ -220,6 +220,20 @@ async def test_risk_alert_uses_embed(recording_http, fake_logger):
 
 
 @pytest.mark.anyio
+async def test_auto_trading_paused_alert_uses_embed(recording_http, fake_logger):
+    notifier = DiscordNotifier(enabled_settings())
+
+    await notifier.auto_trading_paused_alert("repeated_risk_block:trade_cooldown_active")
+
+    embed = recording_http.requests[0]["json"]["embeds"][0]
+    fields = {item["name"]: item["value"] for item in embed["fields"]}
+    assert embed["title"] == "Auto trading paused"
+    assert embed["color"] == DISCORD_RED
+    assert fields["Symbol"] == "BTC/USD"
+    assert fields["Reason"] == "repeated_risk_block:trade_cooldown_active"
+
+
+@pytest.mark.anyio
 async def test_model_alert_uses_embed(recording_http, fake_logger):
     notifier = DiscordNotifier(enabled_settings(discord_alert_on_model=True))
 

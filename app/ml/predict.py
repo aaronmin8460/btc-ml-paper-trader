@@ -14,11 +14,14 @@ class Predictor:
     def predict(self, bars: pd.DataFrame, quote: dict | None = None) -> dict:
         row = latest_feature_row(bars, quote=quote)
         active_path = ModelRegistry(self.settings).active_model_path()
-        if active_path and active_path.exists():
+        model_available = bool(active_path and active_path.exists())
+        if model_available:
             model = MLSignalModel.load(active_path)
             buy_probability = float(model.predict_proba(row)[0])
+            prediction_source = "model"
         else:
             buy_probability = self._fallback_probability(row)
+            prediction_source = "fallback"
         sell_probability = float(max(0.0, min(1.0, 1.0 - buy_probability)))
         result = {
             "symbol": self.settings.symbol,
@@ -27,6 +30,8 @@ class Predictor:
             "sell_probability": sell_probability,
             "features": row.iloc[-1].to_dict(),
             "model_path": str(active_path) if active_path else None,
+            "prediction_source": prediction_source,
+            "model_available": model_available,
         }
         get_logger().event(
             "prediction",
@@ -34,6 +39,8 @@ class Predictor:
             buy_probability=buy_probability,
             sell_probability=sell_probability,
             model_path=result["model_path"],
+            prediction_source=prediction_source,
+            model_available=model_available,
         )
         return result
 

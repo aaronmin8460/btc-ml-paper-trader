@@ -1,7 +1,10 @@
+from datetime import timedelta
+
 import pandas as pd
 import pytest
 
 from app.config import Settings
+from app.risk.risk_manager import PositionState
 from app.services.trader import Trader
 from app.strategy.decision_engine import Decision
 
@@ -41,13 +44,28 @@ class FakeDecisionEngine:
 
 
 class FakeBroker:
-    def __init__(self, events: list[str], order_response: dict | None = None, position: dict | None = None) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        order_response: dict | None = None,
+        position: dict | None = None,
+        account_response: dict | None = None,
+    ) -> None:
         self.events = events
         self.order_response = order_response or {"id": "paper-order-1", "status": "submitted"}
         self.position = position
+        self.account_response = account_response
 
     async def get_position(self, symbol):
         return self.position
+
+    def credentials_available(self):
+        return self.account_response is not None
+
+    async def get_account(self):
+        if self.account_response is None:
+            raise AssertionError("get_account should not be called without credentials")
+        return self.account_response
 
     async def submit_market_order(self, **kwargs):
         self.events.append("submit_order")
@@ -116,7 +134,9 @@ class FakeSession:
 class FakeRepository:
     signals = []
     orders = []
+    account_snapshots = []
     trade_frequency = None
+    order_to_return = None
 
     def __init__(self, db) -> None:
         pass
@@ -125,13 +145,19 @@ class FakeRepository:
     def reset(cls) -> None:
         cls.signals = []
         cls.orders = []
+        cls.account_snapshots = []
         cls.trade_frequency = None
+        cls.order_to_return = None
 
     def add_signal(self, *args) -> None:
         self.signals.append(args)
 
-    def add_order(self, **kwargs) -> None:
+    def add_order(self, **kwargs):
         self.orders.append(kwargs)
+        return self.order_to_return
+
+    def add_account_snapshot(self, **kwargs):
+        self.account_snapshots.append(kwargs)
 
     def trade_frequency_state(self):
         return self.trade_frequency
@@ -147,9 +173,12 @@ def trader_factory(monkeypatch):
         events: list[str] | None = None,
         market_error: Exception | None = None,
         trade_frequency=None,
+        stored_order=None,
+        account_response: dict | None = None,
     ) -> Trader:
         FakeRepository.reset()
         FakeRepository.trade_frequency = trade_frequency
+        FakeRepository.order_to_return = stored_order
         monkeypatch.setattr("app.services.trader.init_db", lambda: None)
         monkeypatch.setattr("app.services.trader.SessionLocal", FakeSession)
         monkeypatch.setattr("app.services.trader.Repository", FakeRepository)
@@ -166,12 +195,23 @@ def trader_factory(monkeypatch):
         position = None
         if decision.action == "sell":
             position = {"qty": "0.01", "avg_entry_price": "65000", "market_value": "650", "current_price": "65000"}
-        trader.broker = FakeBroker(flow_events, position=position)
+        trader.broker = FakeBroker(flow_events, position=position, account_response=account_response)
         trader.logger = FakeLogger()
         trader.notifier = notifier if notifier is not None else FakeNotifier(flow_events)
         return trader
 
     return build_trader
+
+
+def _risk_alert_settings(**overrides) -> Settings:
+    defaults = {
+        "_env_file": None,
+        "discord_alerts_enabled": True,
+        "discord_webhook_url": "https://discord.example/webhook",
+        "discord_risk_alert_cooldown_seconds": 300,
+    }
+    defaults.update(overrides)
+    return Settings(**defaults)
 
 
 @pytest.mark.anyio
@@ -249,6 +289,67 @@ async def test_order_alert_called_after_order_submission(trader_factory):
 
 
 @pytest.mark.anyio
+async def test_filled_order_updates_trade_accounting(trader_factory, monkeypatch):
+    settings = Settings(_env_file=None, trading_enabled=True, discord_alert_on_order=False)
+    decision = Decision("BTC/USD", "buy", "ml_and_rules_approved", notional=25)
+    stored_order = object()
+    calls = []
+
+    def fake_record_filled_order_trade(repo, order, settings):
+        calls.append((repo, order, settings))
+
+    monkeypatch.setattr("app.services.trader.record_filled_order_trade", fake_record_filled_order_trade)
+    trader = trader_factory(
+        settings=settings,
+        decision=decision,
+        stored_order=stored_order,
+    )
+    trader.broker.order_response = {
+        "id": "paper-order-1",
+        "status": "filled",
+        "filled_qty": "0.001",
+        "filled_avg_price": "65000",
+    }
+
+    await trader.run_once()
+
+    assert len(calls) == 1
+    assert calls[0][1] is stored_order
+    assert calls[0][2] is settings
+
+
+@pytest.mark.anyio
+async def test_account_snapshot_saved_when_account_payload_available(trader_factory):
+    settings = Settings(_env_file=None, trading_enabled=False)
+    account = {
+        "equity": "1000.50",
+        "cash": "900.25",
+        "buying_power": "800.75",
+        "portfolio_value": "1001.00",
+        "currency": "USD",
+        "secret_key": "must-not-leak",
+    }
+    trader = trader_factory(
+        settings=settings,
+        decision=Decision("BTC/USD", "hold", "dashboard_test"),
+        account_response=account,
+    )
+
+    await trader.run_once()
+
+    assert FakeRepository.account_snapshots == [
+        {
+            "equity": "1000.50",
+            "cash": "900.25",
+            "buying_power": "800.75",
+            "portfolio_value": "1001.00",
+            "currency": "USD",
+            "raw_response": account,
+        }
+    ]
+
+
+@pytest.mark.anyio
 async def test_error_alert_called_when_run_once_raises(trader_factory):
     settings = Settings(
         _env_file=None,
@@ -276,7 +377,8 @@ async def test_error_alert_called_when_run_once_raises(trader_factory):
 
 
 @pytest.mark.anyio
-async def test_kill_switch_block_sends_risk_alert(trader_factory):
+@pytest.mark.parametrize("reason", ["max_trades_per_hour_reached", "max_order_attempts_per_hour_reached"])
+async def test_kill_switch_block_sends_risk_alert(trader_factory, reason):
     settings = Settings(
         _env_file=None,
         discord_alerts_enabled=True,
@@ -287,13 +389,85 @@ async def test_kill_switch_block_sends_risk_alert(trader_factory):
     notifier = FakeNotifier()
     trader = trader_factory(
         settings=settings,
-        decision=Decision("BTC/USD", "hold", "max_trades_per_hour_reached"),
+        decision=Decision("BTC/USD", "hold", reason),
         notifier=notifier,
     )
 
     await trader.run_once()
 
-    assert notifier.calls == [("risk", ("max_trades_per_hour_reached",))]
+    assert notifier.calls == [("risk", (reason,))]
+
+
+@pytest.mark.anyio
+async def test_first_risk_alert_is_sent(trader_factory):
+    notifier = FakeNotifier()
+    trader = trader_factory(
+        settings=_risk_alert_settings(),
+        decision=Decision("BTC/USD", "hold", "trade_cooldown_active"),
+        notifier=notifier,
+    )
+
+    await trader._send_risk_alert(Decision("BTC/USD", "hold", "trade_cooldown_active"))
+
+    assert notifier.calls == [("risk", ("trade_cooldown_active",))]
+
+
+@pytest.mark.anyio
+async def test_repeated_same_risk_alert_within_cooldown_is_skipped(trader_factory):
+    notifier = FakeNotifier()
+    trader = trader_factory(
+        settings=_risk_alert_settings(),
+        decision=Decision("BTC/USD", "hold", "trade_cooldown_active"),
+        notifier=notifier,
+    )
+    decision = Decision("BTC/USD", "hold", "trade_cooldown_active")
+
+    await trader._send_risk_alert(decision)
+    await trader._send_risk_alert(decision)
+
+    assert notifier.calls == [("risk", ("trade_cooldown_active",))]
+
+
+@pytest.mark.anyio
+async def test_different_risk_reason_sends_immediately(trader_factory):
+    notifier = FakeNotifier()
+    trader = trader_factory(
+        settings=_risk_alert_settings(),
+        decision=Decision("BTC/USD", "hold", "trade_cooldown_active"),
+        notifier=notifier,
+    )
+
+    await trader._send_risk_alert(Decision("BTC/USD", "hold", "trade_cooldown_active"))
+    await trader._send_risk_alert(Decision("BTC/USD", "hold", "api_budget_exhausted"))
+
+    assert notifier.calls == [
+        ("risk", ("trade_cooldown_active",)),
+        ("risk", ("api_budget_exhausted",)),
+    ]
+
+
+@pytest.mark.anyio
+async def test_same_risk_reason_after_cooldown_sends_again(trader_factory):
+    notifier = FakeNotifier()
+    settings = _risk_alert_settings(discord_risk_alert_cooldown_seconds=300)
+    trader = trader_factory(
+        settings=settings,
+        decision=Decision("BTC/USD", "hold", "trade_cooldown_active"),
+        notifier=notifier,
+    )
+    decision = Decision("BTC/USD", "hold", "trade_cooldown_active")
+
+    await trader._send_risk_alert(decision)
+    assert trader._last_risk_alert_sent_at is not None
+    trader._last_risk_alert_sent_at -= timedelta(
+        seconds=settings.discord_risk_alert_cooldown_seconds + 1,
+    )
+    await trader._send_risk_alert(decision)
+
+    assert notifier.calls == [
+        ("risk", ("trade_cooldown_active",)),
+        ("risk", ("trade_cooldown_active",)),
+    ]
 
 
 @pytest.mark.anyio
@@ -351,3 +525,85 @@ async def test_duplicate_order_lock_blocks_concurrent_attempt(trader_factory):
     assert result["decision"]["action"] == "hold"
     assert result["decision"]["reason"] == "order_in_flight"
     trader._order_lock.release()
+
+
+@pytest.mark.anyio
+async def test_duplicate_buy_on_same_latest_bar_is_blocked(trader_factory):
+    settings = Settings(_env_file=None, trading_enabled=True)
+    first = Decision("BTC/USD", "buy", "scalping_dip_entry", notional=25)
+    trader = trader_factory(settings=settings, decision=first)
+    trader._remember_order_attempt_bar(first, "2026-05-29T12:00:00+00:00")
+
+    decision, acquired = await trader._guard_order_decision(
+        Decision("BTC/USD", "buy", "scalping_dip_entry", notional=25),
+        PositionState(),
+        latest_bar_timestamp="2026-05-29T12:00:00+00:00",
+    )
+
+    assert acquired is False
+    assert decision.action == "hold"
+    assert decision.reason == "duplicate_order_bar"
+
+
+@pytest.mark.anyio
+async def test_duplicate_non_hard_sell_on_same_latest_bar_is_blocked(trader_factory):
+    settings = Settings(_env_file=None, trading_enabled=True)
+    first = Decision("BTC/USD", "sell", "scalping_weak_quote_exit", qty=0.01)
+    trader = trader_factory(settings=settings, decision=first)
+    trader._remember_order_attempt_bar(first, "2026-05-29T12:00:00+00:00")
+
+    decision, acquired = await trader._guard_order_decision(
+        Decision("BTC/USD", "sell", "scalping_weak_quote_exit", qty=0.01),
+        PositionState(qty=0.01),
+        latest_bar_timestamp="2026-05-29T12:00:00+00:00",
+    )
+
+    assert acquired is False
+    assert decision.action == "hold"
+    assert decision.reason == "duplicate_order_bar"
+
+
+@pytest.mark.anyio
+async def test_hard_risk_exit_sell_bypasses_duplicate_bar_guard(trader_factory):
+    settings = Settings(_env_file=None, trading_enabled=True)
+    first = Decision("BTC/USD", "sell", "scalping_weak_quote_exit", qty=0.01)
+    trader = trader_factory(settings=settings, decision=first)
+    trader._remember_order_attempt_bar(first, "2026-05-29T12:00:00+00:00")
+
+    decision, acquired = await trader._guard_order_decision(
+        Decision("BTC/USD", "sell", "scalping_stop_loss", qty=0.01),
+        PositionState(qty=0.01),
+        latest_bar_timestamp="2026-05-29T12:00:00+00:00",
+    )
+
+    assert acquired is True
+    assert decision.action == "sell"
+    trader._order_lock.release()
+
+
+def test_ioc_cancel_escalation_cooldown_keeps_guard_active(trader_factory):
+    class FakeIocRepository:
+        def __init__(self, count: int) -> None:
+            self.count = count
+
+        def recent_ioc_canceled_buy_count(self, **kwargs):
+            return self.count
+
+        def latest_ioc_canceled_buy_at(self, **kwargs):
+            return None
+
+    settings = Settings(
+        _env_file=None,
+        max_recent_ioc_cancels=3,
+        ioc_cancel_escalation_cooldown_seconds=600,
+    )
+    trader = trader_factory(
+        settings=settings,
+        decision=Decision("BTC/USD", "hold", "not_reached"),
+    )
+
+    first_count, _ = trader._ioc_cancel_state(FakeIocRepository(3))
+    cooled_count, _ = trader._ioc_cancel_state(FakeIocRepository(0))
+
+    assert first_count == 3
+    assert cooled_count == 3

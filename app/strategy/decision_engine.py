@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import pandas as pd
@@ -36,10 +37,13 @@ class DecisionEngine:
         position: PositionState,
         trading_enabled: bool | None = None,
         trade_frequency: TradeFrequencyState | None = None,
+        order_attempt_frequency: TradeFrequencyState | None = None,
+        filled_trade_frequency: TradeFrequencyState | None = None,
         quote: dict | None = None,
         api_budget: dict | None = None,
         account_state: AccountState | None = None,
         recent_ioc_canceled_buys: int = 0,
+        latest_ioc_canceled_buy_at: datetime | None = None,
     ) -> Decision:
         symbol = prediction.get("symbol", ALLOWED_SYMBOL)
         assert_btc_only(symbol, context="strategy_decision")
@@ -55,11 +59,17 @@ class DecisionEngine:
                 feature_row=feature_row,
                 position=position,
                 trading_enabled=trading_enabled,
-                trade_frequency=trade_frequency,
+                trade_frequency=filled_trade_frequency or trade_frequency,
+                order_attempt_frequency=order_attempt_frequency,
                 latest_price=_quote_mid_price(quote) or latest_price,
                 api_budget=api_budget,
                 account_state=account_state,
                 recent_ioc_canceled_buys=recent_ioc_canceled_buys,
+                latest_ioc_canceled_buy_at=latest_ioc_canceled_buy_at,
+                model_unavailable=_model_unavailable(
+                    prediction,
+                    self.settings,
+                ),
             )
 
         force_sell, sell_reason = self.risk.should_force_sell(position=position, latest_price=latest_price, now=utc_now())
@@ -69,10 +79,14 @@ class DecisionEngine:
 
         sell_gap = sell_probability - buy_probability
         if position.has_position and sell_probability >= self.settings.min_sell_probability and sell_gap >= self.settings.confidence_gap_required:
+            if _model_unavailable(prediction, self.settings):
+                return Decision(symbol, "hold", "model_unavailable")
             approved, reason = self.risk.approve_sell(position)
             return Decision(symbol, "sell" if approved else "hold", "ml_sell_signal" if approved else reason, qty=position.qty if approved else None)
 
         if not position.has_position:
+            if _model_unavailable(prediction, self.settings):
+                return Decision(symbol, "hold", "model_unavailable")
             if buy_probability < self.settings.min_buy_probability:
                 return Decision(symbol, "hold", "buy_probability_below_threshold")
             if buy_probability - sell_probability < self.settings.confidence_gap_required:
@@ -85,7 +99,8 @@ class DecisionEngine:
                 notional=notional,
                 position=position,
                 latest_price=latest_price,
-                trade_frequency=trade_frequency,
+                trade_frequency=filled_trade_frequency or trade_frequency,
+                order_attempt_frequency=order_attempt_frequency,
                 account_state=account_state,
             )
             if not approved:
@@ -106,15 +121,19 @@ class DecisionEngine:
         position: PositionState,
         trading_enabled: bool | None,
         trade_frequency: TradeFrequencyState | None,
+        order_attempt_frequency: TradeFrequencyState | None,
         latest_price: float,
         api_budget: dict | None,
         account_state: AccountState | None,
         recent_ioc_canceled_buys: int,
+        latest_ioc_canceled_buy_at: datetime | None,
+        model_unavailable: bool,
     ) -> Decision:
         if latest_price <= 0:
             return Decision(symbol, "hold", "invalid_price")
 
-        force_sell, sell_reason = self.risk.should_force_sell(position=position, latest_price=latest_price, now=utc_now())
+        now = utc_now()
+        force_sell, sell_reason = self.risk.should_force_sell(position=position, latest_price=latest_price, now=now)
         if force_sell:
             approved, reason = self.risk.approve_sell(position)
             return Decision(symbol, "sell" if approved else "hold", sell_reason if approved else reason, qty=position.qty if approved else None)
@@ -127,6 +146,14 @@ class DecisionEngine:
                 spread_bps > self.settings.max_spread_bps
                 or quote_imbalance < self.settings.scalping_quote_imbalance_exit
             ):
+                if not _held_long_enough_for_weak_quote_exit(
+                    position,
+                    now=now,
+                    min_hold_seconds=self.settings.min_hold_seconds_before_weak_quote_exit,
+                ):
+                    return Decision(symbol, "hold", "weak_quote_exit_min_hold_active")
+                if model_unavailable:
+                    return Decision(symbol, "hold", "model_unavailable")
                 approved, reason = self.risk.approve_sell(position)
                 return Decision(symbol, "sell" if approved else "hold", "scalping_weak_quote_exit" if approved else reason, qty=position.qty if approved else None)
             return Decision(symbol, "hold", "scalping_holding_position")
@@ -134,8 +161,14 @@ class DecisionEngine:
         if _api_hard_budget_exhausted(api_budget):
             return Decision(symbol, "hold", "api_budget_exhausted")
 
-        if buy_probability < self.settings.scalping_buy_probability_floor:
+        if model_unavailable:
+            return Decision(symbol, "hold", "model_unavailable")
+
+        if buy_probability <= self.settings.scalping_buy_probability_floor:
             return Decision(symbol, "hold", "scalping_buy_probability_below_floor")
+
+        if buy_probability - sell_probability < self.settings.scalping_confidence_gap_required:
+            return Decision(symbol, "hold", "scalping_confidence_gap_too_small")
 
         allowed, rule_reason = self.rules.allow_buy(feature_row, buy_probability=buy_probability)
         if not allowed:
@@ -145,8 +178,15 @@ class DecisionEngine:
         if momentum < self.settings.scalping_min_momentum_pct:
             return Decision(symbol, "hold", "scalping_momentum_too_weak")
 
-        if recent_ioc_canceled_buys >= 3:
+        if recent_ioc_canceled_buys >= self.settings.max_recent_ioc_cancels:
             return Decision(symbol, "hold", "recent_ioc_cancels_too_high")
+
+        if _timestamp_within_seconds(
+            latest_ioc_canceled_buy_at,
+            now=now,
+            seconds=self.settings.ioc_cancel_cooldown_seconds,
+        ):
+            return Decision(symbol, "hold", "ioc_cancel_cooldown_active")
 
         sma_20_distance = float(feature_row.get("sma_20_distance", 0) or 0)
         log_return_5 = float(feature_row.get("log_return_5", 0) or 0)
@@ -164,6 +204,7 @@ class DecisionEngine:
             position=position,
             latest_price=latest_price,
             trade_frequency=trade_frequency,
+            order_attempt_frequency=order_attempt_frequency,
             account_state=account_state,
         )
         if not approved:
@@ -208,3 +249,31 @@ def _quote_float(quote: dict, *keys: str) -> float | None:
         if parsed > 0:
             return parsed
     return None
+
+
+def _model_unavailable(prediction: dict, settings: Settings) -> bool:
+    source = str(prediction.get("prediction_source") or prediction.get("source") or "").lower()
+    return source == "fallback" and not settings.allow_fallback_trading
+
+
+def _timestamp_within_seconds(value: datetime | None, *, now: datetime, seconds: int | float) -> bool:
+    if value is None:
+        return False
+    timestamp = value
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    return now - timestamp < timedelta(seconds=max(0, seconds))
+
+
+def _held_long_enough_for_weak_quote_exit(
+    position: PositionState,
+    *,
+    now: datetime,
+    min_hold_seconds: int | float,
+) -> bool:
+    if min_hold_seconds <= 0 or position.opened_at is None:
+        return True
+    opened_at = position.opened_at
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=UTC)
+    return now - opened_at >= timedelta(seconds=min_hold_seconds)

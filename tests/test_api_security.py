@@ -21,6 +21,10 @@ def test_runtime_read_endpoints_require_admin_token(monkeypatch):
 
     client = TestClient(main.app)
 
-    for path in ["/config/safe", "/position", "/signals/latest", "/orders", "/debug/latest-bars"]:
+    for path in ["/config/safe", "/position", "/signals/latest", "/orders", "/debug/latest-bars", "/admin/status"]:
         response = client.get(path)
+        assert response.status_code == 401, path
+
+    for path in ["/admin/pause", "/admin/resume"]:
+        response = client.post(path)
         assert response.status_code == 401, path

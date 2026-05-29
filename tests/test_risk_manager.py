@@ -75,6 +75,36 @@ def test_buy_blocked_after_daily_trade_limit():
     assert reason == "max_daily_trades_reached"
 
 
+def test_canceled_orders_count_toward_hourly_order_attempt_limit():
+    settings = Settings(_env_file=None, max_order_attempts_per_hour=2)
+    risk = RiskManager(settings)
+
+    approved, reason = risk.approve_buy(
+        notional=25,
+        position=PositionState(),
+        latest_price=65000,
+        order_attempt_frequency=TradeFrequencyState(trades_last_hour=2),
+    )
+
+    assert approved is False
+    assert reason == "max_order_attempts_per_hour_reached"
+
+
+def test_canceled_orders_count_toward_daily_order_attempt_limit():
+    settings = Settings(_env_file=None, max_order_attempts_per_day=3)
+    risk = RiskManager(settings)
+
+    approved, reason = risk.approve_buy(
+        notional=25,
+        position=PositionState(),
+        latest_price=65000,
+        order_attempt_frequency=TradeFrequencyState(trades_today=3),
+    )
+
+    assert approved is False
+    assert reason == "max_order_attempts_per_day_reached"
+
+
 def test_buy_blocked_during_trade_cooldown():
     now = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
     settings = Settings(_env_file=None, min_seconds_between_trades=30)

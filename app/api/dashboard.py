@@ -1,6 +1,6 @@
 import json
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -10,8 +10,9 @@ from app.broker.alpaca_client import AlpacaClient
 from app.config import ALLOWED_SYMBOL, Settings
 from app.data.market_data import MarketDataClient
 from app.db.database import SessionLocal
-from app.db.models import Order, Signal, Trade
+from app.db.models import AccountSnapshot, Order, Signal, Trade
 from app.db.repository import Repository
+from app.ml.registry import ModelRegistry
 from app.risk.risk_manager import PositionState, account_state_from_payload
 from app.utils.rate_limiter import get_alpaca_rate_limiter
 from app.utils.time import iso_utc_now
@@ -20,6 +21,32 @@ from app.utils.time import iso_utc_now
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 SECRET_KEY_PARTS = ("secret", "token", "key", "webhook", "authorization", "password")
+RISK_BLOCK_REASONS = {
+    "max_order_attempts_per_hour_reached",
+    "max_order_attempts_per_day_reached",
+    "max_trades_per_hour_reached",
+    "max_daily_trades_reached",
+    "max_consecutive_losses_reached",
+    "trade_cooldown_active",
+    "order_in_flight",
+    "already_holding_btc",
+    "sell_without_position",
+    "api_budget_exhausted",
+    "account_daily_loss_usd_reached",
+    "account_daily_loss_pct_reached",
+    "account_drawdown_reached",
+    "account_data_required_unavailable",
+    "buying_power_too_low",
+    "recent_ioc_cancels_too_high",
+    "ioc_cancel_cooldown_active",
+    "max_daily_loss_reached",
+    "max_drawdown_reached",
+    "cooldown_after_loss",
+    "order_notional_exceeds_max_position",
+    "order_notional_exceeds_total_exposure",
+    "configured_order_notional_too_large",
+    "model_unavailable",
+}
 
 
 @router.get("/summary")
@@ -38,6 +65,7 @@ async def dashboard_summary(request: Request) -> dict:
         trades = repo.all_trades_ordered()
         order_summary = repo.order_summary()
         latest_model_run = repo.recent_model_runs(1)
+        ioc_cancel_summary = _ioc_cancel_summary(settings, repo)
 
     position = await _current_position(trader)
     account_summary = await _account_summary(broker)
@@ -78,6 +106,7 @@ async def dashboard_summary(request: Request) -> dict:
         **trade_metrics,
         "last_order": _serialize_order(latest_order) if latest_order else None,
         "last_trade": _serialize_trade(latest_trade) if latest_trade else None,
+        "ioc_cancel_guard": ioc_cancel_summary,
         "data_freshness": {
             "latest_timestamp": market_summary.get("latest_timestamp"),
             "current_utc_time": market_summary.get("current_utc_time"),
@@ -113,6 +142,42 @@ async def dashboard_equity_curve() -> list[dict]:
     with SessionLocal() as db:
         trades = Repository(db).all_trades_ordered()
     return _equity_curve(trades)
+
+
+@router.get("/account-snapshots")
+async def dashboard_account_snapshots(limit: int = Query(default=500, ge=1)) -> list[dict]:
+    with SessionLocal() as db:
+        rows = Repository(db).recent_account_snapshots(_cap_limit(limit))
+        return [_serialize_account_snapshot(row) for row in rows]
+
+
+@router.get("/portfolio-curve")
+async def dashboard_portfolio_curve() -> list[dict]:
+    with SessionLocal() as db:
+        rows = Repository(db).recent_account_snapshots(500)
+    return _portfolio_curve(rows)
+
+
+@router.get("/trading-status")
+async def dashboard_trading_status(request: Request) -> dict:
+    settings = _settings_from_request(request)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    pause_status = _scheduler_pause_status(scheduler)
+    with SessionLocal() as db:
+        repo = Repository(db)
+        latest_signal = repo.latest_signal()
+        recent_signals = repo.recent_signals(50)
+        ioc_cancel_summary = _ioc_cancel_summary(settings, repo)
+    return _trading_status_payload(
+        settings=settings,
+        scheduler_running=getattr(scheduler, "running", None),
+        latest_signal=latest_signal,
+        recent_signals=recent_signals,
+        ioc_cancel_summary=ioc_cancel_summary,
+        paused=bool(pause_status.get("paused")),
+        pause_reason=pause_status.get("pause_reason"),
+        paused_at=pause_status.get("paused_at"),
+    )
 
 
 @router.get("/market")
@@ -210,10 +275,11 @@ async def _market_snapshot(settings: Settings, market: MarketDataClient) -> dict
 
 
 def _trade_metrics(trades: list[Trade], position: PositionState) -> dict:
-    pnl_values = _known_trade_pnls(trades)
+    pnl_values = _closed_trade_pnls(trades)
     total_realized_pnl = float(sum(pnl_values)) if pnl_values else 0.0
     winning_trades = [pnl for pnl in pnl_values if pnl > 0]
     return {
+        "closed_trades": len(pnl_values),
         "total_realized_pnl": total_realized_pnl,
         "total_return_pct": None,
         "unrealized_pnl": _unrealized_pnl(position),
@@ -230,6 +296,8 @@ def _equity_curve(trades: list[Trade]) -> list[dict]:
     peak = 0.0
     points = []
     for trade in trades:
+        if str(trade.side).lower() != "sell":
+            continue
         pnl = _safe_float(trade.pnl)
         if pnl is None:
             continue
@@ -244,6 +312,122 @@ def _equity_curve(trades: list[Trade]) -> list[dict]:
             }
         )
     return points
+
+
+def _portfolio_curve(snapshots: list[AccountSnapshot]) -> list[dict]:
+    return [
+        {
+            "timestamp": _serialize_timestamp(snapshot.created_at),
+            "equity": _safe_float(snapshot.equity),
+            "cash": _safe_float(snapshot.cash),
+            "buying_power": _safe_float(snapshot.buying_power),
+            "portfolio_value": _safe_float(snapshot.portfolio_value),
+        }
+        for snapshot in sorted(snapshots, key=lambda row: row.created_at)
+    ]
+
+
+def _trading_status_payload(
+    *,
+    settings: Settings,
+    scheduler_running: bool | None,
+    latest_signal: Signal | None,
+    recent_signals: list[Signal],
+    ioc_cancel_summary: dict,
+    paused: bool = False,
+    pause_reason: str | None = None,
+    paused_at: str | None = None,
+) -> dict:
+    latest_risk_reason = _latest_risk_block_reason(recent_signals)
+    model_available = _model_available(settings)
+    prediction_source = "model" if model_available else "fallback"
+    state, state_tone = _trading_state(
+        settings=settings,
+        scheduler_running=scheduler_running,
+        paused=paused,
+        latest_decision_action=latest_signal.action if latest_signal else None,
+        latest_risk_block_reason=latest_risk_reason,
+        ioc_cooldown_active=bool(ioc_cancel_summary.get("cooldown_active")),
+    )
+    return {
+        "state": state,
+        "state_tone": state_tone,
+        "paused": paused,
+        "pause_reason": pause_reason,
+        "paused_at": paused_at,
+        "latest_decision_action": latest_signal.action if latest_signal else None,
+        "latest_decision_reason": latest_signal.reason if latest_signal else None,
+        "latest_risk_block_reason": latest_risk_reason,
+        "current_ioc_cancel_count": ioc_cancel_summary.get("recent_buy_ioc_cancel_count"),
+        "ioc_cancel_lookback_seconds": ioc_cancel_summary.get("lookback_seconds"),
+        "ioc_cooldown_active": bool(ioc_cancel_summary.get("cooldown_active")),
+        "ioc_cooldown_expires_at": ioc_cancel_summary.get("cooldown_expires_at"),
+        "scheduler_running": scheduler_running,
+        "auto_trade_enabled": settings.auto_trade_enabled,
+        "trading_enabled": settings.trading_enabled,
+        "paper_trading_only": settings.paper_trading_only,
+        "model_available": model_available,
+        "prediction_source": prediction_source,
+        "fallback_trading_allowed": settings.allow_fallback_trading,
+    }
+
+
+def _latest_risk_block_reason(signals: list[Signal]) -> str | None:
+    for signal in signals:
+        if signal.action == "hold" and signal.reason in RISK_BLOCK_REASONS:
+            return signal.reason
+    return None
+
+
+def _model_available(settings: Settings) -> bool:
+    active_path = ModelRegistry(settings).active_model_path()
+    return bool(active_path and active_path.exists())
+
+
+def _scheduler_pause_status(scheduler: Any) -> dict:
+    if scheduler is None:
+        return {"paused": False, "pause_reason": None, "paused_at": None}
+    if hasattr(scheduler, "status"):
+        try:
+            status = scheduler.status()
+            return {
+                "paused": bool(status.get("paused")),
+                "pause_reason": status.get("pause_reason"),
+                "paused_at": _serialize_timestamp(status.get("paused_at")),
+            }
+        except Exception:
+            pass
+    return {
+        "paused": bool(getattr(scheduler, "paused", False)),
+        "pause_reason": getattr(scheduler, "pause_reason", None),
+        "paused_at": _serialize_timestamp(getattr(scheduler, "paused_at", None)),
+    }
+
+
+def _trading_state(
+    *,
+    settings: Settings,
+    scheduler_running: bool | None,
+    paused: bool,
+    latest_decision_action: str | None,
+    latest_risk_block_reason: str | None,
+    ioc_cooldown_active: bool,
+) -> tuple[str, str]:
+    if paused:
+        return "paused", "red"
+    if not settings.trading_enabled:
+        return "disabled", "gray"
+    if not settings.auto_trade_enabled:
+        return "paused", "red"
+    if scheduler_running is False:
+        return "stopped", "red"
+    if ioc_cooldown_active:
+        return "cooling_down", "yellow"
+    if latest_risk_block_reason and latest_decision_action == "hold":
+        return "blocked", "red"
+    if latest_decision_action == "hold":
+        return "waiting", "yellow"
+    return "running", "green"
 
 
 def _unrealized_pnl(position: PositionState) -> float | None:
@@ -303,6 +487,18 @@ def _serialize_trade(trade: Trade) -> dict:
     }
 
 
+def _serialize_account_snapshot(snapshot: AccountSnapshot) -> dict:
+    return {
+        "created_at": _serialize_timestamp(snapshot.created_at),
+        "equity": _safe_float(snapshot.equity),
+        "cash": _safe_float(snapshot.cash),
+        "buying_power": _safe_float(snapshot.buying_power),
+        "portfolio_value": _safe_float(snapshot.portfolio_value),
+        "currency": snapshot.currency,
+        "raw_response": _parse_order_raw_response(snapshot.raw_response),
+    }
+
+
 def _serialize_position(position: PositionState) -> dict:
     return {
         "symbol": position.symbol,
@@ -349,6 +545,42 @@ def _latest_model_summary(model_run: Any | None) -> dict:
     }
 
 
+def _ioc_cancel_summary(settings: Settings, repo: Repository) -> dict:
+    now = datetime.now(UTC)
+    latest_buy_cancel = repo.latest_ioc_canceled_order(side="buy")
+    latest_any_cancel = repo.latest_ioc_canceled_order()
+    latest_buy_cancel_at = _ensure_datetime_utc(
+        latest_buy_cancel.created_at if latest_buy_cancel is not None else None
+    )
+    recent_buy_count = repo.recent_ioc_canceled_count(
+        side="buy",
+        now=now,
+        lookback_seconds=settings.ioc_cancel_lookback_seconds,
+    )
+    cooldown_remaining = _seconds_until(
+        latest_buy_cancel_at,
+        now=now,
+        seconds=settings.ioc_cancel_cooldown_seconds,
+    )
+    cooldown_expires_at = (
+        latest_buy_cancel_at + timedelta(seconds=max(0, settings.ioc_cancel_cooldown_seconds))
+        if latest_buy_cancel_at is not None and cooldown_remaining > 0
+        else None
+    )
+    return {
+        "latest_ioc_cancel_at": _serialize_timestamp(
+            latest_any_cancel.created_at if latest_any_cancel is not None else None
+        ),
+        "latest_buy_ioc_cancel_at": _serialize_timestamp(latest_buy_cancel_at),
+        "recent_buy_ioc_cancel_count": recent_buy_count,
+        "lookback_seconds": settings.ioc_cancel_lookback_seconds,
+        "max_recent_ioc_cancels": settings.max_recent_ioc_cancels,
+        "cooldown_active": cooldown_remaining > 0,
+        "cooldown_seconds_remaining": cooldown_remaining if cooldown_remaining > 0 else 0,
+        "cooldown_expires_at": _serialize_timestamp(cooldown_expires_at),
+    }
+
+
 def _sanitize_mapping(value: dict[str, Any]) -> dict[str, Any]:
     return _redact_secrets(dict(value))
 
@@ -381,6 +613,20 @@ def _serialize_timestamp(value: Any) -> str | None:
     else:
         timestamp = timestamp.tz_convert(UTC)
     return timestamp.isoformat()
+
+
+def _ensure_datetime_utc(value: Any) -> datetime | None:
+    timestamp_iso = _serialize_timestamp(value)
+    if timestamp_iso is None:
+        return None
+    return datetime.fromisoformat(timestamp_iso)
+
+
+def _seconds_until(value: datetime | None, *, now: datetime, seconds: int | float) -> float:
+    if value is None:
+        return 0.0
+    ends_at = value + timedelta(seconds=max(0, seconds))
+    return max(0.0, (ends_at - now).total_seconds())
 
 
 def _safe_float(value: Any) -> float | None:
@@ -446,9 +692,11 @@ def _quote_snapshot(quote: dict[str, Any] | None) -> dict:
     }
 
 
-def _known_trade_pnls(trades: list[Trade]) -> list[float]:
+def _closed_trade_pnls(trades: list[Trade]) -> list[float]:
     pnls = []
     for trade in trades:
+        if str(trade.side).lower() != "sell":
+            continue
         pnl = _safe_float(trade.pnl)
         if pnl is not None:
             pnls.append(pnl)

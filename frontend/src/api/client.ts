@@ -42,6 +42,46 @@ export type EquityPoint = {
   drawdown: number | null;
 };
 
+export type AccountSnapshot = {
+  created_at: string | null;
+  equity: number | null;
+  cash: number | null;
+  buying_power: number | null;
+  portfolio_value: number | null;
+  currency: string | null;
+  raw_response?: unknown;
+};
+
+export type PortfolioPoint = {
+  timestamp: string | null;
+  equity: number | null;
+  cash: number | null;
+  buying_power: number | null;
+  portfolio_value: number | null;
+};
+
+export type TradingStatus = {
+  state: 'running' | 'waiting' | 'cooling_down' | 'blocked' | 'paused' | 'stopped' | 'disabled' | string;
+  state_tone: 'green' | 'yellow' | 'red' | 'gray' | string;
+  paused: boolean;
+  pause_reason: string | null;
+  paused_at: string | null;
+  latest_decision_action: string | null;
+  latest_decision_reason: string | null;
+  latest_risk_block_reason: string | null;
+  current_ioc_cancel_count: number | null;
+  ioc_cancel_lookback_seconds: number | null;
+  ioc_cooldown_active: boolean;
+  ioc_cooldown_expires_at: string | null;
+  scheduler_running: boolean | null;
+  auto_trade_enabled: boolean;
+  trading_enabled: boolean;
+  paper_trading_only: boolean;
+  model_available: boolean;
+  prediction_source: string | null;
+  fallback_trading_allowed: boolean;
+};
+
 export type PositionSummary = {
   symbol: string;
   qty: number | null;
@@ -106,6 +146,7 @@ export type DashboardSummary = {
   total_buy_orders: number;
   total_sell_orders: number;
   total_trades: number;
+  closed_trades: number;
   total_realized_pnl: number | null;
   total_return_pct: number | null;
   unrealized_pnl: number | null;
@@ -167,6 +208,9 @@ export type DashboardData = {
   orders: DashboardOrder[];
   trades: DashboardTrade[];
   equityCurve: EquityPoint[];
+  accountSnapshots: AccountSnapshot[];
+  portfolioCurve: PortfolioPoint[];
+  tradingStatus: TradingStatus;
 };
 
 export type ActionResult = {
@@ -236,6 +280,9 @@ export const apiClient = {
   orders: (token: string, limit = 200) => protectedJson<DashboardOrder[]>(`/dashboard/orders?limit=${limit}`, token),
   trades: (token: string, limit = 200) => protectedJson<DashboardTrade[]>(`/dashboard/trades?limit=${limit}`, token),
   equityCurve: (token: string) => protectedJson<EquityPoint[]>('/dashboard/equity-curve', token),
+  accountSnapshots: (token: string, limit = 500) => protectedJson<AccountSnapshot[]>(`/dashboard/account-snapshots?limit=${limit}`, token),
+  portfolioCurve: (token: string) => protectedJson<PortfolioPoint[]>('/dashboard/portfolio-curve', token),
+  tradingStatus: (token: string) => protectedJson<TradingStatus>('/dashboard/trading-status', token),
   runOnce: (token: string) => protectedJson<DashboardRunOnceResult>('/dashboard/run-once', token, { method: 'POST' }),
   startAuto: (token: string) => protectedJson<ActionResult>('/auto/start', token, { method: 'POST' }),
   stopAuto: (token: string) => protectedJson<ActionResult>('/auto/stop', token, { method: 'POST' }),

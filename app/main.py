@@ -36,6 +36,10 @@ def serialize_timestamp(value) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def runtime_scheduler():
+    return getattr(app.state, "scheduler", scheduler)
+
+
 def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
     token = settings.api_admin_token
     if not token or x_admin_token != token:
@@ -151,14 +155,52 @@ async def debug_latest_bars(force_refresh: bool = False) -> dict:
 
 @app.post("/auto/start", dependencies=[Depends(require_admin)])
 async def auto_start() -> dict:
-    started = scheduler.start()
-    return {"started": started, "running": scheduler.running}
+    active_scheduler = runtime_scheduler()
+    started = active_scheduler.start()
+    return {"started": started, "running": active_scheduler.running}
 
 
 @app.post("/auto/stop", dependencies=[Depends(require_admin)])
 async def auto_stop() -> dict:
-    stopped = await scheduler.stop()
-    return {"stopped": stopped, "running": scheduler.running}
+    active_scheduler = runtime_scheduler()
+    stopped = await active_scheduler.stop()
+    return {"stopped": stopped, "running": active_scheduler.running}
+
+
+@app.post("/admin/pause", dependencies=[Depends(require_admin)])
+async def admin_pause() -> dict:
+    active_scheduler = runtime_scheduler()
+    changed = await active_scheduler.pause("manual_pause", send_alert=False)
+    return {"changed": changed, **scheduler_status_payload(active_scheduler)}
+
+
+@app.post("/admin/resume", dependencies=[Depends(require_admin)])
+async def admin_resume() -> dict:
+    active_scheduler = runtime_scheduler()
+    changed = active_scheduler.resume()
+    return {"changed": changed, **scheduler_status_payload(active_scheduler)}
+
+
+@app.get("/admin/status", dependencies=[Depends(require_admin)])
+async def admin_status() -> dict:
+    return scheduler_status_payload(runtime_scheduler())
+
+
+def scheduler_status_payload(active_scheduler) -> dict:
+    if hasattr(active_scheduler, "status"):
+        status = dict(active_scheduler.status())
+    else:
+        status = {
+            "running": getattr(active_scheduler, "running", None),
+            "paused": getattr(active_scheduler, "paused", False),
+            "pause_reason": getattr(active_scheduler, "pause_reason", None),
+            "paused_at": getattr(active_scheduler, "paused_at", None),
+            "auto_trade_enabled": settings.auto_trade_enabled,
+            "trading_enabled": settings.trading_enabled,
+            "circuit_breaker_enabled": settings.circuit_breaker_enabled,
+        }
+    status["paused_at"] = serialize_timestamp(status.get("paused_at"))
+    return status
 
 
 @app.post("/alerts/discord/test", dependencies=[Depends(require_admin)])

@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     discord_alert_on_order: bool = True
     discord_alert_on_error: bool = True
     discord_alert_on_model: bool = False
+    discord_risk_alert_cooldown_seconds: int = 300
+
+    circuit_breaker_enabled: bool = True
+    max_same_risk_blocks_before_pause: int = 20
+    max_runtime_errors_before_pause: int = 10
+    circuit_breaker_window_seconds: int = 900
 
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
@@ -52,18 +58,24 @@ class Settings(BaseSettings):
     order_type: str = "limit"
     time_in_force: str = "ioc"
     limit_price_offset_bps: float = 2
+    ioc_cancel_lookback_seconds: int = 300
+    max_recent_ioc_cancels: int = 3
+    ioc_cancel_cooldown_seconds: int = 120
+    ioc_cancel_escalation_cooldown_seconds: int = 600
     max_position_notional_usd: float = 100
     max_total_exposure_usd: float = 100
     max_daily_loss_usd: float = 20
     max_drawdown_pct: float = 0.05
     max_open_positions: int = 1
 
-    scalping_mode_enabled: bool = True
+    scalping_mode_enabled: bool = False
     max_spread_bps: float = 10
     max_slippage_bps: float = 8
     min_quote_imbalance: float = -0.05
     max_trades_per_hour: int = 1000
     max_daily_trades: int = 10000
+    max_order_attempts_per_hour: int = 30
+    max_order_attempts_per_day: int = 100
     max_consecutive_losses: int = 3
     min_seconds_between_trades: int = 0
 
@@ -74,8 +86,10 @@ class Settings(BaseSettings):
     scalping_min_momentum_pct: float = -0.0005
     scalping_max_position_seconds: int = 90
     scalping_buy_probability_floor: float = 0.50
+    scalping_confidence_gap_required: float = 0.04
     scalping_sell_on_weak_quote: bool = True
     scalping_quote_imbalance_exit: float = -0.10
+    min_hold_seconds_before_weak_quote_exit: int = 30
 
     order_in_flight_timeout_seconds: int = 15
     order_status_check_enabled: bool = True
@@ -91,6 +105,8 @@ class Settings(BaseSettings):
     maker_fee_bps: float = 15
     slippage_bps: float = 10
     backtest_use_taker_fees: bool = True
+    paper_fee_bps: float = 0
+    paper_slippage_bps: float = 0
 
     min_buy_probability: float = 0.58
     min_sell_probability: float = 0.55
@@ -102,6 +118,7 @@ class Settings(BaseSettings):
     max_holding_minutes: int = 720
 
     ml_enabled: bool = True
+    allow_fallback_trading: bool = False
     model_retrain_enabled: bool = True
     retrain_every_hours: int = 24
     min_training_rows: int = 1000
@@ -139,11 +156,11 @@ class Settings(BaseSettings):
             raise ValueError("TIME_IN_FORCE must be gtc or ioc.")
         return normalized
 
-    @field_validator("taker_fee_bps", "maker_fee_bps", "slippage_bps")
+    @field_validator("taker_fee_bps", "maker_fee_bps", "slippage_bps", "paper_fee_bps", "paper_slippage_bps")
     @classmethod
-    def backtest_cost_bps_must_be_non_negative(cls, value: float) -> float:
+    def cost_bps_must_be_non_negative(cls, value: float) -> float:
         if value < 0:
-            raise ValueError("Backtest fee and slippage bps values must be non-negative.")
+            raise ValueError("Fee and slippage bps values must be non-negative.")
         return value
 
     @field_validator(
@@ -156,7 +173,18 @@ class Settings(BaseSettings):
         "quote_cache_seconds",
         "order_in_flight_timeout_seconds",
         "order_status_check_delay_seconds",
+        "ioc_cancel_lookback_seconds",
+        "max_recent_ioc_cancels",
+        "ioc_cancel_cooldown_seconds",
+        "ioc_cancel_escalation_cooldown_seconds",
+        "discord_risk_alert_cooldown_seconds",
+        "max_same_risk_blocks_before_pause",
+        "max_runtime_errors_before_pause",
+        "circuit_breaker_window_seconds",
+        "max_order_attempts_per_hour",
+        "max_order_attempts_per_day",
         "scalping_max_position_seconds",
+        "min_hold_seconds_before_weak_quote_exit",
         "max_account_daily_loss_usd",
         "max_account_daily_loss_pct",
         "max_account_drawdown_pct",

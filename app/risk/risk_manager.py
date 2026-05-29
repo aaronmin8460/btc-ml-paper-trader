@@ -60,6 +60,7 @@ class RiskManager:
         position: PositionState,
         latest_price: float,
         trade_frequency: TradeFrequencyState | None = None,
+        order_attempt_frequency: TradeFrequencyState | None = None,
         account_state: AccountState | None = None,
         now: datetime | None = None,
     ) -> tuple[bool, str]:
@@ -85,6 +86,9 @@ class RiskManager:
         if latest_price <= 0:
             return self._block("invalid_price")
         approved, reason = self.approve_account_for_buy(notional=notional, account_state=account_state)
+        if not approved:
+            return self._block(reason)
+        approved, reason = self._approve_order_attempt_frequency(order_attempt_frequency or TradeFrequencyState())
         if not approved:
             return self._block(reason)
         approved, reason = self._approve_trade_frequency(trade_frequency or TradeFrequencyState(), now=current_time)
@@ -147,6 +151,13 @@ class RiskManager:
     def approve_sell(self, position: PositionState) -> tuple[bool, str]:
         if not position.has_position:
             return self._block("sell_without_position")
+        return True, "approved"
+
+    def _approve_order_attempt_frequency(self, state: TradeFrequencyState) -> tuple[bool, str]:
+        if state.trades_last_hour >= self.settings.max_order_attempts_per_hour:
+            return False, "max_order_attempts_per_hour_reached"
+        if state.trades_today >= self.settings.max_order_attempts_per_day:
+            return False, "max_order_attempts_per_day_reached"
         return True, "approved"
 
     def _approve_trade_frequency(self, state: TradeFrequencyState, *, now: datetime) -> tuple[bool, str]:

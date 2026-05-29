@@ -13,6 +13,7 @@ import { RiskBudgetPanel } from './components/RiskBudgetPanel';
 import { SignalPanel } from './components/SignalPanel';
 import { Toast, type ToastState } from './components/Toast';
 import { TradesTable } from './components/TradesTable';
+import { TradingStatusPanel } from './components/TradingStatusPanel';
 
 const TOKEN_KEY = 'btc-paper-trader-admin-token';
 
@@ -29,7 +30,7 @@ export default function App() {
     setIsLoading(true);
     setError(null);
     try {
-      const [healthResult, summary, market, signals, orders, trades, equityCurve] = await Promise.all([
+      const [healthResult, summary, market, signals, orders, trades, equityCurve, accountSnapshots, portfolioCurve, tradingStatus] = await Promise.all([
         apiClient.health().catch(() => null),
         apiClient.summary(token),
         apiClient.market(token),
@@ -37,8 +38,11 @@ export default function App() {
         apiClient.orders(token),
         apiClient.trades(token),
         apiClient.equityCurve(token),
+        apiClient.accountSnapshots(token),
+        apiClient.portfolioCurve(token),
+        apiClient.tradingStatus(token),
       ]);
-      setData({ health: healthResult, summary, market, signals, orders, trades, equityCurve });
+      setData({ health: healthResult, summary, market, signals, orders, trades, equityCurve, accountSnapshots, portfolioCurve, tradingStatus });
       setLastRefreshed(new Date());
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : 'Failed to load dashboard.');
@@ -93,6 +97,7 @@ export default function App() {
               <div className="rounded-2xl border border-rose-400/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</div>
             ) : null}
 
+            <TradingStatusPanel status={data.tradingStatus} />
             <KpiGrid summary={data.summary} />
             <RiskBudgetPanel summary={data.summary} />
 
@@ -101,7 +106,7 @@ export default function App() {
               <ControlsPanel token={token} onError={showError} onRefresh={() => void loadDashboard()} onSuccess={showSuccess} />
             </div>
 
-            <DashboardCharts equityCurve={data.equityCurve} orders={data.orders} signals={data.signals} />
+            <DashboardCharts equityCurve={data.equityCurve} orders={data.orders} portfolioCurve={data.portfolioCurve} signals={data.signals} />
 
             <div className="grid gap-4 xl:grid-cols-2">
               <OrdersTable orders={data.orders} />

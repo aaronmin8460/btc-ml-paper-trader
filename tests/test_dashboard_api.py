@@ -9,7 +9,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.config import Settings
 from app.db.database import Base
-from app.db.models import Order, Signal, Trade
+from app.db.models import AccountSnapshot, Order, Signal, Trade
 from app.risk.risk_manager import PositionState
 
 
@@ -91,6 +91,9 @@ class NoCredentialsTrader(FakeTrader):
 
 class FakeScheduler:
     running = True
+    paused = False
+    pause_reason = None
+    paused_at = None
 
 
 class FailingMarketDataClient:
@@ -105,7 +108,7 @@ class FailingMarketDataClient:
 
 
 @pytest.fixture
-def dashboard_client(monkeypatch):
+def dashboard_client(monkeypatch, tmp_path):
     from app import main
     from app.api import dashboard
 
@@ -127,6 +130,7 @@ def dashboard_client(monkeypatch):
         auto_trade_enabled=False,
         lookback_bars=2,
         timeframe="1Min",
+        model_dir=str(tmp_path / "models"),
     )
     monkeypatch.setattr(main, "settings", settings)
     monkeypatch.setattr(main.app.state, "settings", settings, raising=False)
@@ -150,6 +154,9 @@ def test_dashboard_endpoints_require_admin_token(dashboard_client):
         "/dashboard/orders",
         "/dashboard/trades",
         "/dashboard/equity-curve",
+        "/dashboard/account-snapshots",
+        "/dashboard/portfolio-curve",
+        "/dashboard/trading-status",
         "/dashboard/market",
     ]:
         response = client.get(path)
@@ -173,6 +180,7 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["latest_btc_price"] == 101.5
     assert body["total_orders"] == 0
     assert body["total_trades"] == 0
+    assert body["closed_trades"] == 0
     assert body["total_return_pct"] is None
     assert body["win_rate"] is None
     assert body["average_trade_pnl"] is None
@@ -190,7 +198,149 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["latest_signal"] is None
     assert body["last_order"] is None
     assert body["last_trade"] is None
+    assert body["ioc_cancel_guard"]["latest_buy_ioc_cancel_at"] is None
+    assert body["ioc_cancel_guard"]["recent_buy_ioc_cancel_count"] == 0
+    assert body["ioc_cancel_guard"]["cooldown_active"] is False
     assert body["data_freshness"]["latest_timestamp"] == "2026-05-27T16:01:00+00:00"
+
+
+def test_dashboard_trading_status_returns_disabled_empty_state(dashboard_client):
+    client, _ = dashboard_client
+
+    response = client.get("/dashboard/trading-status", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "disabled"
+    assert body["state_tone"] == "gray"
+    assert body["paused"] is False
+    assert body["pause_reason"] is None
+    assert body["paused_at"] is None
+    assert body["latest_decision_action"] is None
+    assert body["latest_decision_reason"] is None
+    assert body["latest_risk_block_reason"] is None
+    assert body["current_ioc_cancel_count"] == 0
+    assert body["ioc_cancel_lookback_seconds"] == 300
+    assert body["ioc_cooldown_active"] is False
+    assert body["ioc_cooldown_expires_at"] is None
+    assert body["scheduler_running"] is True
+    assert body["auto_trade_enabled"] is False
+    assert body["trading_enabled"] is False
+    assert body["model_available"] is False
+    assert body["prediction_source"] == "fallback"
+    assert body["fallback_trading_allowed"] is False
+
+
+def test_dashboard_trading_status_shows_risk_block_and_ioc_cooldown(dashboard_client, monkeypatch):
+    from app import main
+
+    client, Session = dashboard_client
+    settings = Settings(
+        _env_file=None,
+        api_admin_token="secret",
+        trading_enabled=True,
+        auto_trade_enabled=True,
+        ioc_cancel_lookback_seconds=300,
+        ioc_cancel_cooldown_seconds=120,
+        model_dir=main.settings.model_dir,
+    )
+    monkeypatch.setattr(main, "settings", settings)
+    monkeypatch.setattr(main.app.state, "settings", settings, raising=False)
+    with Session() as db:
+        db.add_all(
+            [
+                Signal(
+                    symbol="BTC/USD",
+                    action="hold",
+                    buy_probability=0.9,
+                    sell_probability=0.1,
+                    reason="ioc_cancel_cooldown_active",
+                    created_at=datetime.now(UTC) - timedelta(seconds=5),
+                ),
+                Order(
+                    symbol="BTC/USD",
+                    side="buy",
+                    status="canceled",
+                    raw_response='{"order_type":"limit","time_in_force":"ioc"}',
+                    created_at=datetime.now(UTC) - timedelta(seconds=20),
+                ),
+            ]
+        )
+        db.commit()
+
+    response = client.get("/dashboard/trading-status", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "cooling_down"
+    assert body["state_tone"] == "yellow"
+    assert body["paused"] is False
+    assert body["latest_decision_action"] == "hold"
+    assert body["latest_decision_reason"] == "ioc_cancel_cooldown_active"
+    assert body["latest_risk_block_reason"] == "ioc_cancel_cooldown_active"
+    assert body["current_ioc_cancel_count"] == 1
+    assert body["ioc_cooldown_active"] is True
+    assert body["ioc_cooldown_expires_at"] is not None
+    assert body["scheduler_running"] is True
+    assert body["auto_trade_enabled"] is True
+    assert body["trading_enabled"] is True
+
+
+def test_dashboard_trading_status_shows_runtime_pause(dashboard_client, monkeypatch):
+    from app import main
+
+    client, _ = dashboard_client
+    settings = Settings(
+        _env_file=None,
+        api_admin_token="secret",
+        trading_enabled=True,
+        auto_trade_enabled=True,
+    )
+
+    class PausedScheduler:
+        running = True
+        paused = True
+        pause_reason = "repeated_risk_block:trade_cooldown_active"
+        paused_at = datetime(2026, 5, 29, tzinfo=UTC)
+
+    monkeypatch.setattr(main, "settings", settings)
+    monkeypatch.setattr(main.app.state, "settings", settings, raising=False)
+    monkeypatch.setattr(main.app.state, "scheduler", PausedScheduler(), raising=False)
+
+    response = client.get("/dashboard/trading-status", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "paused"
+    assert body["state_tone"] == "red"
+    assert body["paused"] is True
+    assert body["pause_reason"] == "repeated_risk_block:trade_cooldown_active"
+    assert body["paused_at"] == "2026-05-29T00:00:00+00:00"
+
+
+def test_dashboard_summary_shows_active_ioc_cancel_cooldown(dashboard_client):
+    client, Session = dashboard_client
+    with Session() as db:
+        db.add(
+            Order(
+                symbol="BTC/USD",
+                side="buy",
+                status="canceled",
+                raw_response='{"order_type":"limit","time_in_force":"ioc"}',
+                created_at=datetime.now(UTC) - timedelta(seconds=10),
+            )
+        )
+        db.commit()
+
+    response = client.get("/dashboard/summary", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    guard = response.json()["ioc_cancel_guard"]
+    assert guard["latest_ioc_cancel_at"] is not None
+    assert guard["latest_buy_ioc_cancel_at"] is not None
+    assert guard["recent_buy_ioc_cancel_count"] == 1
+    assert guard["cooldown_active"] is True
+    assert guard["cooldown_seconds_remaining"] > 0
 
 
 def test_dashboard_endpoints_do_not_expose_secrets(dashboard_client):
@@ -280,6 +430,103 @@ def test_dashboard_equity_curve_returns_empty_list_without_trades(dashboard_clie
 
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_dashboard_account_snapshots_empty_returns_empty_lists(dashboard_client):
+    client, _ = dashboard_client
+
+    snapshots = client.get("/dashboard/account-snapshots", headers={"X-Admin-Token": "secret"})
+    curve = client.get("/dashboard/portfolio-curve", headers={"X-Admin-Token": "secret"})
+
+    assert snapshots.status_code == 200
+    assert snapshots.json() == []
+    assert curve.status_code == 200
+    assert curve.json() == []
+
+
+def test_dashboard_account_snapshots_redact_secrets_and_build_portfolio_curve(dashboard_client):
+    client, Session = dashboard_client
+    now = datetime(2026, 5, 27, 16, 0, tzinfo=UTC)
+    with Session() as db:
+        db.add_all(
+            [
+                AccountSnapshot(
+                    created_at=now,
+                    equity=1000,
+                    cash=900,
+                    buying_power=800,
+                    portfolio_value=1005,
+                    currency="USD",
+                    raw_response='{"api_key":"raw-key","nested":{"secret_token":"hidden"}}',
+                ),
+                AccountSnapshot(
+                    created_at=now + timedelta(minutes=1),
+                    equity=1002,
+                    cash=902,
+                    buying_power=802,
+                    portfolio_value=1007,
+                    currency="USD",
+                    raw_response='{"status":"ACTIVE"}',
+                ),
+            ]
+        )
+        db.commit()
+
+    snapshots = client.get("/dashboard/account-snapshots", headers={"X-Admin-Token": "secret"})
+    curve = client.get("/dashboard/portfolio-curve", headers={"X-Admin-Token": "secret"})
+
+    assert snapshots.status_code == 200
+    body_text = snapshots.text
+    assert "raw-key" not in body_text
+    assert "hidden" not in body_text
+    assert snapshots.json()[1]["raw_response"]["api_key"] == "***"
+    assert snapshots.json()[1]["raw_response"]["nested"]["secret_token"] == "***"
+    assert curve.status_code == 200
+    assert curve.json() == [
+        {
+            "timestamp": "2026-05-27T16:00:00+00:00",
+            "equity": 1000,
+            "cash": 900,
+            "buying_power": 800,
+            "portfolio_value": 1005,
+        },
+        {
+            "timestamp": "2026-05-27T16:01:00+00:00",
+            "equity": 1002,
+            "cash": 902,
+            "buying_power": 802,
+            "portfolio_value": 1007,
+        },
+    ]
+
+
+def test_dashboard_trade_metrics_use_closed_sell_trades_only(dashboard_client):
+    client, Session = dashboard_client
+    now = datetime(2026, 5, 27, 16, 0, tzinfo=UTC)
+    with Session() as db:
+        db.add_all(
+            [
+                Trade(symbol="BTC/USD", side="buy", qty=0.01, price=10_000, pnl=100, created_at=now),
+                Trade(symbol="BTC/USD", side="sell", qty=0.01, price=11_000, pnl=10, created_at=now + timedelta(seconds=1)),
+                Trade(symbol="BTC/USD", side="sell", qty=0.01, price=9_500, pnl=-5, created_at=now + timedelta(seconds=2)),
+            ]
+        )
+        db.commit()
+
+    summary = client.get("/dashboard/summary", headers={"X-Admin-Token": "secret"})
+    equity = client.get("/dashboard/equity-curve", headers={"X-Admin-Token": "secret"})
+
+    assert summary.status_code == 200
+    body = summary.json()
+    assert body["total_trades"] == 3
+    assert body["closed_trades"] == 2
+    assert body["total_realized_pnl"] == 5
+    assert body["win_rate"] == pytest.approx(0.5)
+    assert body["average_trade_pnl"] == pytest.approx(2.5)
+    assert body["best_trade_pnl"] == 10
+    assert body["worst_trade_pnl"] == -5
+    assert equity.status_code == 200
+    assert [point["trade_pnl"] for point in equity.json()] == [10, -5]
 
 
 def test_dashboard_limit_query_params_are_capped_at_500(dashboard_client):
