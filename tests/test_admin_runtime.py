@@ -39,6 +39,40 @@ class FakeScheduler:
         }
 
 
+class FakeTrainingScheduler:
+    def __init__(self) -> None:
+        self.running = False
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self) -> bool:
+        self.start_calls += 1
+        if self.running:
+            return False
+        self.running = True
+        return True
+
+    async def stop(self) -> bool:
+        self.stop_calls += 1
+        if not self.running:
+            return False
+        self.running = False
+        return True
+
+    def status(self) -> dict:
+        return {
+            "auto_train_enabled": True,
+            "running": self.running,
+            "last_training_started_at": datetime(2026, 5, 29, tzinfo=UTC),
+            "last_training_finished_at": None,
+            "last_training_status": "idle",
+            "last_training_reason": None,
+            "last_training_model_path": None,
+            "last_training_accepted": None,
+            "last_training_metrics": None,
+        }
+
+
 def test_admin_pause_resume_status(monkeypatch):
     from app import main
 
@@ -66,3 +100,31 @@ def test_admin_pause_resume_status(monkeypatch):
     assert resumed.json()["paused"] is False
     assert resumed.json()["pause_reason"] is None
     assert resumed.json()["paused_at"] is None
+
+
+def test_admin_training_start_stop_status(monkeypatch):
+    from app import main
+
+    settings = Settings(_env_file=None, api_admin_token="secret")
+    training_scheduler = FakeTrainingScheduler()
+    monkeypatch.setattr(main, "settings", settings)
+    monkeypatch.setattr(main.app.state, "training_scheduler", training_scheduler, raising=False)
+
+    client = TestClient(main.app)
+
+    status = client.get("/admin/training/status", headers={"X-Admin-Token": "secret"})
+    assert status.status_code == 200
+    assert status.json()["running"] is False
+    assert status.json()["last_training_started_at"] == "2026-05-29T00:00:00+00:00"
+
+    started = client.post("/admin/training/start", headers={"X-Admin-Token": "secret"})
+    assert started.status_code == 200
+    assert started.json()["started"] is True
+    assert started.json()["running"] is True
+    assert training_scheduler.start_calls == 1
+
+    stopped = client.post("/admin/training/stop", headers={"X-Admin-Token": "secret"})
+    assert stopped.status_code == 200
+    assert stopped.json()["stopped"] is True
+    assert stopped.json()["running"] is False
+    assert training_scheduler.stop_calls == 1

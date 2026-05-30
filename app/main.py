@@ -14,6 +14,7 @@ from app.monitoring.logger import get_logger
 from app.notifications.discord import DiscordNotifier
 from app.risk.risk_manager import account_state_from_payload
 from app.services.scheduler import TradingScheduler
+from app.services.training_scheduler import TrainingScheduler
 from app.services.trader import Trader
 from app.utils.time import iso_utc_now
 
@@ -24,9 +25,11 @@ app = FastAPI(title="btc-ml-paper-trader", version="0.1.0")
 settings = get_settings()
 trader = Trader(settings)
 scheduler = TradingScheduler(trader, settings)
+training_scheduler = TrainingScheduler(settings, broker=trader.broker)
 app.state.settings = settings
 app.state.trader = trader
 app.state.scheduler = scheduler
+app.state.training_scheduler = training_scheduler
 
 
 def serialize_model(row) -> dict:
@@ -39,6 +42,10 @@ def serialize_timestamp(value) -> str | None:
 
 def runtime_scheduler():
     return getattr(app.state, "scheduler", scheduler)
+
+
+def runtime_training_scheduler():
+    return getattr(app.state, "training_scheduler", training_scheduler)
 
 
 def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
@@ -92,6 +99,8 @@ async def startup() -> None:
     init_db()
     if settings.auto_trade_enabled:
         scheduler.start()
+    if settings.auto_train_enabled:
+        training_scheduler.start()
 
 
 @app.get("/health")
@@ -187,6 +196,30 @@ async def admin_status() -> dict:
     return scheduler_status_payload(runtime_scheduler())
 
 
+@app.get("/admin/training/status", dependencies=[Depends(require_admin)])
+async def admin_training_status() -> dict:
+    return training_scheduler_status_payload(runtime_training_scheduler())
+
+
+@app.post("/admin/training/run-now", dependencies=[Depends(require_admin)])
+async def admin_training_run_now() -> dict:
+    return training_scheduler_status_payload(await runtime_training_scheduler().run_now())
+
+
+@app.post("/admin/training/start", dependencies=[Depends(require_admin)])
+async def admin_training_start() -> dict:
+    active_scheduler = runtime_training_scheduler()
+    started = active_scheduler.start()
+    return {"started": started, **training_scheduler_status_payload(active_scheduler)}
+
+
+@app.post("/admin/training/stop", dependencies=[Depends(require_admin)])
+async def admin_training_stop() -> dict:
+    active_scheduler = runtime_training_scheduler()
+    stopped = await active_scheduler.stop()
+    return {"stopped": stopped, **training_scheduler_status_payload(active_scheduler)}
+
+
 def scheduler_status_payload(active_scheduler) -> dict:
     if hasattr(active_scheduler, "status"):
         status = dict(active_scheduler.status())
@@ -201,6 +234,13 @@ def scheduler_status_payload(active_scheduler) -> dict:
             "circuit_breaker_enabled": settings.circuit_breaker_enabled,
         }
     status["paused_at"] = serialize_timestamp(status.get("paused_at"))
+    return status
+
+
+def training_scheduler_status_payload(value) -> dict:
+    status = dict(value if isinstance(value, dict) else value.status())
+    for key in ["last_training_started_at", "last_training_finished_at"]:
+        status[key] = serialize_timestamp(status.get(key))
     return status
 
 

@@ -55,6 +55,7 @@ async def dashboard_summary(request: Request) -> dict:
     settings = _settings_from_request(request)
     trader = _trader_from_request(request)
     scheduler = getattr(request.app.state, "scheduler", None)
+    training_status = _training_scheduler_status(getattr(request.app.state, "training_scheduler", None), settings)
     market = MarketDataClient(settings)
     broker = getattr(trader, "broker", AlpacaClient(settings))
 
@@ -83,6 +84,7 @@ async def dashboard_summary(request: Request) -> dict:
         "paper_trading_only": settings.paper_trading_only,
         "trading_enabled": settings.trading_enabled,
         "auto_trade_enabled": settings.auto_trade_enabled,
+        **training_status,
         "scheduler_running": getattr(scheduler, "running", None),
         "latest_btc_price": market_summary.get("latest_close"),
         "latest_signal": _serialize_signal(latest_signal) if latest_signal else None,
@@ -423,6 +425,46 @@ def _scheduler_pause_status(scheduler: Any) -> dict:
         "paused": bool(getattr(scheduler, "paused", False)),
         "pause_reason": getattr(scheduler, "pause_reason", None),
         "paused_at": _serialize_timestamp(getattr(scheduler, "paused_at", None)),
+    }
+
+
+def _training_scheduler_status(training_scheduler: Any, settings: Settings) -> dict:
+    if training_scheduler is None or not hasattr(training_scheduler, "status"):
+        return {
+            "auto_train_enabled": settings.auto_train_enabled,
+            "training_scheduler_running": False,
+            "last_training_started_at": None,
+            "last_training_finished_at": None,
+            "last_training_status": None,
+            "last_training_reason": None,
+            "last_training_model_path": None,
+            "last_training_accepted": None,
+            "last_training_metrics": None,
+        }
+    try:
+        status = training_scheduler.status()
+    except Exception:
+        return {
+            "auto_train_enabled": settings.auto_train_enabled,
+            "training_scheduler_running": False,
+            "last_training_started_at": None,
+            "last_training_finished_at": None,
+            "last_training_status": "unavailable",
+            "last_training_reason": "training_scheduler_status_unavailable",
+            "last_training_model_path": None,
+            "last_training_accepted": None,
+            "last_training_metrics": None,
+        }
+    return {
+        "auto_train_enabled": bool(status.get("auto_train_enabled")),
+        "training_scheduler_running": bool(status.get("running")),
+        "last_training_started_at": _serialize_timestamp(status.get("last_training_started_at")),
+        "last_training_finished_at": _serialize_timestamp(status.get("last_training_finished_at")),
+        "last_training_status": status.get("last_training_status"),
+        "last_training_reason": status.get("last_training_reason"),
+        "last_training_model_path": status.get("last_training_model_path"),
+        "last_training_accepted": status.get("last_training_accepted"),
+        "last_training_metrics": status.get("last_training_metrics"),
     }
 
 

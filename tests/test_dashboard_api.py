@@ -96,6 +96,23 @@ class FakeScheduler:
     paused_at = None
 
 
+class FakeTrainingScheduler:
+    running = False
+
+    def status(self):
+        return {
+            "auto_train_enabled": False,
+            "running": self.running,
+            "last_training_started_at": datetime(2026, 5, 29, tzinfo=UTC),
+            "last_training_finished_at": datetime(2026, 5, 29, 0, 1, tzinfo=UTC),
+            "last_training_status": "rejected",
+            "last_training_reason": "model_not_profitable_after_costs",
+            "last_training_model_path": "models/rejected.joblib",
+            "last_training_accepted": False,
+            "last_training_metrics": {"net_return_pct": -0.01},
+        }
+
+
 class FailingMarketDataClient:
     def __init__(self, settings) -> None:
         self.settings = settings
@@ -136,6 +153,7 @@ def dashboard_client(monkeypatch, tmp_path):
     monkeypatch.setattr(main.app.state, "settings", settings, raising=False)
     monkeypatch.setattr(main.app.state, "trader", FakeTrader(), raising=False)
     monkeypatch.setattr(main.app.state, "scheduler", FakeScheduler(), raising=False)
+    monkeypatch.setattr(main.app.state, "training_scheduler", FakeTrainingScheduler(), raising=False)
     monkeypatch.setattr(dashboard, "SessionLocal", Session)
     monkeypatch.setattr(dashboard, "MarketDataClient", FakeMarketDataClient)
 
@@ -177,6 +195,15 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["symbol"] == "BTC/USD"
     assert body["paper_trading_only"] is True
     assert body["scheduler_running"] is True
+    assert body["auto_train_enabled"] is False
+    assert body["training_scheduler_running"] is False
+    assert body["last_training_started_at"] == "2026-05-29T00:00:00+00:00"
+    assert body["last_training_finished_at"] == "2026-05-29T00:01:00+00:00"
+    assert body["last_training_status"] == "rejected"
+    assert body["last_training_reason"] == "model_not_profitable_after_costs"
+    assert body["last_training_model_path"] == "models/rejected.joblib"
+    assert body["last_training_accepted"] is False
+    assert body["last_training_metrics"] == {"net_return_pct": -0.01}
     assert body["latest_btc_price"] == 101.5
     assert body["profit_guard_enabled"] is True
     assert body["min_net_exit_profit_pct"] == 0.002

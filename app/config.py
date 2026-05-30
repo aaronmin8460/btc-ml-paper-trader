@@ -133,6 +133,11 @@ class Settings(BaseSettings):
     retrain_every_hours: int = 24
     min_training_rows: int = 1000
     optuna_enabled: bool = False
+    auto_train_enabled: bool = False
+    auto_train_interval_seconds: int = 21600
+    auto_train_startup_delay_seconds: int = 300
+    auto_train_min_bars: int = 3000
+    auto_train_send_discord_alerts: bool = True
 
     min_precision_for_promotion: float = 0.52
     max_validation_drawdown_pct: float = 0.20
@@ -202,6 +207,9 @@ class Settings(BaseSettings):
         "max_backtest_drawdown_pct",
         "min_backtest_profit_factor",
         "min_backtest_trades",
+        "auto_train_interval_seconds",
+        "auto_train_startup_delay_seconds",
+        "auto_train_min_bars",
         "min_net_exit_profit_pct",
         "exit_profit_buffer_bps",
         "emergency_stop_loss_pct",

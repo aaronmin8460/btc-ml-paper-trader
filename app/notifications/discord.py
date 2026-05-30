@@ -144,8 +144,8 @@ class DiscordNotifier:
             footer="Alpaca paper order",
         )
 
-    async def error_alert(self, where: str, error: Exception | str) -> None:
-        if not self.settings.discord_alert_on_error:
+    async def error_alert(self, where: str, error: Exception | str, *, force: bool = False) -> None:
+        if not force and not self.settings.discord_alert_on_error:
             return
 
         error_type = type(error).__name__ if isinstance(error, Exception) else "Error"
@@ -191,8 +191,10 @@ class DiscordNotifier:
         accepted: bool,
         reason: str,
         metrics: dict[str, Any] | None = None,
+        *,
+        force: bool = False,
     ) -> None:
-        if not self.settings.discord_alert_on_model:
+        if not force and not self.settings.discord_alert_on_model:
             return
 
         await self.send_embed(

@@ -132,6 +132,15 @@ export type DashboardSummary = {
   paper_trading_only: boolean;
   trading_enabled: boolean;
   auto_trade_enabled: boolean;
+  auto_train_enabled: boolean;
+  training_scheduler_running: boolean;
+  last_training_started_at: string | null;
+  last_training_finished_at: string | null;
+  last_training_status: string | null;
+  last_training_reason: string | null;
+  last_training_model_path: string | null;
+  last_training_accepted: boolean | null;
+  last_training_metrics: Record<string, unknown> | null;
   scheduler_running: boolean | null;
   latest_btc_price: number | null;
   latest_signal: DashboardSignal | null;

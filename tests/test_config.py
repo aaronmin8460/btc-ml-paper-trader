@@ -93,6 +93,11 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.weak_quote_sell_requires_profit is True
     assert settings.max_holding_sell_requires_profit is True
     assert settings.allow_fallback_trading is False
+    assert settings.auto_train_enabled is False
+    assert settings.auto_train_interval_seconds == 21600
+    assert settings.auto_train_startup_delay_seconds == 300
+    assert settings.auto_train_min_bars == 3000
+    assert settings.auto_train_send_discord_alerts is True
     assert settings.order_in_flight_timeout_seconds == 15
     assert settings.order_status_check_enabled is True
     assert settings.order_status_check_delay_seconds == 0.5
