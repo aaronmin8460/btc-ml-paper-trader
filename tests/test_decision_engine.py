@@ -751,7 +751,7 @@ def test_weak_quote_sell_is_blocked_at_loss():
     )
 
     assert decision.action == "hold"
-    assert decision.reason == "profit_guard_holding_at_loss"
+    assert decision.reason == "profit_guard_holding_until_profitable"
 
 
 def test_weak_quote_sell_is_allowed_at_profit():
@@ -797,7 +797,7 @@ def test_model_sell_is_blocked_at_loss():
     )
 
     assert decision.action == "hold"
-    assert decision.reason == "profit_guard_holding_at_loss"
+    assert decision.reason == "profit_guard_holding_until_profitable"
 
 
 def test_emergency_stop_loss_is_allowed_only_when_enabled():
@@ -909,4 +909,4 @@ def test_max_holding_sell_is_blocked_at_loss_when_configured():
     )
 
     assert decision.action == "hold"
-    assert decision.reason == "profit_guard_holding_at_loss"
+    assert decision.reason == "profit_guard_holding_until_profitable"

@@ -203,7 +203,7 @@ class RiskManager:
         minimum_exit_price = self.minimum_profitable_exit_price(entry)
         if expected_exit_price >= minimum_exit_price:
             return True, "approved"
-        if expected_exit_price < entry:
+        if expected_exit_price < entry and not self.settings.allow_emergency_stop_loss:
             return False, "profit_guard_holding_at_loss"
         return False, "profit_guard_holding_until_profitable"
 
