@@ -6,7 +6,7 @@ import pandas as pd
 from app.config import Settings, get_settings
 from app.backtest.scalping import walk_forward_fee_aware_backtest
 from app.data.dataset_builder import build_training_dataset
-from app.data.feature_engineering import FEATURE_COLUMNS
+from app.data.feature_engineering import BAR_FEATURE_COLUMNS
 from app.ml.model import MLSignalModel, tune_tree_params
 from app.ml.registry import ModelRegistry
 from app.ml.validation import promotion_decision, walk_forward_validate
@@ -29,6 +29,14 @@ def train_model_from_bars(
         bars,
         take_profit_pct=take_profit_pct,
         stop_loss_pct=stop_loss_pct,
+        scalping_mode_enabled=settings.scalping_mode_enabled,
+        trailing_stop_pct=settings.scalping_trailing_stop_pct if settings.scalping_mode_enabled else settings.trailing_stop_pct,
+        trailing_stop_arm_profit_pct=settings.trailing_stop_arm_profit_pct,
+        fee_bps_per_side=_backtest_fee_bps(settings),
+        slippage_bps_per_side=settings.slippage_bps,
+        spread_cost_pct=(settings.max_spread_bps / 10_000) if settings.scalping_mode_enabled else 0.0,
+        min_net_exit_profit_pct=settings.min_net_exit_profit_pct if settings.scalping_mode_enabled else 0.0,
+        exit_profit_buffer_bps=settings.exit_profit_buffer_bps if settings.scalping_mode_enabled else 0.0,
     )
     class_counts = {
         int(label): int(count)
@@ -81,10 +89,11 @@ def train_model_from_bars(
         _record_model_run(version, "rejected", metrics)
         return {"model_path": None, "accepted": False, "reason": metrics["reason"], "metrics": metrics, "registry": None}
 
-    tuned_params = tune_tree_params(dataset, FEATURE_COLUMNS) if settings.optuna_enabled else {}
-    model = MLSignalModel(feature_columns=FEATURE_COLUMNS).train(dataset, tuned_params=tuned_params)
+    tuned_params = tune_tree_params(dataset, BAR_FEATURE_COLUMNS) if settings.optuna_enabled else {}
+    model = MLSignalModel(feature_columns=BAR_FEATURE_COLUMNS).train(dataset, tuned_params=tuned_params)
     model.metadata["validation_metrics"] = metrics
     model.metadata["promotion_reason"] = reason
+    model.metadata["model_version"] = version
     model.metadata["tuned_params"] = tuned_params
     model_path = Path(settings.model_dir) / f"{version}.joblib"
     model.save(model_path)
@@ -93,7 +102,7 @@ def train_model_from_bars(
     if accepted:
         registry = ModelRegistry(settings).promote(
             model_path=str(model_path),
-            feature_columns=FEATURE_COLUMNS,
+            feature_columns=BAR_FEATURE_COLUMNS,
             metrics=metrics,
             thresholds={
                 "min_buy_probability": threshold,
@@ -131,6 +140,10 @@ def _promotion_performance_metrics(fee_metrics: dict, *, starting_equity: float 
         "fee_aware_backtest_valid": fee_metrics.get("valid"),
         "fee_aware_backtest_reason": fee_metrics.get("reason"),
     }
+
+
+def _backtest_fee_bps(settings: Settings) -> float:
+    return settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps
 
 
 def _record_model_run(model_version: str, status: str, metrics: dict) -> None:

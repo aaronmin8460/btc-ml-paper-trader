@@ -139,8 +139,8 @@ class Settings(BaseSettings):
     max_trade_fraction: float = 0.40
     min_backtest_net_return_pct: float = 0.001
     max_backtest_drawdown_pct: float = 0.01
-    min_backtest_profit_factor: float = 1.05
-    min_backtest_trades: int = 20
+    min_backtest_profit_factor: float = 1.2
+    min_backtest_trades: int = 30
     model_promotion_require_positive_net_return: bool = True
 
     @field_validator("symbol")

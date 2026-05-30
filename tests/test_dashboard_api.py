@@ -201,6 +201,15 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["api_budget_status"] in {"ok", "soft_limit", "hard_stop", "disabled"}
     assert body["latest_model_net_return_pct"] is None
     assert body["latest_model_accepted"] is None
+    assert body["active_model_status"] == "stale"
+    assert body["active_model_valid"] is False
+    assert body["active_model_invalid_reason"] == "no_active_model"
+    assert body["active_model_reason"] == "no_active_model"
+    assert body["active_model_version"] is None
+    assert body["active_model_profit_factor_net"] is None
+    assert body["active_model_number_of_trades"] is None
+    assert body["registry_metadata_matches_joblib"] is False
+    assert body["active_model_registry_mismatched"] is False
     assert body["latest_signal"] is None
     assert body["last_order"] is None
     assert body["last_trade"] is None
@@ -234,6 +243,11 @@ def test_dashboard_trading_status_returns_disabled_empty_state(dashboard_client)
     assert body["trading_enabled"] is False
     assert body["model_available"] is False
     assert body["prediction_source"] == "fallback"
+    assert body["active_model_status"] == "stale"
+    assert body["active_model_valid"] is False
+    assert body["active_model_invalid_reason"] == "no_active_model"
+    assert body["active_model_reason"] == "no_active_model"
+    assert body["registry_metadata_matches_joblib"] is False
     assert body["fallback_trading_allowed"] is False
 
 
@@ -283,7 +297,7 @@ def test_dashboard_trading_status_shows_risk_block_and_ioc_cooldown(dashboard_cl
     assert body["paused"] is False
     assert body["latest_decision_action"] == "hold"
     assert body["latest_decision_reason"] == "ioc_cancel_cooldown_active"
-    assert body["latest_risk_block_reason"] == "ioc_cancel_cooldown_active"
+    assert body["latest_risk_block_reason"] is None
     assert body["current_ioc_cancel_count"] == 1
     assert body["ioc_cooldown_active"] is True
     assert body["ioc_cooldown_expires_at"] is not None

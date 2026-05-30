@@ -81,13 +81,24 @@ export function TradingStatusPanel({ status }: { status: TradingStatus | null })
         <StatusBlock
           icon={<ShieldCheck className="h-4 w-4" />}
           label="Model status"
-          tone={status.model_available ? 'green' : status.fallback_trading_allowed ? 'yellow' : 'red'}
-          value={status.model_available ? 'Model available' : 'Fallback'}
-          helper={`${status.prediction_source ?? 'unknown'} source · fallback trading ${status.fallback_trading_allowed ? 'allowed' : 'blocked'}`}
+          tone={modelTone(status)}
+          value={modelLabel(status)}
+          helper={`${status.prediction_source ?? 'unknown'} source · ${status.active_model_invalid_reason ?? 'registry ok'} · fallback trading ${status.fallback_trading_allowed ? 'allowed' : 'blocked'}`}
         />
       </div>
     </Card>
   );
+}
+
+function modelLabel(status: TradingStatus): string {
+  if (status.active_model_valid) return 'Accepted';
+  return status.active_model_status.replace(/_/g, ' ');
+}
+
+function modelTone(status: TradingStatus): StatusTone {
+  if (status.active_model_valid) return 'green';
+  if (status.active_model_status === 'stale') return status.fallback_trading_allowed ? 'yellow' : 'gray';
+  return 'red';
 }
 
 function StatusBlock({

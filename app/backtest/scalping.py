@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from app.config import Settings
-from app.data.feature_engineering import FEATURE_COLUMNS
+from app.data.feature_engineering import BAR_FEATURE_COLUMNS
 from app.ml.model import MLSignalModel
 
 
@@ -39,6 +39,9 @@ ZERO_BACKTEST_METRICS = {
 
 def backtest_assumptions(settings: Settings, *, spread_available: bool = False) -> dict[str, Any]:
     fee_bps = settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps
+    spread_source = "orderbook_spread" if spread_available else "unavailable"
+    if not spread_available and settings.scalping_mode_enabled:
+        spread_source = "configured_max_spread_bps"
     return {
         "symbol": settings.symbol,
         "paper_trading_only": settings.paper_trading_only,
@@ -49,7 +52,7 @@ def backtest_assumptions(settings: Settings, *, spread_available: bool = False) 
         "maker_fee_bps": settings.maker_fee_bps,
         "slippage_bps_per_side": settings.slippage_bps,
         "fee_and_slippage_applied_on": "entry_and_exit",
-        "spread_source": "orderbook_spread" if spread_available else "unavailable",
+        "spread_source": spread_source,
         "spread_cost_model": "full_round_trip_spread_subtracted_when_available",
         "order_notional_usd": settings.order_notional_usd,
         "return_metrics_unit": "fraction_of_traded_notional",
@@ -67,12 +70,12 @@ def calculate_fee_aware_metrics(trades: pd.DataFrame, settings: Settings) -> dic
     labels = trades["buy_quality_label"].astype(int).to_numpy()
     take_profit_pct = _take_profit_pct(settings)
     stop_loss_pct = _stop_loss_pct(settings)
-    gross_returns = np.where(labels == 1, take_profit_pct, -stop_loss_pct).astype(float)
+    gross_returns = _gross_returns(trades, labels, take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct)
 
     fee_bps = settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps
     fee_costs = np.full(len(trades), 2 * (fee_bps / 10_000), dtype=float)
     slippage_costs = np.full(len(trades), 2 * (settings.slippage_bps / 10_000), dtype=float)
-    spread_costs = _spread_costs(trades)
+    spread_costs = _spread_costs(trades, settings)
 
     net_returns = gross_returns - fee_costs - slippage_costs - spread_costs
     notional = float(settings.order_notional_usd)
@@ -157,7 +160,7 @@ def _walk_forward_prediction_frame(df: pd.DataFrame, *, min_train_rows: int, fol
         valid = df.iloc[train_end:valid_end]
         if "buy_quality_label" in train.columns and train["buy_quality_label"].astype(int).nunique() < 2:
             continue
-        model = MLSignalModel(feature_columns=FEATURE_COLUMNS).train(train)
+        model = MLSignalModel(feature_columns=BAR_FEATURE_COLUMNS).train(train)
         frame = valid.copy()
         frame["_probability"] = model.predict_proba(valid)
         validation_frames.append(frame)
@@ -166,11 +169,28 @@ def _walk_forward_prediction_frame(df: pd.DataFrame, *, min_train_rows: int, fol
     return pd.concat(validation_frames, ignore_index=True)
 
 
-def _spread_costs(trades: pd.DataFrame) -> np.ndarray:
-    if "orderbook_spread" not in trades.columns:
-        return np.zeros(len(trades), dtype=float)
-    spread = pd.to_numeric(trades["orderbook_spread"], errors="coerce").fillna(0).clip(lower=0)
-    return spread.to_numpy(dtype=float)
+def _spread_costs(trades: pd.DataFrame, settings: Settings) -> np.ndarray:
+    if "orderbook_spread" in trades.columns:
+        spread = pd.to_numeric(trades["orderbook_spread"], errors="coerce").fillna(0).clip(lower=0)
+        if bool((spread > 0).any()):
+            return spread.to_numpy(dtype=float)
+    if settings.scalping_mode_enabled:
+        return np.full(len(trades), max(0.0, settings.max_spread_bps) / 10_000, dtype=float)
+    return np.zeros(len(trades), dtype=float)
+
+
+def _gross_returns(
+    trades: pd.DataFrame,
+    labels: np.ndarray,
+    *,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+) -> np.ndarray:
+    fallback = np.where(labels == 1, take_profit_pct, -stop_loss_pct).astype(float)
+    if "buy_exit_return_pct" not in trades.columns:
+        return fallback
+    returns = pd.to_numeric(trades["buy_exit_return_pct"], errors="coerce").to_numpy(dtype=float)
+    return np.where(np.isfinite(returns), returns, fallback)
 
 
 def _mean_or_zero(values: np.ndarray) -> float:
@@ -183,7 +203,7 @@ def _profit_factor(returns: np.ndarray) -> float | None:
     gross_win = float(wins.sum()) if len(wins) else 0.0
     gross_loss = abs(float(losses.sum())) if len(losses) else 0.0
     if gross_loss == 0:
-        return None if gross_win > 0 else 0.0
+        return float("inf") if gross_win > 0 else 0.0
     return float(gross_win / gross_loss)
 
 

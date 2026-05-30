@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
-from app.data.feature_engineering import FEATURE_COLUMNS
+from app.data.feature_engineering import BAR_FEATURE_COLUMNS
 from app.ml.model import MLSignalModel
 
 
@@ -27,7 +27,7 @@ def trading_metrics(
             "profit_factor": 0.0,
             "max_drawdown": 0.0,
         }
-    returns = np.where(trades["buy_quality_label"].to_numpy() == 1, take_profit_pct, -stop_loss_pct)
+    returns = _trade_returns(trades, take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct)
     wins = returns[returns > 0]
     losses = returns[returns < 0]
     equity = np.cumsum(returns)
@@ -80,7 +80,7 @@ def walk_forward_validate(
         if len(_class_counts(train["buy_quality_label"])) < 2:
             skipped_folds += 1
             continue
-        model = MLSignalModel(feature_columns=FEATURE_COLUMNS).train(train)
+        model = MLSignalModel(feature_columns=BAR_FEATURE_COLUMNS).train(train)
         probs = model.predict_proba(valid)
         all_y.extend(valid["buy_quality_label"].astype(int).tolist())
         all_p.extend(probs.tolist())
@@ -129,8 +129,8 @@ def promotion_decision(
     max_trade_fraction: float,
     min_net_return_pct: float = 0.0,
     max_backtest_drawdown_pct: float | None = None,
-    min_backtest_profit_factor: float = 1.05,
-    min_backtest_trades: int = 1,
+    min_backtest_profit_factor: float = 1.2,
+    min_backtest_trades: int = 30,
     require_positive_net_return: bool = False,
 ) -> tuple[bool, str]:
     if not metrics or metrics.get("validation_rows", 0) < min(50, min_rows):
@@ -154,7 +154,7 @@ def promotion_decision(
     net_return = _metric_float(metrics.get("net_return_pct"))
     if net_return is None:
         return False, "net_return_unavailable"
-    if require_positive_net_return and net_return <= 0:
+    if net_return <= 0:
         return False, "model_not_profitable_after_costs"
     if net_return < min_net_return_pct:
         return False, "net_return_below_threshold"
@@ -165,8 +165,10 @@ def promotion_decision(
         and backtest_drawdown > max_backtest_drawdown_pct
     ):
         return False, "backtest_drawdown_too_high"
-    profit_factor_net = _metric_float(metrics.get("profit_factor_net"))
-    if profit_factor_net is not None and profit_factor_net < min_backtest_profit_factor:
+    profit_factor_net = _metric_float(metrics.get("profit_factor_net"), allow_infinite=True)
+    if profit_factor_net is None:
+        return False, "profit_factor_net_unavailable"
+    if profit_factor_net < min_backtest_profit_factor:
         return False, "profit_factor_net_too_low"
     return True, "accepted"
 
@@ -176,11 +178,22 @@ def _class_counts(values: pd.Series) -> dict[int, int]:
     return {int(label): int(count) for label, count in counts.items()}
 
 
-def _metric_float(value: object) -> float | None:
+def _metric_float(value: object, *, allow_infinite: bool = False) -> float | None:
     if value is None:
         return None
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
-    return parsed if math.isfinite(parsed) else None
+    if math.isfinite(parsed) or allow_infinite:
+        return parsed
+    return None
+
+
+def _trade_returns(trades: pd.DataFrame, *, take_profit_pct: float, stop_loss_pct: float) -> np.ndarray:
+    labels = trades["buy_quality_label"].to_numpy()
+    fallback = np.where(labels == 1, take_profit_pct, -stop_loss_pct).astype(float)
+    if "buy_exit_return_pct" not in trades.columns:
+        return fallback
+    returns = pd.to_numeric(trades["buy_exit_return_pct"], errors="coerce").to_numpy(dtype=float)
+    return np.where(np.isfinite(returns), returns, fallback)

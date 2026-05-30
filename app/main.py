@@ -8,6 +8,7 @@ from app.config import Settings, get_settings
 from app.data.market_data import MarketDataClient
 from app.db.database import SessionLocal, init_db
 from app.db.repository import Repository
+from app.ml.registry import ModelRegistry
 from app.ml.train import train_model_from_bars
 from app.monitoring.logger import get_logger
 from app.notifications.discord import DiscordNotifier
@@ -100,7 +101,7 @@ async def health() -> dict:
 
 @app.get("/config/safe", dependencies=[Depends(require_admin)])
 async def safe_config() -> dict:
-    return settings.safe_dict()
+    return {**settings.safe_dict(), **ModelRegistry(settings).validate_active_model().to_dict()}
 
 
 @app.get("/position", dependencies=[Depends(require_admin)])

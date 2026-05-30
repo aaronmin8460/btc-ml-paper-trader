@@ -11,11 +11,9 @@ export function RiskBudgetPanel({ summary }: { summary: DashboardSummary }) {
   const totalBudget = remaining === null || remaining === undefined ? null : calls + remaining;
   const usedPct = totalBudget && totalBudget > 0 ? Math.min(1, calls / totalBudget) : null;
   const modelStatus =
-    summary.latest_model_accepted === null
-      ? 'No model run'
-      : summary.latest_model_accepted
-        ? 'Accepted'
-        : `Rejected: ${summary.latest_model_rejected_reason ?? 'unknown'}`;
+    summary.active_model_valid
+      ? 'Active accepted'
+      : `Active ${summary.active_model_status}: ${summary.active_model_invalid_reason ?? summary.latest_model_rejected_reason ?? 'unknown'}`;
 
   return (
     <Card>
@@ -56,7 +54,7 @@ export function RiskBudgetPanel({ summary }: { summary: DashboardSummary }) {
           label="Account risk / model"
           value={formatPercent(summary.account_drawdown_pct)}
           helper={`Daily ${formatUsd(summary.account_daily_change_usd)} (${formatPercent(summary.account_daily_change_pct)}) · ${modelStatus}`}
-          tone={(summary.account_drawdown_pct ?? 0) > 0.02 || summary.latest_model_accepted === false ? 'amber' : 'blue'}
+          tone={(summary.account_drawdown_pct ?? 0) > 0.02 || !summary.active_model_valid ? 'amber' : 'blue'}
         />
       </div>
     </Card>

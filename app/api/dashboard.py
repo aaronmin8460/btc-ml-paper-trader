@@ -38,7 +38,6 @@ RISK_BLOCK_REASONS = {
     "account_data_required_unavailable",
     "buying_power_too_low",
     "recent_ioc_cancels_too_high",
-    "ioc_cancel_cooldown_active",
     "max_daily_loss_reached",
     "max_drawdown_reached",
     "cooldown_after_loss",
@@ -76,6 +75,7 @@ async def dashboard_summary(request: Request) -> dict:
     profit_guard = _profit_guard_summary(settings, position, market_summary)
     api_budget = get_alpaca_rate_limiter(settings).snapshot()
     latest_model = _latest_model_summary(latest_model_run[0] if latest_model_run else None)
+    active_model = ModelRegistry(settings).validate_active_model().to_dict()
 
     return {
         "app_status": "ok",
@@ -105,6 +105,7 @@ async def dashboard_summary(request: Request) -> dict:
         "latest_model_profit_factor": latest_model.get("latest_model_profit_factor"),
         "latest_model_accepted": latest_model.get("latest_model_accepted"),
         "latest_model_rejected_reason": latest_model.get("latest_model_rejected_reason"),
+        **active_model,
         **order_summary,
         "total_trades": len(trades),
         **trade_metrics,
@@ -359,7 +360,8 @@ def _trading_status_payload(
     paused_at: str | None = None,
 ) -> dict:
     latest_risk_reason = _latest_risk_block_reason(recent_signals)
-    model_available = _model_available(settings)
+    active_model = ModelRegistry(settings).validate_active_model().to_dict()
+    model_available = bool(active_model["active_model_valid"])
     prediction_source = "model" if model_available else "fallback"
     state, state_tone = _trading_state(
         settings=settings,
@@ -388,6 +390,7 @@ def _trading_status_payload(
         "paper_trading_only": settings.paper_trading_only,
         "model_available": model_available,
         "prediction_source": prediction_source,
+        **active_model,
         "fallback_trading_allowed": settings.allow_fallback_trading,
     }
 
@@ -400,8 +403,7 @@ def _latest_risk_block_reason(signals: list[Signal]) -> str | None:
 
 
 def _model_available(settings: Settings) -> bool:
-    active_path = ModelRegistry(settings).active_model_path()
-    return bool(active_path and active_path.exists())
+    return ModelRegistry(settings).validate_active_model().valid
 
 
 def _scheduler_pause_status(scheduler: Any) -> dict:

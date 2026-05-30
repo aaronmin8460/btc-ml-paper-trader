@@ -23,6 +23,14 @@ async def run_backtest() -> dict:
         bars,
         take_profit_pct=take_profit_pct,
         stop_loss_pct=stop_loss_pct,
+        scalping_mode_enabled=settings.scalping_mode_enabled,
+        trailing_stop_pct=settings.scalping_trailing_stop_pct if settings.scalping_mode_enabled else settings.trailing_stop_pct,
+        trailing_stop_arm_profit_pct=settings.trailing_stop_arm_profit_pct,
+        fee_bps_per_side=settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps,
+        slippage_bps_per_side=settings.slippage_bps,
+        spread_cost_pct=(settings.max_spread_bps / 10_000) if settings.scalping_mode_enabled else 0.0,
+        min_net_exit_profit_pct=settings.min_net_exit_profit_pct if settings.scalping_mode_enabled else 0.0,
+        exit_profit_buffer_bps=settings.exit_profit_buffer_bps if settings.scalping_mode_enabled else 0.0,
     )
     metrics = walk_forward_validate(
         dataset,

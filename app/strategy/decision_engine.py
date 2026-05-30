@@ -318,7 +318,7 @@ def _quote_float(quote: dict | None, *keys: str) -> float | None:
 
 def _model_unavailable(prediction: dict, settings: Settings) -> bool:
     source = str(prediction.get("prediction_source") or prediction.get("source") or "").lower()
-    return source == "fallback" and not settings.allow_fallback_trading
+    return source.startswith("fallback") and not settings.allow_fallback_trading
 
 
 def _timestamp_within_seconds(value: datetime | None, *, now: datetime, seconds: int | float) -> bool:

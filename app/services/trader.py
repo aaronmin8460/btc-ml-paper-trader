@@ -34,7 +34,6 @@ KILL_SWITCH_REASONS = {
     "account_data_required_unavailable",
     "buying_power_too_low",
     "recent_ioc_cancels_too_high",
-    "ioc_cancel_cooldown_active",
     "model_not_profitable_after_costs",
 }
 

@@ -79,6 +79,17 @@ export type TradingStatus = {
   paper_trading_only: boolean;
   model_available: boolean;
   prediction_source: string | null;
+  active_model_path: string | null;
+  active_model_version: string | null;
+  active_model_status: string;
+  active_model_valid: boolean;
+  active_model_invalid_reason: string | null;
+  active_model_promotion_reason: string | null;
+  active_model_net_return_pct: number | null;
+  active_model_profit_factor_net: number | null;
+  active_model_number_of_trades: number | null;
+  registry_metadata_matches_joblib: boolean;
+  active_model_registry_mismatched: boolean;
   fallback_trading_allowed: boolean;
 };
 
@@ -148,6 +159,17 @@ export type DashboardSummary = {
   latest_model_profit_factor: number | null;
   latest_model_accepted: boolean | null;
   latest_model_rejected_reason: string | null;
+  active_model_path: string | null;
+  active_model_version: string | null;
+  active_model_status: string;
+  active_model_valid: boolean;
+  active_model_invalid_reason: string | null;
+  active_model_promotion_reason: string | null;
+  active_model_net_return_pct: number | null;
+  active_model_profit_factor_net: number | null;
+  active_model_number_of_trades: number | null;
+  registry_metadata_matches_joblib: boolean;
+  active_model_registry_mismatched: boolean;
   total_orders: number;
   total_buy_orders: number;
   total_sell_orders: number;

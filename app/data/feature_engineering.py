@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 
-FEATURE_COLUMNS = [
+BAR_FEATURE_COLUMNS = [
     "log_return_1",
     "log_return_3",
     "log_return_5",
@@ -32,9 +32,14 @@ FEATURE_COLUMNS = [
     "hour_of_day",
     "day_of_week",
     "is_weekend",
+]
+
+RUNTIME_ONLY_FEATURE_COLUMNS = [
     "orderbook_spread",
     "quote_imbalance",
 ]
+
+FEATURE_COLUMNS = BAR_FEATURE_COLUMNS
 
 
 def compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
@@ -117,7 +122,7 @@ def add_features(df: pd.DataFrame, quote: dict | None = None) -> pd.DataFrame:
 
 
 def latest_feature_row(df: pd.DataFrame, quote: dict | None = None) -> pd.DataFrame:
-    features = add_features(df, quote=quote).dropna(subset=[c for c in FEATURE_COLUMNS if c not in {"orderbook_spread", "quote_imbalance"}])
+    features = add_features(df, quote=quote).dropna(subset=BAR_FEATURE_COLUMNS)
     if features.empty:
         raise ValueError("Not enough bars to compute features.")
     return features.tail(1)

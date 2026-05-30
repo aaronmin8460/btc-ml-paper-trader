@@ -2,7 +2,6 @@ import pandas as pd
 
 from app.config import Settings, get_settings
 from app.data.feature_engineering import latest_feature_row
-from app.ml.model import MLSignalModel
 from app.ml.registry import ModelRegistry
 from app.monitoring.logger import get_logger
 
@@ -13,15 +12,14 @@ class Predictor:
 
     def predict(self, bars: pd.DataFrame, quote: dict | None = None) -> dict:
         row = latest_feature_row(bars, quote=quote)
-        active_path = ModelRegistry(self.settings).active_model_path()
-        model_available = bool(active_path and active_path.exists())
+        model, active_model_status = ModelRegistry(self.settings).load_valid_active_model()
+        model_available = model is not None
         if model_available:
-            model = MLSignalModel.load(active_path)
             buy_probability = float(model.predict_proba(row)[0])
             prediction_source = "model"
         else:
             buy_probability = self._fallback_probability(row)
-            prediction_source = "fallback"
+            prediction_source = "fallback_invalid_model" if active_model_status.active_model_path else "fallback"
         sell_probability = float(max(0.0, min(1.0, 1.0 - buy_probability)))
         result = {
             "symbol": self.settings.symbol,
@@ -29,9 +27,10 @@ class Predictor:
             "buy_probability": buy_probability,
             "sell_probability": sell_probability,
             "features": row.iloc[-1].to_dict(),
-            "model_path": str(active_path) if active_path else None,
+            "model_path": active_model_status.active_model_path,
             "prediction_source": prediction_source,
             "model_available": model_available,
+            **active_model_status.to_dict(),
         }
         get_logger().event(
             "prediction",
@@ -41,6 +40,8 @@ class Predictor:
             model_path=result["model_path"],
             prediction_source=prediction_source,
             model_available=model_available,
+            active_model_status=result["active_model_status"],
+            active_model_reason=result["active_model_reason"],
         )
         return result
 

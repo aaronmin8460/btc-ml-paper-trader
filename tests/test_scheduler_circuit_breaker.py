@@ -114,6 +114,25 @@ async def test_different_risk_reasons_are_counted_separately():
 
 
 @pytest.mark.anyio
+async def test_ioc_cancel_cooldown_does_not_pause_scheduler():
+    trader = FakeTrader(
+        [
+            _risk_result("ioc_cancel_cooldown_active"),
+            _risk_result("ioc_cancel_cooldown_active"),
+            _risk_result("ioc_cancel_cooldown_active"),
+        ]
+    )
+    scheduler = TradingScheduler(trader, _settings(max_same_risk_blocks_before_pause=2))
+
+    assert await scheduler.run_pending_once() is True
+    assert await scheduler.run_pending_once() is True
+    assert await scheduler.run_pending_once() is True
+
+    assert scheduler.paused is False
+    assert scheduler.pause_reason is None
+
+
+@pytest.mark.anyio
 async def test_discord_pause_alert_sent_once():
     scheduler = TradingScheduler(FakeTrader(), _settings())
 

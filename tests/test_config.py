@@ -103,8 +103,8 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.require_account_data_for_trading is False
     assert settings.min_backtest_net_return_pct == 0.001
     assert settings.max_backtest_drawdown_pct == 0.01
-    assert settings.min_backtest_profit_factor == 1.05
-    assert settings.min_backtest_trades == 20
+    assert settings.min_backtest_profit_factor == 1.2
+    assert settings.min_backtest_trades == 30
     assert settings.model_promotion_require_positive_net_return is True
 
 
@@ -257,13 +257,14 @@ def test_safe_dict_masks_discord_webhook_url():
     assert "example/secret" not in str(safe_config)
 
 
-def test_safe_config_endpoint_masks_discord_webhook_url(monkeypatch):
+def test_safe_config_endpoint_masks_discord_webhook_url(monkeypatch, tmp_path):
     from app import main
 
     settings = Settings(
         _env_file=None,
         api_admin_token="secret",
         discord_webhook_url="https://discord.example/api/webhooks/example/secret",
+        model_dir=str(tmp_path / "models"),
     )
     monkeypatch.setattr(main, "settings", settings)
 
@@ -271,4 +272,8 @@ def test_safe_config_endpoint_masks_discord_webhook_url(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["discord_webhook_url"] == "***"
+    assert response.json()["active_model_status"] == "stale"
+    assert response.json()["active_model_valid"] is False
+    assert response.json()["active_model_invalid_reason"] == "no_active_model"
+    assert response.json()["registry_metadata_matches_joblib"] is False
     assert "example/secret" not in response.text
