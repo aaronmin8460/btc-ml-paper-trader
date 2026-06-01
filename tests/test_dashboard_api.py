@@ -176,6 +176,8 @@ def test_dashboard_endpoints_require_admin_token(dashboard_client):
         "/dashboard/portfolio-curve",
         "/dashboard/trading-status",
         "/dashboard/market",
+        "/dashboard/risk",
+        "/dashboard/model",
     ]:
         response = client.get(path)
         assert response.status_code == 401, path
@@ -194,7 +196,10 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["app_status"] == "ok"
     assert body["symbol"] == "BTC/USD"
     assert body["paper_trading_only"] is True
+    assert body["scalping_mode_enabled"] is False
     assert body["scheduler_running"] is True
+    assert body["scheduler_paused"] is False
+    assert body["pause_reason"] is None
     assert body["auto_train_enabled"] is False
     assert body["training_scheduler_running"] is False
     assert body["last_training_started_at"] == "2026-05-29T00:00:00+00:00"
@@ -208,6 +213,10 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["profit_guard_enabled"] is True
     assert body["min_net_exit_profit_pct"] == 0.002
     assert body["current_unrealized_pnl_pct"] is None
+    assert body["current_unrealized_pnl"] == 0
+    assert body["realized_pnl_today"] == 0
+    assert body["total_trades_today"] == 0
+    assert body["win_rate_today"] is None
     assert body["profit_guard_exit_allowed"] is False
     assert body["estimated_exit_price"] == pytest.approx(100.98)
     assert body["minimum_profitable_exit_price"] is None
@@ -238,12 +247,15 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["registry_metadata_matches_joblib"] is False
     assert body["active_model_registry_mismatched"] is False
     assert body["latest_signal"] is None
+    assert body["latest_order"] is None
     assert body["last_order"] is None
     assert body["last_trade"] is None
     assert body["ioc_cancel_guard"]["latest_buy_ioc_cancel_at"] is None
     assert body["ioc_cancel_guard"]["recent_buy_ioc_cancel_count"] == 0
     assert body["ioc_cancel_guard"]["cooldown_active"] is False
     assert body["data_freshness"]["latest_timestamp"] == "2026-05-27T16:01:00+00:00"
+    assert "quote_timestamp" in body["data_freshness"]
+    assert "quote_age_seconds" in body["data_freshness"]
 
 
 def test_dashboard_trading_status_returns_disabled_empty_state(dashboard_client):
@@ -438,6 +450,200 @@ def test_dashboard_orders_invalid_raw_response_returns_null(dashboard_client):
     assert response.json()[0]["raw_response"] is None
 
 
+def test_dashboard_orders_surface_execution_observability_fields(dashboard_client):
+    client, Session = dashboard_client
+    with Session() as db:
+        db.add(
+            Order(
+                symbol="BTC/USD",
+                side="buy",
+                status="filled",
+                broker_order_id="paper-order-1",
+                raw_response=(
+                    '{"order_type":"limit","time_in_force":"ioc","limit_price":101,'
+                    '"filled_qty":0.25,"filled_avg_price":100.5,"fee_amount":0.1,'
+                    '"slippage_amount":0.05}'
+                ),
+            )
+        )
+        db.commit()
+
+    response = client.get("/dashboard/orders", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    order = response.json()[0]
+    assert order["local_order_id"] is not None
+    assert order["order_id"] == "paper-order-1"
+    assert order["order_type"] == "limit"
+    assert order["time_in_force"] == "ioc"
+    assert order["filled_qty"] == 0.25
+    assert order["fee_amount"] == 0.1
+    assert order["slippage_amount"] == 0.05
+
+
+def test_dashboard_orders_infer_ioc_no_fill_cancel_reason(dashboard_client):
+    client, Session = dashboard_client
+    with Session() as db:
+        db.add(
+            Order(
+                symbol="BTC/USD",
+                side="buy",
+                status="canceled",
+                raw_response='{"order_type":"limit","time_in_force":"ioc"}',
+            )
+        )
+        db.commit()
+
+    response = client.get("/dashboard/orders", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    assert response.json()[0]["cancel_reason"] == "ioc_no_fill"
+
+
+def test_dashboard_signals_surface_scalping_observability_fields(dashboard_client):
+    client, Session = dashboard_client
+    with Session() as db:
+        db.add(
+            Signal(
+                symbol="BTC/USD",
+                action="hold",
+                buy_probability=0.61,
+                sell_probability=0.22,
+                reason="spread_too_wide",
+                spread_bps=7.5,
+                quote_imbalance=-0.2,
+                model_version="btc_model_test",
+            )
+        )
+        db.commit()
+
+    response = client.get("/dashboard/signals", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    signal = response.json()[0]
+    assert signal["timestamp"] is not None
+    assert signal["spread_bps"] == 7.5
+    assert signal["quote_imbalance"] == -0.2
+    assert signal["model_version"] == "btc_model_test"
+
+
+def test_dashboard_trades_surface_closed_trade_execution_fields(dashboard_client):
+    client, Session = dashboard_client
+    with Session() as db:
+        db.add(
+            Trade(
+                symbol="BTC/USD",
+                side="sell",
+                qty=0.01,
+                price=10_100,
+                pnl=0.75,
+                entry_price=10_000,
+                exit_price=10_100,
+                notional=101,
+                gross_pnl=1,
+                net_pnl=0.75,
+                fee_amount=0.2,
+                slippage_amount=0.05,
+                hold_seconds=42,
+                reason="scalping_take_profit",
+            )
+        )
+        db.commit()
+
+    response = client.get("/dashboard/trades", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    trade = response.json()[0]
+    assert trade["timestamp"] is not None
+    assert trade["entry_price"] == 10_000
+    assert trade["exit_price"] == 10_100
+    assert trade["gross_pnl"] == 1
+    assert trade["net_pnl"] == 0.75
+    assert trade["hold_seconds"] == 42
+    assert trade["reason"] == "scalping_take_profit"
+
+
+def test_dashboard_risk_returns_safe_empty_state(dashboard_client):
+    client, _ = dashboard_client
+
+    response = client.get("/dashboard/risk", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["symbol"] == "BTC/USD"
+    assert body["active_risk_blocks"] == []
+    assert body["recent_risk_block_counts"] == {
+        "window_seconds": 3600,
+        "total": 0,
+        "by_reason": {},
+    }
+    assert body["trade_frequency_state"]["last_10_minutes"] == 0
+    assert body["order_attempt_frequency_state"]["last_10_minutes"] == 0
+    assert body["daily_loss_state"]["realized_pnl"] == 0
+    assert body["hourly_loss_state"]["realized_pnl"] == 0
+    assert body["kill_switch_state"]["paused"] is False
+    assert body["kill_switch_state"]["latest_persisted_event"] is None
+
+
+def test_dashboard_risk_surfaces_latest_block_and_frequency_state(dashboard_client):
+    client, Session = dashboard_client
+    with Session() as db:
+        db.add(
+            Signal(
+                symbol="BTC/USD",
+                action="hold",
+                buy_probability=0.2,
+                sell_probability=0.8,
+                reason="spread_too_wide",
+            )
+        )
+        db.add(
+            Order(
+                symbol="BTC/USD",
+                side="buy",
+                status="canceled",
+                raw_response='{"order_type":"limit","time_in_force":"ioc"}',
+            )
+        )
+        db.commit()
+
+    response = client.get("/dashboard/risk", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["active_risk_blocks"][0]["reason"] == "spread_too_wide"
+    assert body["recent_risk_block_counts"]["by_reason"]["spread_too_wide"] == 1
+    assert body["order_attempt_frequency_state"]["last_10_minutes"] == 1
+    assert body["ioc_cancel_guard"]["recent_buy_ioc_cancel_count"] == 1
+
+
+def test_dashboard_model_returns_safe_defaults_and_redacts_metrics(dashboard_client, tmp_path, monkeypatch):
+    from app import main
+
+    client, _ = dashboard_client
+    model_dir = tmp_path / "dashboard-model"
+    model_dir.mkdir()
+    (model_dir / "registry.json").write_text(
+        '{"model_version":"btc_model_test","feature_columns":["scalping_momentum_3"],'
+        '"metrics":{"net_return_pct":0.01,"api_key":"must-not-leak"}}',
+        encoding="utf-8",
+    )
+    settings = Settings(_env_file=None, api_admin_token="secret", model_dir=str(model_dir))
+    monkeypatch.setattr(main, "settings", settings)
+    monkeypatch.setattr(main.app.state, "settings", settings, raising=False)
+
+    response = client.get("/dashboard/model", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["active_model_path"] is None
+    assert body["active_model_status"] == "stale"
+    assert body["model_version"] == "btc_model_test"
+    assert body["feature_columns"] == ["scalping_momentum_3"]
+    assert body["validation_metrics"]["api_key"] == "***"
+    assert "must-not-leak" not in response.text
+
+
 def test_dashboard_summary_works_without_alpaca_credentials(dashboard_client, monkeypatch):
     from app import main
 
@@ -599,6 +805,23 @@ def test_dashboard_limit_query_params_are_capped_at_500(dashboard_client):
 
     assert response.status_code == 200
     assert len(response.json()) == 500
+
+
+def test_dashboard_list_endpoint_limits_are_applied(dashboard_client):
+    client, Session = dashboard_client
+    with Session() as db:
+        for index in range(3):
+            db.add(Order(symbol="BTC/USD", side="buy", status="filled", raw_response="{}"))
+            db.add(Trade(symbol="BTC/USD", side="sell", qty=0.01, price=10_000 + index, pnl=index))
+        db.commit()
+
+    orders = client.get("/dashboard/orders?limit=2", headers={"X-Admin-Token": "secret"})
+    trades = client.get("/dashboard/trades?limit=2", headers={"X-Admin-Token": "secret"})
+
+    assert orders.status_code == 200
+    assert trades.status_code == 200
+    assert len(orders.json()) == 2
+    assert len(trades.json()) == 2
 
 
 def test_dashboard_run_once_includes_dashboard_summary(dashboard_client):

@@ -8,6 +8,7 @@ from urllib.parse import quote
 import httpx
 
 from app.broker.execution_guard import assert_btc_only, validate_order_request
+from app.broker.paper_execution import PaperOrderRequest, simulate_limit_ioc_order, simulate_market_order
 from app.config import ALLOWED_SYMBOL, Settings, get_settings
 from app.monitoring.logger import get_logger
 from app.utils.rate_limiter import get_alpaca_rate_limiter
@@ -19,6 +20,9 @@ class AlpacaClient:
         self.logger = get_logger()
         self._position_cache: dict[str, tuple[datetime, dict[str, Any] | None]] = {}
         self._account_cache: tuple[datetime, dict[str, Any]] | None = None
+        self._local_position_qty = 0.0
+        self._local_avg_entry_price = 0.0
+        self._local_current_price = 0.0
 
     @property
     def headers(self) -> dict[str, str]:
@@ -48,6 +52,8 @@ class AlpacaClient:
 
     async def get_position(self, symbol: str = ALLOWED_SYMBOL, *, force_refresh: bool = False) -> dict[str, Any] | None:
         assert_btc_only(symbol, context="position_symbol_validation")
+        if self.settings.paper_execution_mode == "local_simulated":
+            return self._local_position_payload()
         cached = self._get_position_cache(symbol, force_refresh=force_refresh)
         if cached is not _CACHE_MISS:
             return cached
@@ -173,6 +179,14 @@ class AlpacaClient:
                 "time_in_force": selected_time_in_force,
                 "limit_price": order.limit_price,
             }
+        if self.settings.paper_execution_mode == "local_simulated":
+            return self._simulate_local_order(
+                order=order,
+                time_in_force=selected_time_in_force,
+                current_position_qty=current_position_qty,
+                quote=quote,
+                latest_price=latest_price,
+            )
         if not self.credentials_available():
             raise RuntimeError("Alpaca credentials are required when TRADING_ENABLED=true.")
 
@@ -213,6 +227,90 @@ class AlpacaClient:
                 time_in_force=selected_time_in_force,
             )
             return data
+
+    def _simulate_local_order(
+        self,
+        *,
+        order,
+        time_in_force: str,
+        current_position_qty: float,
+        quote: dict[str, Any] | None,
+        latest_price: float | None,
+    ) -> dict[str, Any]:
+        bid_size = self._quote_size_float(quote, "bid_size", "bs")
+        ask_size = self._quote_size_float(quote, "ask_size", "as")
+        qty = order.qty
+        if order.side == "sell":
+            qty = min(order.qty or current_position_qty, max(0.0, current_position_qty))
+        request = PaperOrderRequest(
+            symbol=order.symbol,
+            side=order.side,
+            bid_price=self._quote_float(quote, "bid_price", "bp", "bid"),
+            ask_price=self._quote_float(quote, "ask_price", "ap", "ask"),
+            bid_size=bid_size,
+            ask_size=ask_size,
+            latest_price=latest_price,
+            notional=order.notional,
+            qty=qty,
+            fee_bps=self.settings.paper_fee_bps,
+            slippage_bps=self.settings.paper_slippage_bps,
+            limit_price=order.limit_price,
+            order_type=order.order_type,
+            time_in_force=time_in_force,
+        )
+        result = simulate_market_order(request) if order.order_type == "market" else simulate_limit_ioc_order(request)
+        data = result.to_order_response()
+        self._apply_local_fill(data)
+        self.logger.event(
+            "submitted_order",
+            symbol=order.symbol,
+            side=order.side,
+            broker_order_id=data["id"],
+            status=data["status"],
+            order_type=order.order_type,
+            time_in_force=time_in_force,
+            filled_qty=data["filled_qty"],
+            filled_avg_price=data["filled_avg_price"],
+            fee_amount=data["fee_amount"],
+            slippage_amount=data["slippage_amount"],
+            execution_source=data["execution_source"],
+        )
+        return data
+
+    def _apply_local_fill(self, order_response: dict[str, Any]) -> None:
+        filled_qty = float(order_response.get("filled_qty") or 0)
+        filled_avg_price = float(order_response.get("filled_avg_price") or 0)
+        if filled_qty <= 0 or filled_avg_price <= 0:
+            return
+        if order_response.get("side") == "buy":
+            old_notional = self._local_position_qty * self._local_avg_entry_price
+            self._local_position_qty += filled_qty
+            self._local_avg_entry_price = (old_notional + filled_qty * filled_avg_price) / self._local_position_qty
+        else:
+            self._local_position_qty = max(0.0, self._local_position_qty - filled_qty)
+            if self._local_position_qty <= 1e-12:
+                self._local_position_qty = 0.0
+                self._local_avg_entry_price = 0.0
+        self._local_current_price = filled_avg_price
+
+    def _local_position_payload(self) -> dict[str, Any] | None:
+        if self._local_position_qty <= 0:
+            return None
+        return {
+            "symbol": ALLOWED_SYMBOL,
+            "qty": str(self._local_position_qty),
+            "avg_entry_price": str(self._local_avg_entry_price),
+            "current_price": str(self._local_current_price or self._local_avg_entry_price),
+            "market_value": str(self._local_position_qty * (self._local_current_price or self._local_avg_entry_price)),
+            "execution_source": "local_simulated",
+        }
+
+    def hydrate_local_position(self, *, qty: float, avg_entry_price: float, current_price: float | None = None) -> None:
+        if self.settings.paper_execution_mode != "local_simulated":
+            return
+        self._local_position_qty = max(0.0, float(qty))
+        self._local_avg_entry_price = max(0.0, float(avg_entry_price))
+        self._local_current_price = max(0.0, float(current_price or avg_entry_price))
 
     async def get_order(self, order_id: str) -> dict[str, Any]:
         if not self.credentials_available():
@@ -268,6 +366,22 @@ class AlpacaClient:
             except (TypeError, ValueError):
                 continue
             if math.isfinite(parsed) and parsed > 0:
+                return parsed
+        return None
+
+    @staticmethod
+    def _quote_size_float(quote: dict[str, Any] | None, *keys: str) -> float | None:
+        if not quote:
+            return None
+        for key in keys:
+            value = quote.get(key)
+            if value is None or value == "":
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed) and parsed >= 0:
                 return parsed
         return None
 

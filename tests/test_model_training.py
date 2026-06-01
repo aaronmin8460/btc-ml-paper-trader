@@ -1,17 +1,20 @@
 import json
 from datetime import UTC, datetime
 
+import numpy as np
 import pandas as pd
+import pytest
 
 from app.config import Settings
-from app.data.dataset_builder import build_training_dataset
+from app.data.dataset_builder import build_training_dataset, training_feature_columns
 from app.data.feature_engineering import BAR_FEATURE_COLUMNS, RUNTIME_ONLY_FEATURE_COLUMNS
 from app.data.market_data import MarketDataClient
+from app.data.scalping_features import SCALPING_BAR_FEATURE_COLUMNS, SCALPING_FEATURE_COLUMNS, SCALPING_QUOTE_FEATURE_COLUMNS
 from app.ml.labels import net_profit_scalping_labels
 from app.ml.model import MLSignalModel
 from app.ml.predict import Predictor
-from app.ml.registry import ModelRegistry
-from app.ml.train import train_model_from_bars
+from app.ml.registry import ActiveModelStatus, ModelRegistry
+from app.ml.train import dataset_metadata, train_model_from_bars
 from app.ml.validation import promotion_decision
 
 
@@ -22,6 +25,34 @@ def test_model_training_produces_probabilities():
     probabilities = model.predict_proba(dataset.tail(5))
     assert len(probabilities) == 5
     assert all(0 <= value <= 1 for value in probabilities)
+
+
+def test_model_training_returns_independent_buy_and_sell_probabilities():
+    feature = np.linspace(-1, 1, 120)
+    dataset = pd.DataFrame(
+        {
+            "feature": feature,
+            "buy_quality_label": (feature > 0).astype(int),
+            "sell_quality_label": (feature > 0).astype(int),
+        }
+    )
+
+    model = MLSignalModel(feature_columns=["feature"]).train(dataset, model_version="two_head_test")
+    rows = dataset.iloc[[10, 110]]
+    buy_probabilities = model.predict_buy_proba(rows)
+    sell_probabilities = model.predict_sell_proba(rows)
+
+    assert model.supports_independent_sell_probability is True
+    assert np.allclose(model.predict_proba(rows), buy_probabilities)
+    assert np.allclose(sell_probabilities, buy_probabilities)
+    assert not np.allclose(sell_probabilities, 1 - buy_probabilities)
+    assert model.metadata["target_class_balances"] == {
+        "buy_quality_label": {0: 0.5, 1: 0.5},
+        "sell_quality_label": {0: 0.5, 1: 0.5},
+    }
+    assert model.metadata["feature_columns"] == ["feature"]
+    assert model.metadata["model_version"] == "two_head_test"
+    assert model.metadata["supports_independent_sell_probability"] is True
 
 
 def test_labels_drop_rows_where_future_unavailable():
@@ -41,6 +72,55 @@ def test_predictor_marks_fallback_predictions_when_no_model_is_active(tmp_path):
     assert prediction["model_available"] is False
     assert prediction["model_path"] is None
     assert prediction["active_model_status"] == "stale"
+
+
+def test_predictor_uses_scalping_row_for_active_scalping_model(monkeypatch, tmp_path):
+    class ScalpingModel:
+        feature_columns = SCALPING_BAR_FEATURE_COLUMNS
+        supports_independent_sell_probability = True
+
+        def predict_buy_proba(self, row):
+            assert row[SCALPING_BAR_FEATURE_COLUMNS].notna().all(axis=None)
+            assert row.iloc[-1]["scalping_spread_bps"] > 0
+            return np.array([0.7])
+
+        def predict_sell_proba(self, row):
+            return np.array([0.2])
+
+    status = ActiveModelStatus("scalping-model.joblib", "accepted", True)
+    monkeypatch.setattr(ModelRegistry, "load_valid_active_model", lambda self: (ScalpingModel(), status))
+    settings = Settings(_env_file=None, model_dir=str(tmp_path))
+    quote = {"bid_price": 99.9, "ask_price": 100.1, "bid_size": 2.0, "ask_size": 1.0}
+
+    prediction = Predictor(settings).predict(MarketDataClient.synthetic_btc_bars(140), quote=quote)
+
+    assert prediction["prediction_source"] == "model"
+    assert prediction["sell_probability_source"] == "independent_sell_model"
+    assert prediction["supports_independent_sell_probability"] is True
+    assert prediction["model_available"] is True
+    assert prediction["buy_probability"] == 0.7
+    assert prediction["sell_probability"] == 0.2
+    assert "scalping_log_return_1" in prediction["features"]
+
+
+def test_predictor_uses_legacy_sell_probability_fallback_for_old_model(monkeypatch, tmp_path):
+    class LegacyModel:
+        feature_columns = BAR_FEATURE_COLUMNS
+
+        def predict_proba(self, row):
+            return np.array([0.7])
+
+    status = ActiveModelStatus("legacy-model.joblib", "accepted", True)
+    monkeypatch.setattr(ModelRegistry, "load_valid_active_model", lambda self: (LegacyModel(), status))
+    settings = Settings(_env_file=None, model_dir=str(tmp_path))
+
+    prediction = Predictor(settings).predict(MarketDataClient.synthetic_btc_bars(140))
+
+    assert prediction["prediction_source"] == "legacy_sell_probability_fallback"
+    assert prediction["sell_probability_source"] == "buy_probability_complement"
+    assert prediction["supports_independent_sell_probability"] is False
+    assert prediction["buy_probability"] == 0.7
+    assert prediction["sell_probability"] == pytest.approx(0.3)
 
 
 def test_training_rejects_single_class_dataset_without_crashing(tmp_path):
@@ -217,7 +297,49 @@ def test_scalping_dataset_does_not_train_on_runtime_quote_filters():
     assert "orderbook_spread" not in BAR_FEATURE_COLUMNS
     assert "quote_imbalance" not in BAR_FEATURE_COLUMNS
     assert RUNTIME_ONLY_FEATURE_COLUMNS == ["orderbook_spread", "quote_imbalance"]
-    assert {"orderbook_spread", "quote_imbalance"}.issubset(dataset.columns)
+    assert set(SCALPING_FEATURE_COLUMNS).issubset(dataset.columns)
+    assert training_feature_columns(True) == SCALPING_BAR_FEATURE_COLUMNS
+    assert dataset[SCALPING_QUOTE_FEATURE_COLUMNS].isna().all(axis=None)
+
+
+def test_scalping_dataset_metadata_records_short_horizon_and_costs():
+    settings = Settings(
+        _env_file=None,
+        scalping_mode_enabled=True,
+        scalping_label_horizon_bars=2,
+        scalping_label_take_profit_pct=0.0014,
+        scalping_label_stop_loss_pct=0.0009,
+        scalping_label_min_net_profit_pct=0.0003,
+        taker_fee_bps=17,
+        slippage_bps=4,
+        max_spread_bps=6,
+    )
+
+    metadata = dataset_metadata(settings, feature_columns=training_feature_columns(True))
+
+    assert metadata["feature_set_name"] == "scalping_bar_features_v1"
+    assert metadata["feature_columns"] == SCALPING_BAR_FEATURE_COLUMNS
+    assert metadata["horizon_bars"] == 2
+    assert metadata["take_profit_pct"] == 0.0014
+    assert metadata["stop_loss_pct"] == 0.0009
+    assert metadata["fee_bps_per_side"] == 17
+    assert metadata["slippage_bps_per_side"] == 4
+    assert metadata["spread_cost_pct"] == 0.0006
+    assert metadata["min_net_profit_pct"] == 0.0003
+
+
+def test_registry_records_independent_sell_probability_support(tmp_path):
+    registry = ModelRegistry(Settings(_env_file=None, model_dir=str(tmp_path))).promote(
+        model_path=str(tmp_path / "model.joblib"),
+        feature_columns=["feature"],
+        metrics=_passing_metrics(),
+        thresholds={},
+        training_start="2026-05-27T00:00:00+00:00",
+        training_end="2026-05-27T00:01:00+00:00",
+        supports_independent_sell_probability=True,
+    )
+
+    assert registry["supports_independent_sell_probability"] is True
 
 
 def test_model_rejected_when_positive_gross_return_is_negative_after_costs():
@@ -272,6 +394,25 @@ def test_model_rejected_when_trade_count_is_too_low():
 
     assert accepted is False
     assert reason == "not_enough_backtest_trades"
+
+
+def test_model_rejected_when_ambiguous_candle_ratio_is_too_high():
+    accepted, reason = promotion_decision(
+        _passing_metrics(ambiguous_candle_ratio=0.11),
+        min_rows=100,
+        min_precision=0.52,
+        max_drawdown=0.2,
+        max_trade_fraction=0.4,
+        min_net_return_pct=0.001,
+        max_backtest_drawdown_pct=0.01,
+        min_backtest_profit_factor=1.2,
+        min_backtest_trades=30,
+        max_ambiguous_candle_ratio=0.10,
+        require_positive_net_return=True,
+    )
+
+    assert accepted is False
+    assert reason == "ambiguous_candle_ratio_too_high"
 
 
 def test_active_registry_mismatch_marks_model_invalid(tmp_path):
@@ -412,6 +553,33 @@ def test_active_model_rejected_when_trade_count_is_too_low(tmp_path):
     assert status.valid is False
     assert status.status == "rejected"
     assert status.reason == "not_enough_backtest_trades"
+
+
+def test_active_model_rejected_when_ambiguous_candle_ratio_is_too_high(tmp_path):
+    settings = Settings(_env_file=None, model_dir=str(tmp_path), max_backtest_ambiguous_candle_ratio=0.10)
+    model_path = tmp_path / "btc_model.joblib"
+    metrics = _passing_metrics(ambiguous_candle_ratio=0.11)
+    model = MLSignalModel(feature_columns=BAR_FEATURE_COLUMNS)
+    model.metadata["validation_metrics"] = metrics
+    model.metadata["promotion_reason"] = "accepted"
+    model.save(model_path)
+    (tmp_path / "registry.json").write_text(
+        json.dumps(
+            {
+                "active_model_path": str(model_path),
+                "model_version": model_path.stem,
+                "feature_columns": BAR_FEATURE_COLUMNS,
+                "metrics": metrics,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = ModelRegistry(settings).validate_active_model()
+
+    assert status.valid is False
+    assert status.status == "rejected"
+    assert status.reason == "ambiguous_candle_ratio_too_high"
 
 
 def test_active_model_version_mismatch_marks_registry_mismatched(tmp_path):

@@ -1,7 +1,19 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
-from app.services.scheduler import TradingScheduler
+from app.db.database import Base, connect_args_for_database_url
+from app.db.repository import Repository
+from app.services import scheduler as scheduler_module
+from app.services.scheduler import (
+    SCALPING_HOURLY_LOSS_REASON,
+    SCALPING_IOC_CANCEL_STREAK_REASON,
+    SCALPING_RUNTIME_ERRORS_REASON,
+    TradingScheduler,
+)
 
 
 class FakeNotifier:
@@ -43,6 +55,15 @@ def _settings(**overrides) -> Settings:
 
 def _risk_result(reason: str) -> dict:
     return {"decision": {"action": "hold", "reason": reason}}
+
+
+def _persisted_scheduler_session(tmp_path, monkeypatch):
+    database_url = f"sqlite:///{tmp_path / 'trading.db'}"
+    engine = create_engine(database_url, connect_args=connect_args_for_database_url(database_url))
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(scheduler_module, "SessionLocal", Session)
+    return engine, Session
 
 
 @pytest.mark.anyio
@@ -157,3 +178,106 @@ async def test_repeated_runtime_errors_trigger_pause():
     assert scheduler.paused is True
     assert scheduler.pause_reason == "repeated_runtime_errors"
     assert trader.notifier.pause_alerts == ["repeated_runtime_errors"]
+
+
+@pytest.mark.anyio
+async def test_scalping_hourly_loss_limit_pauses_with_clear_reason(tmp_path, monkeypatch):
+    engine, _ = _persisted_scheduler_session(tmp_path, monkeypatch)
+    trader = FakeTrader(
+        [
+            {
+                "decision": {"action": "hold", "reason": SCALPING_HOURLY_LOSS_REASON},
+                "scalping_kill_switch_reason": SCALPING_HOURLY_LOSS_REASON,
+            }
+        ]
+    )
+    try:
+        scheduler = TradingScheduler(trader, _settings(scalping_mode_enabled=True))
+
+        assert await scheduler.run_pending_once() is True
+
+        assert scheduler.paused is True
+        assert scheduler.pause_reason == "scalping_kill_switch:hourly_loss_limit"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_scalping_runtime_errors_pause_with_clear_reason(tmp_path, monkeypatch):
+    engine, _ = _persisted_scheduler_session(tmp_path, monkeypatch)
+    trader = FakeTrader(errors=[RuntimeError("boom"), RuntimeError("boom again")])
+    try:
+        scheduler = TradingScheduler(trader, _settings(scalping_mode_enabled=True))
+
+        assert await scheduler.run_pending_once() is False
+        assert await scheduler.run_pending_once() is False
+
+        assert scheduler.paused is True
+        assert scheduler.pause_reason == SCALPING_RUNTIME_ERRORS_REASON
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_ioc_cancel_streak_pause_is_restored_after_restart(tmp_path, monkeypatch):
+    engine, Session = _persisted_scheduler_session(tmp_path, monkeypatch)
+    try:
+        trader = FakeTrader(
+            [
+                {
+                    "decision": {"action": "hold", "reason": SCALPING_IOC_CANCEL_STREAK_REASON},
+                    "scalping_kill_switch_reason": SCALPING_IOC_CANCEL_STREAK_REASON,
+                }
+            ]
+        )
+        settings = _settings(
+            scalping_mode_enabled=True,
+            ioc_cancel_escalation_cooldown_seconds=600,
+        )
+        scheduler = TradingScheduler(trader, settings)
+
+        assert await scheduler.run_pending_once() is True
+        assert scheduler.paused is True
+        assert scheduler.pause_reason == "scalping_kill_switch:ioc_cancel_streak"
+
+        with Session() as db:
+            stored = Repository(db).latest_scalping_kill_switch_event()
+            assert stored is not None
+            assert stored.event_type == "scalping_kill_switch_pause"
+            assert stored.reason == SCALPING_IOC_CANCEL_STREAK_REASON
+
+        restarted = TradingScheduler(FakeTrader(), settings)
+        assert restarted.restore_pause_state(now=scheduler.paused_at + timedelta(seconds=1)) is True
+        assert restarted.paused is True
+        assert restarted.pause_reason == SCALPING_IOC_CANCEL_STREAK_REASON
+        assert restarted.paused_at == scheduler.paused_at
+    finally:
+        engine.dispose()
+
+
+def test_expired_scalping_pause_is_not_restored(tmp_path, monkeypatch):
+    engine, Session = _persisted_scheduler_session(tmp_path, monkeypatch)
+    paused_at = datetime(2026, 5, 29, 12, 0, tzinfo=UTC)
+    settings = _settings(
+        scalping_mode_enabled=True,
+        ioc_cancel_escalation_cooldown_seconds=10,
+    )
+    try:
+        with Session() as db:
+            Repository(db).add_risk_event(
+                event_type="scalping_kill_switch_pause",
+                reason=SCALPING_IOC_CANCEL_STREAK_REASON,
+                created_at=paused_at,
+            )
+
+        restarted = TradingScheduler(FakeTrader(), settings)
+        restored = restarted.restore_pause_state(now=paused_at + timedelta(seconds=11))
+
+        assert restored is False
+        assert restarted.paused is False
+        with Session() as db:
+            latest = Repository(db).latest_scalping_kill_switch_event()
+            assert latest is not None
+            assert latest.event_type == "scalping_kill_switch_resume"
+    finally:
+        engine.dispose()

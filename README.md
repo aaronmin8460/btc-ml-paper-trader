@@ -139,7 +139,7 @@ Discord alerts are optional. The app runs with no Discord environment variables 
 
 1. In Discord, create a webhook for the channel that should receive bot alerts.
 2. Copy the webhook URL.
-3. Store it only in your local `.env` or Railway environment variables.
+3. Store it only in your local `.env` or deployment platform secret manager.
 4. Never commit the webhook URL.
 
 Alerts are sent as rich Discord embeds for signals, paper orders, risk guards, runtime errors, model validation, and the `/alerts/discord/test` endpoint. The legacy plain text sender remains available internally for compatibility. Mention parsing is disabled in webhook payloads so bot alerts cannot ping users or roles.
@@ -170,224 +170,122 @@ If Discord is disabled, the endpoint returns:
 {"sent":false,"reason":"discord_disabled"}
 ```
 
-## Railway deployment
+## Docker deployment
 
-This FastAPI server is deployable on Railway with the included `railway.toml`.
+The container entrypoint runs `python scripts/run_api.py`. It binds FastAPI to `0.0.0.0` and reads the generic `PORT` environment variable, defaulting to `8000`.
 
-Railway should use Nixpacks and start the app with:
+Build and run the image locally:
 
 ```bash
-python scripts/run_api.py
+docker build -t btc-ml-paper-trader .
+docker run --rm --env-file .env -p 8000:8000 btc-ml-paper-trader
 ```
 
-The server binds to `0.0.0.0` and reads Railway's `PORT` environment variable. In production, set `APP_ENV=production` so reload stays disabled.
+For persistent SQLite data, logs, and models, use Docker Compose:
 
-Recommended Railway steps:
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
 
-1. Create a new Railway project from this GitHub repository.
-2. Add the environment variables from the sections below.
-3. Attach a Railway Volume if using SQLite persistence.
-4. Deploy with exactly one replica.
-5. Verify `/health`.
-6. Test Discord alerts.
-7. Run `/run-once` manually before enabling automatic paper trading.
+The included `docker-compose.yml` mounts local directories under `./runtime/` into `/app/data`, `/app/logs`, and `/app/models`. These are ordinary mounted volumes, not provider-specific paths.
 
-## Railway environment variables
+## AWS deployment overview
 
-Use Railway's Variables UI. Values below are examples or placeholders; do not paste real keys into the README or commit them to git.
+The simplest AWS setup is a single EC2 instance with Docker Compose. Install Docker, clone this repository, create a private `.env`, and run:
 
-Minimum safe deployment:
+```bash
+docker compose up -d --build
+```
+
+Use one running scheduler instance. Multiple containers with `AUTO_TRADE_ENABLED=true` can duplicate scans and paper orders.
+
+For a managed container deployment, publish the Docker image to Amazon ECR and run one ECS/Fargate task. Store secrets in AWS Secrets Manager or SSM Parameter Store, send container stdout/stderr to CloudWatch Logs, and configure the task or load balancer health check to call `/health`.
+
+For longer-running production-like paper trading, prefer PostgreSQL on Amazon RDS over container-local SQLite. Local development can keep:
+
+```env
+DATABASE_URL=sqlite:///./data/trading.db
+```
+
+A PostgreSQL/RDS deployment can use:
+
+```env
+DATABASE_URL=postgresql+psycopg://replace-with-user:replace-with-password@replace-with-host:5432/replace-with-database
+```
+
+SQLite is also suitable for a single Docker host when `/app/data` is backed by a mounted volume. Logs should go to stdout/stderr for container aggregation; `LOG_DIR` remains available for JSONL application logs.
+
+## Deployment environment
+
+Minimum safe container or AWS configuration:
 
 ```env
 APP_ENV=production
+PORT=8000
+DATABASE_URL=sqlite:///./data/trading.db
+MODEL_DIR=./models
+LOG_DIR=./logs
 PAPER_TRADING_ONLY=true
 TRADING_ENABLED=false
 AUTO_TRADE_ENABLED=false
 SCALPING_MODE_ENABLED=false
 SYMBOL=BTC/USD
 API_ADMIN_TOKEN=replace-with-a-long-random-secret
+ALPACA_API_KEY=replace-with-your-alpaca-paper-key
+ALPACA_SECRET_KEY=replace-with-your-alpaca-paper-secret
 ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
 ```
 
-Add Alpaca paper credentials only as Railway variables:
-
-```env
-ALPACA_API_KEY=replace-with-your-alpaca-paper-key
-ALPACA_SECRET_KEY=replace-with-your-alpaca-paper-secret
-```
-
-Optional Discord variables:
-
-```env
-DISCORD_WEBHOOK_URL=replace-with-your-discord-webhook-url
-DISCORD_ALERTS_ENABLED=true
-DISCORD_ALERT_ON_HOLD=false
-DISCORD_ALERT_ON_SIGNAL=true
-DISCORD_ALERT_ON_ORDER=true
-DISCORD_ALERT_ON_ERROR=true
-DISCORD_ALERT_ON_MODEL=false
-DISCORD_RISK_ALERT_COOLDOWN_SECONDS=300
-```
-
-Conservative BTC/USD paper scalping profile:
-
-```env
-TRADING_ENABLED=true
-AUTO_TRADE_ENABLED=true
-SCALPING_MODE_ENABLED=true
-TIMEFRAME=1Min
-LOOKBACK_BARS=1500
-SCAN_INTERVAL_SECONDS=5
-ALPACA_MAX_CALLS_PER_MINUTE=180
-ALPACA_API_BUDGET_TARGET_PER_MINUTE=170
-ALPACA_API_BUDGET_HARD_STOP_PER_MINUTE=195
-MARKET_BARS_CACHE_SECONDS=30
-POSITION_CACHE_SECONDS=2
-ACCOUNT_EQUITY_CACHE_SECONDS=5
-ORDER_TYPE=limit
-TIME_IN_FORCE=ioc
-ORDER_NOTIONAL_USD=25
-MAX_SPREAD_BPS=6
-MAX_SLIPPAGE_BPS=8
-MIN_QUOTE_IMBALANCE=0.00
-SCALPING_BUY_PROBABILITY_FLOOR=0.57
-SCALPING_CONFIDENCE_GAP_REQUIRED=0.06
-MIN_SECONDS_BETWEEN_TRADES=15
-MAX_TRADES_PER_HOUR=30
-MAX_DAILY_TRADES=150
-MAX_ORDER_ATTEMPTS_PER_HOUR=30
-MAX_ORDER_ATTEMPTS_PER_DAY=100
-IOC_CANCEL_LOOKBACK_SECONDS=300
-MAX_RECENT_IOC_CANCELS=3
-IOC_CANCEL_COOLDOWN_SECONDS=120
-IOC_CANCEL_ESCALATION_COOLDOWN_SECONDS=600
-MIN_HOLD_SECONDS_BEFORE_WEAK_QUOTE_EXIT=30
-PROFIT_ONLY_EXIT_ENABLED=true
-MIN_NET_EXIT_PROFIT_PCT=0.002
-EXIT_PROFIT_BUFFER_BPS=5
-ALLOW_EMERGENCY_STOP_LOSS=true
-EMERGENCY_STOP_LOSS_PCT=0.006
-TRAILING_STOP_ARM_PROFIT_PCT=0.002
-MODEL_SELL_REQUIRES_PROFIT=true
-WEAK_QUOTE_SELL_REQUIRES_PROFIT=true
-MAX_HOLDING_SELL_REQUIRES_PROFIT=true
-DISCORD_ALERT_ON_SIGNAL=false
-DISCORD_ALERT_ON_ORDER=true
-DISCORD_ALERT_ON_ERROR=true
-DISCORD_RISK_ALERT_COOLDOWN_SECONDS=300
-CIRCUIT_BREAKER_ENABLED=true
-MAX_SAME_RISK_BLOCKS_BEFORE_PAUSE=20
-MAX_RUNTIME_ERRORS_BEFORE_PAUSE=10
-CIRCUIT_BREAKER_WINDOW_SECONDS=900
-ALLOW_FALLBACK_TRADING=false
-PAPER_FEE_BPS=0
-PAPER_SLIPPAGE_BPS=0
-SCALPING_TAKE_PROFIT_PCT=0.0015
-SCALPING_STOP_LOSS_PCT=0.001
-SCALPING_TRAILING_STOP_PCT=0.0008
-SCALPING_MAX_POSITION_SECONDS=90
-```
-
-This profile is still paper trading and is not guaranteed profitable. It keeps scalping enabled, requires stronger entries, caps filled-trade frequency and order-attempt frequency separately, cools down after IOC cancels, blocks non-emergency loss exits with the profit guard, throttles duplicate Discord risk alerts, and pauses automatic trading if the same kill-switch risk block or runtime errors repeat too often.
-
-## Railway Volume setup for SQLite persistence
-
-Local development can use SQLite at the default path:
-
-```env
-DATABASE_URL=sqlite:///./data/trading.db
-```
-
-For Railway SQLite persistence:
-
-1. Add a Railway Volume to the service.
-2. Mount it at `/data`.
-3. Set these Railway variables:
-
-```env
-DATABASE_URL=sqlite:////data/trading.db
-MODEL_DIR=/data/models
-LOG_DIR=/data/logs
-```
-
-PostgreSQL can be used later for production analytics, but it is not required for the paper-trading deployment:
-
-```env
-DATABASE_URL=postgresql+psycopg://replace-with-user:replace-with-password@replace-with-host:5432/replace-with-database
-```
+Add Discord settings only when alerts are needed. Keep Alpaca credentials, the admin token, and the Discord webhook in private environment variables or a secret manager.
 
 ## Safe first deployment
 
-Deploy first with trading and automatic scheduling disabled:
+Start every deployment with trading and automatic scheduling disabled:
 
 ```env
+PAPER_TRADING_ONLY=true
 TRADING_ENABLED=false
 AUTO_TRADE_ENABLED=false
+SCALPING_MODE_ENABLED=false
 ```
 
-This lets you verify health, config masking, Discord alerts, and one manual `/run-once` without submitting paper orders.
-
-## Testing deployed server
-
-Set your Railway URL and admin token in your shell:
+Set the deployed API URL and admin token in your shell:
 
 ```bash
-export API_URL="https://replace-with-your-railway-domain"
+export API_URL="https://replace-with-your-api-domain"
 export ADMIN_TOKEN="replace-with-your-api-admin-token"
 ```
 
-Health check:
+Verify the public health endpoint:
 
 ```bash
 curl -sS "$API_URL/health"
 ```
 
-Safe config check. This must not expose Alpaca keys, the admin token, or the Discord webhook URL:
+Verify that protected config output masks Alpaca keys, the admin token, and the Discord webhook:
 
 ```bash
-curl -sS "$API_URL/config/safe"
-```
-
-Discord test alert:
-
-```bash
-curl -sS -X POST "$API_URL/alerts/discord/test" \
+curl -sS "$API_URL/config/safe" \
   -H "X-Admin-Token: $ADMIN_TOKEN"
 ```
 
-Manual run-once test:
+Run one manual BTC/USD decision:
 
 ```bash
 curl -sS -X POST "$API_URL/run-once" \
   -H "X-Admin-Token: $ADMIN_TOKEN"
 ```
 
-Expected safety signals:
-
-- `/health` returns `status: ok`, `paper_trading_only: true`, and `symbol: BTC/USD`.
-- `/config/safe` masks secrets with `***`.
-- `/alerts/discord/test` returns either `{"sent":true}` or `{"sent":false,"reason":"discord_disabled"}`.
-- `/run-once` returns a BTC/USD decision. With `TRADING_ENABLED=false`, `order` should be `null`.
-
-## Enabling automatic paper trading
-
-After the safe first deployment succeeds, enable paper trading and the in-process scheduler:
+With `TRADING_ENABLED=false`, `/run-once` returns a BTC/USD decision with no submitted paper order. After validating health, masked config, logs, and optional Discord alerts, enable paper auto-trading deliberately:
 
 ```env
 TRADING_ENABLED=true
 AUTO_TRADE_ENABLED=true
 ```
 
-Keep these safety variables unchanged:
-
-```env
-PAPER_TRADING_ONLY=true
-SYMBOL=BTC/USD
-ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
-```
-
-Redeploy after changing Railway variables. The scheduler runs every `SCAN_INTERVAL_SECONDS` and calls `Trader.run_once()`.
+Keep `PAPER_TRADING_ONLY=true`, `SYMBOL=BTC/USD`, and the Alpaca paper API URL unchanged. The scheduler runs every `SCAN_INTERVAL_SECONDS` and calls `Trader.run_once()`.
 
 ## Runtime circuit breaker
 
@@ -417,7 +315,7 @@ curl -sS -X POST "$API_URL/admin/resume" \
 
 ## Important safety warnings
 
-- Use one Railway replica only. The app has an in-process scheduler, and multiple replicas can duplicate scans.
+- Run one scheduler-enabled container only. Multiple instances can duplicate scans and paper orders.
 - Keep `API_ADMIN_TOKEN` secret.
 - Never commit Alpaca keys.
 - Never commit the Discord webhook URL.

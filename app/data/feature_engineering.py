@@ -61,6 +61,7 @@ def compute_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
 
 def add_features(df: pd.DataFrame, quote: dict | None = None) -> pd.DataFrame:
     data = df.copy().sort_values("timestamp").reset_index(drop=True)
+    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
     close = data["close"]
     log_close = np.log(close)
     log_ret = log_close.diff()
@@ -73,13 +74,28 @@ def add_features(df: pd.DataFrame, quote: dict | None = None) -> pd.DataFrame:
     data["rolling_mean_return_10"] = log_ret.rolling(10).mean()
     ema_fast = close.ewm(span=12, adjust=False).mean()
     ema_slow = close.ewm(span=26, adjust=False).mean()
+    ema_20 = close.ewm(span=20, adjust=False).mean()
+    ema_50 = close.ewm(span=50, adjust=False).mean()
     data["ema_fast_distance"] = (close - ema_fast) / close
     data["ema_slow_distance"] = (close - ema_slow) / close
+    data["ema_20"] = ema_20
+    data["ema_50"] = ema_50
+    data["ema_20_distance"] = (close - ema_20) / close
+    data["ema_50_distance"] = (close - ema_50) / close
     sma_20 = close.rolling(20).mean()
     sma_50 = close.rolling(50).mean()
     data["sma_20_distance"] = (close - sma_20) / close
     data["sma_50_distance"] = (close - sma_50) / close
     data["rsi_14"] = compute_rsi(close)
+    typical_price = (data["high"] + data["low"] + close) / 3
+    utc_date = data["timestamp"].dt.date
+    cumulative_typical_volume = (typical_price * data["volume"]).groupby(utc_date).cumsum()
+    cumulative_volume = data["volume"].groupby(utc_date).cumsum()
+    data["vwap"] = cumulative_typical_volume / cumulative_volume.replace(0, np.nan)
+    data["vwap_distance"] = (close - data["vwap"]) / close
+    data["prev_high"] = data["high"].shift(1)
+    data["prev_close"] = close.shift(1)
+    data["prev_rsi_14"] = data["rsi_14"].shift(1)
     data["macd"] = (ema_fast - ema_slow) / close
     macd_signal = (ema_fast - ema_slow).ewm(span=9, adjust=False).mean()
     data["macd_hist"] = ((ema_fast - ema_slow) - macd_signal) / close
@@ -121,8 +137,80 @@ def add_features(df: pd.DataFrame, quote: dict | None = None) -> pd.DataFrame:
     return data.replace([np.inf, -np.inf], np.nan)
 
 
+def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    data = df.copy()
+    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
+    return (
+        data.sort_values("timestamp")
+        .set_index("timestamp")
+        .resample(timeframe)
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        .dropna()
+        .reset_index()
+    )
+
+
 def latest_feature_row(df: pd.DataFrame, quote: dict | None = None) -> pd.DataFrame:
     features = add_features(df, quote=quote).dropna(subset=BAR_FEATURE_COLUMNS)
     if features.empty:
         raise ValueError("Not enough bars to compute features.")
     return features.tail(1)
+
+
+def latest_rule_scalping_feature_row(df: pd.DataFrame, quote: dict | None = None) -> pd.DataFrame:
+    features_1m = add_features(df, quote=quote)
+    features_5m = add_features(resample_ohlcv(df, "5min"))
+    features_15m = add_features(resample_ohlcv(df, "15min"))
+
+    required_1m_columns = [
+        "rsi_14",
+        "normalized_volume",
+        "ema_20",
+        "ema_50",
+        "ema_20_distance",
+        "ema_50_distance",
+        "vwap",
+        "vwap_distance",
+        "prev_high",
+        "prev_close",
+        "prev_rsi_14",
+    ]
+    required_5m_columns = ["close", "ema_20", "vwap", "log_return_3"]
+    required_15m_columns = ["close", "ema_20", "ema_50", "log_return_3"]
+
+    latest_1m = features_1m.tail(1)
+    latest_5m = features_5m.tail(1)
+    latest_15m = features_15m.tail(1)
+    if (
+        latest_1m.empty
+        or latest_5m.empty
+        or latest_15m.empty
+        or latest_1m[required_1m_columns].isna().any(axis=None)
+        or latest_5m[required_5m_columns].isna().any(axis=None)
+        or latest_15m[required_15m_columns].isna().any(axis=None)
+    ):
+        raise ValueError("Not enough bars to compute rule scalping features for 1m, 5m, and 15m timeframes.")
+
+    row = latest_1m.copy()
+    feature_5m = latest_5m.iloc[-1]
+    feature_15m = latest_15m.iloc[-1]
+    trend_5m_close_above_ema20 = bool(feature_5m["close"] > feature_5m["ema_20"])
+    trend_5m_close_above_vwap = bool(feature_5m["close"] > feature_5m["vwap"])
+    trend_15m_close_above_ema20 = bool(feature_15m["close"] > feature_15m["ema_20"])
+    trend_15m_ema20_above_ema50 = bool(feature_15m["ema_20"] > feature_15m["ema_50"])
+
+    row["trend_5m_close_above_ema20"] = trend_5m_close_above_ema20
+    row["trend_5m_close_above_vwap"] = trend_5m_close_above_vwap
+    row["trend_15m_close_above_ema20"] = trend_15m_close_above_ema20
+    row["trend_15m_ema20_above_ema50"] = trend_15m_ema20_above_ema50
+    row["trend_5m_up"] = trend_5m_close_above_ema20 and trend_5m_close_above_vwap and feature_5m["log_return_3"] >= 0
+    row["trend_15m_up"] = trend_15m_close_above_ema20 and trend_15m_ema20_above_ema50 and feature_15m["log_return_3"] >= 0
+    return row

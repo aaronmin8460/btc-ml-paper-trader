@@ -48,9 +48,9 @@ def triple_barrier_labels(
 def net_profit_scalping_labels(
     df: pd.DataFrame,
     *,
-    horizon_bars: int = 12,
-    take_profit_pct: float = 0.0015,
-    stop_loss_pct: float = 0.001,
+    horizon_bars: int = 3,
+    take_profit_pct: float = 0.0012,
+    stop_loss_pct: float = 0.0008,
     trailing_stop_pct: float = 0.0008,
     trailing_stop_arm_profit_pct: float = 0.002,
     fee_bps_per_side: float = 0.0,
@@ -59,6 +59,9 @@ def net_profit_scalping_labels(
     min_net_exit_profit_pct: float = 0.0,
     exit_profit_buffer_bps: float = 0.0,
 ) -> pd.DataFrame:
+    if horizon_bars <= 0:
+        raise ValueError("horizon_bars must be positive")
+
     out = df.copy().reset_index(drop=True)
     labels: list[int | float] = []
     sell_labels: list[int | float] = []
@@ -159,7 +162,9 @@ def _required_net_scalping_exit_return(
     min_net_exit_profit_pct: float,
     exit_profit_buffer_bps: float,
 ) -> float:
-    row_spread = _positive_float(row.get("orderbook_spread"))
+    row_spread = _positive_float(row.get("scalping_spread_pct"))
+    if row_spread is None:
+        row_spread = _positive_float(row.get("orderbook_spread"))
     spread = row_spread if row_spread is not None else max(0.0, float(spread_cost_pct))
     return (
         2 * max(0.0, float(fee_bps_per_side)) / 10_000

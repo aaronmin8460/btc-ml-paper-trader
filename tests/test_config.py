@@ -29,6 +29,7 @@ def test_discord_settings_are_disabled_by_default(monkeypatch):
     assert settings.discord_alert_on_order is True
     assert settings.discord_alert_on_error is True
     assert settings.discord_alert_on_model is False
+    assert settings.discord_alert_cooldown_seconds == 60
     assert settings.discord_risk_alert_cooldown_seconds == 300
     assert settings.circuit_breaker_enabled is True
     assert settings.max_same_risk_blocks_before_pause == 20
@@ -41,6 +42,7 @@ def test_scalping_settings_load_conservative_defaults():
 
     assert settings.trading_enabled is False
     assert settings.auto_trade_enabled is False
+    assert settings.strategy_mode == "rule_scalping"
     assert settings.order_type == "limit"
     assert settings.time_in_force == "ioc"
     assert settings.limit_price_offset_bps == 2
@@ -49,19 +51,27 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.ioc_cancel_cooldown_seconds == 120
     assert settings.ioc_cancel_escalation_cooldown_seconds == 600
     assert settings.scalping_mode_enabled is False
-    assert settings.max_spread_bps == 10
+    assert settings.max_spread_bps == 5
     assert settings.max_slippage_bps == 8
-    assert settings.min_quote_imbalance == -0.05
-    assert settings.max_trades_per_hour == 1000
-    assert settings.max_daily_trades == 10000
+    assert settings.min_quote_imbalance == 0.0
+    assert settings.max_trades_per_hour == 5
+    assert settings.max_trades_per_10_minutes == 10
+    assert settings.max_daily_trades == 20
     assert settings.max_order_attempts_per_hour == 30
+    assert settings.max_order_attempts_per_10_minutes == 20
     assert settings.max_order_attempts_per_day == 100
-    assert settings.max_consecutive_losses == 3
-    assert settings.min_seconds_between_trades == 0
+    assert settings.max_consecutive_losses == 2
+    assert settings.max_loss_usd_per_hour == 5
+    assert settings.max_consecutive_ioc_cancels == 5
+    assert settings.min_seconds_between_trades == 180
+    assert settings.scalping_kill_switch_enabled is True
+    assert settings.scalping_pause_after_loss_streak_seconds == 900
+    assert settings.scalping_pause_after_runtime_errors_seconds == 900
     assert settings.taker_fee_bps == 25
     assert settings.maker_fee_bps == 15
     assert settings.slippage_bps == 10
     assert settings.backtest_use_taker_fees is True
+    assert settings.paper_execution_mode == "alpaca_paper"
     assert settings.paper_fee_bps == 0
     assert settings.paper_slippage_bps == 0
     assert settings.alpaca_rate_limit_enabled is True
@@ -73,16 +83,35 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.account_equity_cache_seconds == 5
     assert settings.quote_cache_seconds == 0
     assert settings.scalping_entry_dip_pct == 0.0005
-    assert settings.scalping_take_profit_pct == 0.0015
-    assert settings.scalping_stop_loss_pct == 0.001
-    assert settings.scalping_trailing_stop_pct == 0.0008
+    assert settings.scalping_take_profit_pct == 0.006
+    assert settings.scalping_stop_loss_pct == 0.003
+    assert settings.scalping_trailing_stop_pct == 0.002
+    assert settings.scalping_label_horizon_bars == 3
+    assert settings.scalping_label_take_profit_pct == 0.0012
+    assert settings.scalping_label_stop_loss_pct == 0.0008
+    assert settings.scalping_label_min_net_profit_pct == 0.0002
     assert settings.scalping_min_momentum_pct == -0.0005
-    assert settings.scalping_max_position_seconds == 90
+    assert settings.scalping_max_position_seconds == 900
+    assert settings.scalping_max_data_age_seconds == 120
+    assert settings.scalping_min_hold_seconds == 0
     assert settings.scalping_buy_probability_floor == 0.50
     assert settings.scalping_confidence_gap_required == 0.04
+    assert settings.scalping_sell_probability_floor == 0.55
+    assert settings.scalping_exit_confidence_gap_required == 0.04
     assert settings.scalping_sell_on_weak_quote is True
     assert settings.scalping_quote_imbalance_exit == -0.10
+    assert settings.scalping_profit_guard_enabled is False
     assert settings.min_hold_seconds_before_weak_quote_exit == 30
+    assert settings.rule_rsi_min == 40
+    assert settings.rule_rsi_max == 60
+    assert settings.rule_min_normalized_volume == 1.1
+    assert settings.rule_ema_touch_tolerance_pct == 0.0015
+    assert settings.rule_vwap_touch_tolerance_pct == 0.0015
+    assert settings.rule_max_vwap_distance_pct == 0.01
+    assert settings.rule_require_vwap_above is True
+    assert settings.rule_min_score_to_buy == 10
+    assert settings.rule_trend_5m_required is True
+    assert settings.rule_trend_15m_required is True
     assert settings.profit_only_exit_enabled is True
     assert settings.min_net_exit_profit_pct == 0.002
     assert settings.exit_profit_buffer_bps == 5
@@ -110,7 +139,20 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.max_backtest_drawdown_pct == 0.01
     assert settings.min_backtest_profit_factor == 1.2
     assert settings.min_backtest_trades == 30
+    assert settings.max_backtest_ambiguous_candle_ratio == 0.10
     assert settings.model_promotion_require_positive_net_return is True
+
+
+def test_rule_scalping_strategy_mode_is_accepted():
+    settings = Settings(_env_file=None, strategy_mode="rule_scalping")
+
+    assert settings.strategy_mode == "rule_scalping"
+
+
+@pytest.mark.parametrize("strategy_mode", ["ml", "hybrid", "invalid"])
+def test_invalid_strategy_modes_are_rejected(strategy_mode):
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, strategy_mode=strategy_mode)
 
 
 def test_conservative_paper_scalping_profile_values_load():
@@ -247,10 +289,25 @@ def test_config_still_rejects_unsafe_symbol_and_non_paper_mode():
         Settings(_env_file=None, paper_slippage_bps=-1)
 
     with pytest.raises(ValueError):
+        Settings(_env_file=None, paper_execution_mode="live")
+
+    with pytest.raises(ValueError):
         Settings(_env_file=None, alpaca_max_calls_per_minute=0)
 
     with pytest.raises(ValueError):
         Settings(_env_file=None, circuit_breaker_window_seconds=-1)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, max_loss_usd_per_hour=-1)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, scalping_label_horizon_bars=0)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, scalping_label_horizon_bars=4)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, max_backtest_ambiguous_candle_ratio=1.01)
 
 
 def test_safe_dict_masks_discord_webhook_url():

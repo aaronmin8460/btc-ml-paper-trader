@@ -32,7 +32,12 @@ class FakeMarketData:
 
 class FakePredictor:
     def predict(self, bars, quote=None):
-        return {"symbol": "BTC/USD", "buy_probability": 0.75, "sell_probability": 0.15}
+        return {
+            "symbol": "BTC/USD",
+            "buy_probability": 0.75,
+            "sell_probability": 0.15,
+            "sell_probability_source": "independent_sell_model",
+        }
 
 
 class FakeDecisionEngine:
@@ -69,6 +74,8 @@ class FakeBroker:
 
     async def submit_market_order(self, **kwargs):
         self.events.append("submit_order")
+        if isinstance(self.order_response, Exception):
+            raise self.order_response
         return self.order_response
 
     async def submit_order(self, **kwargs):
@@ -239,6 +246,8 @@ async def test_signal_alert_called_for_buy_sell(trader_factory, action):
 
     assert notifier.calls[0][0] == "signal"
     assert notifier.calls[0][1] == ("BTC/USD", action, "test_signal", 0.75, 0.15)
+    signal_events = [payload for event_type, payload in trader.logger.events if event_type == "signal"]
+    assert signal_events[0]["sell_probability_source"] == "independent_sell_model"
 
 
 @pytest.mark.anyio
@@ -316,6 +325,69 @@ async def test_filled_order_updates_trade_accounting(trader_factory, monkeypatch
     assert len(calls) == 1
     assert calls[0][1] is stored_order
     assert calls[0][2] is settings
+
+
+@pytest.mark.anyio
+async def test_partially_filled_order_updates_trade_accounting(trader_factory, monkeypatch):
+    settings = Settings(_env_file=None, trading_enabled=True, discord_alert_on_order=False)
+    decision = Decision("BTC/USD", "buy", "ml_and_rules_approved", notional=25)
+    stored_order = object()
+    calls = []
+
+    monkeypatch.setattr(
+        "app.services.trader.record_filled_order_trade",
+        lambda repo, order, settings: calls.append((repo, order, settings)),
+    )
+    trader = trader_factory(settings=settings, decision=decision, stored_order=stored_order)
+    trader.broker.order_response = {
+        "id": "paper-order-1",
+        "status": "partially_filled",
+        "filled_qty": "0.0005",
+        "filled_avg_price": "65000",
+    }
+
+    await trader.run_once()
+
+    assert len(calls) == 1
+    assert calls[0][1] is stored_order
+
+
+def test_trader_surfaces_ioc_cancel_streak_kill_switch_reason():
+    class FakeKillSwitchRepository:
+        def realized_pnl_last_hour(self):
+            return 0
+
+        def consecutive_ioc_canceled_count(self):
+            return 5
+
+    trader = Trader(
+        Settings(
+            _env_file=None,
+            scalping_mode_enabled=True,
+            max_consecutive_ioc_cancels=5,
+        )
+    )
+
+    assert trader._scalping_kill_switch_reason(FakeKillSwitchRepository()) == "scalping_kill_switch:ioc_cancel_streak"
+
+
+def test_trader_surfaces_hourly_loss_kill_switch_reason():
+    class FakeKillSwitchRepository:
+        def realized_pnl_last_hour(self):
+            return -5
+
+        def consecutive_ioc_canceled_count(self):
+            return 0
+
+    trader = Trader(
+        Settings(
+            _env_file=None,
+            scalping_mode_enabled=True,
+            max_loss_usd_per_hour=5,
+        )
+    )
+
+    assert trader._scalping_kill_switch_reason(FakeKillSwitchRepository()) == "scalping_kill_switch:hourly_loss_limit"
 
 
 @pytest.mark.anyio
@@ -516,9 +588,124 @@ async def test_discord_failure_does_not_interrupt_trading(trader_factory):
     assert [event[0] for event in trader.logger.events] == [
         "signal",
         "discord_alert_failed",
+        "order",
         "discord_alert_failed",
     ]
     assert "discord.example" not in str(trader.logger.events)
+
+
+@pytest.mark.anyio
+async def test_structured_signal_log_contains_required_observability_fields(trader_factory):
+    trader = trader_factory(
+        settings=Settings(_env_file=None),
+        decision=Decision("BTC/USD", "hold", "dashboard_test"),
+    )
+
+    await trader.run_once()
+
+    signal = next(payload for event_type, payload in trader.logger.events if event_type == "signal")
+    assert {
+        "symbol",
+        "action",
+        "reason",
+        "timestamp",
+        "latest_bar_timestamp",
+        "bar_age_seconds",
+        "quote_age_seconds",
+        "buy_probability",
+        "sell_probability",
+        "prediction_source",
+        "model_version",
+        "spread_bps",
+        "quote_imbalance",
+        "momentum",
+        "volatility",
+        "position_qty",
+        "avg_entry_price",
+        "unrealized_pnl_pct",
+        "risk_block_reason",
+        "api_budget_status",
+    }.issubset(signal)
+
+
+@pytest.mark.anyio
+async def test_structured_order_log_contains_required_execution_fields(trader_factory):
+    trader = trader_factory(
+        settings=Settings(_env_file=None, trading_enabled=True),
+        decision=Decision("BTC/USD", "buy", "ml_and_rules_approved", notional=25),
+    )
+
+    await trader.run_once()
+
+    order = next(payload for event_type, payload in trader.logger.events if event_type == "order")
+    assert {
+        "order_id",
+        "local_order_id",
+        "side",
+        "order_type",
+        "time_in_force",
+        "requested_notional",
+        "requested_qty",
+        "limit_price",
+        "filled_qty",
+        "filled_avg_price",
+        "fee_amount",
+        "slippage_amount",
+        "status",
+        "cancel_reason",
+    }.issubset(order)
+
+
+@pytest.mark.anyio
+async def test_structured_risk_block_log_contains_limit_value_and_reset_fields(trader_factory):
+    trader = trader_factory(
+        settings=Settings(_env_file=None),
+        decision=Decision("BTC/USD", "hold", "max_trades_per_hour_reached"),
+    )
+
+    await trader.run_once()
+
+    risk_block = next(payload for event_type, payload in trader.logger.events if event_type == "risk_block")
+    assert risk_block["reason"] == "max_trades_per_hour_reached"
+    assert {"relevant_limit", "current_value", "reset_time"}.issubset(risk_block)
+
+
+@pytest.mark.anyio
+async def test_canceled_ioc_order_log_has_clear_cancel_reason(trader_factory):
+    trader = trader_factory(
+        settings=Settings(_env_file=None, trading_enabled=True),
+        decision=Decision("BTC/USD", "buy", "ml_and_rules_approved", notional=25),
+    )
+    trader.broker.order_response = {
+        "id": "paper-order-1",
+        "status": "canceled",
+        "order_type": "limit",
+        "time_in_force": "ioc",
+    }
+
+    await trader.run_once()
+
+    order = next(payload for event_type, payload in trader.logger.events if event_type == "order")
+    assert order["cancel_reason"] == "ioc_no_fill"
+
+
+@pytest.mark.anyio
+async def test_failed_order_attempt_is_logged_before_runtime_error(trader_factory):
+    trader = trader_factory(
+        settings=Settings(_env_file=None, trading_enabled=True),
+        decision=Decision("BTC/USD", "buy", "ml_and_rules_approved", notional=25),
+    )
+    trader.broker.order_response = RuntimeError("submit failed")
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        await trader.run_once()
+
+    event_types = [event_type for event_type, _ in trader.logger.events]
+    assert "order" in event_types
+    assert "runtime_error" in event_types
+    order = next(payload for event_type, payload in trader.logger.events if event_type == "order")
+    assert order["status"] == "failed"
+    assert order["cancel_reason"] == "RuntimeError"
 
 
 @pytest.mark.anyio

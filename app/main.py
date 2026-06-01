@@ -97,6 +97,7 @@ configure_frontend_static(app)
 @app.on_event("startup")
 async def startup() -> None:
     init_db()
+    scheduler.restore_pause_state()
     if settings.auto_trade_enabled:
         scheduler.start()
     if settings.auto_train_enabled:

@@ -62,6 +62,9 @@ def validate_order_request(
     if side == "sell" and qty is not None and qty <= 0:
         get_logger().event("rejected_order", symbol=symbol, side=side, reason="invalid_qty", context=context)
         raise ValueError("Sell quantity must be positive.")
+    if side == "sell" and qty is not None and qty > current_position_qty:
+        get_logger().event("rejected_order", symbol=symbol, side=side, reason="sell_exceeds_position", context=context)
+        raise LongOnlyViolation("Sell quantity cannot exceed the current BTC position.")
     if order_type == "limit" and (limit_price is None or not math.isfinite(limit_price) or limit_price <= 0):
         get_logger().event("rejected_order", symbol=symbol, side=side, reason="invalid_limit_price", context=context)
         raise ValueError("Limit orders require a valid positive limit price.")

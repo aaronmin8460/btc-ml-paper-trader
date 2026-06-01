@@ -42,6 +42,67 @@ def test_buy_blocked_after_hourly_trade_limit():
     assert reason == "max_trades_per_hour_reached"
 
 
+def test_scalping_buy_blocked_after_ten_minute_trade_limit():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, max_trades_per_10_minutes=2)
+    risk = RiskManager(settings)
+
+    approved, reason = risk.approve_buy(
+        notional=25,
+        position=PositionState(),
+        latest_price=65000,
+        trade_frequency=TradeFrequencyState(trades_last_10_minutes=2),
+    )
+
+    assert approved is False
+    assert reason == "max_trades_per_10_minutes_reached"
+
+
+def test_scalping_buy_blocked_after_ten_minute_order_attempt_limit():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, max_order_attempts_per_10_minutes=2)
+    risk = RiskManager(settings)
+
+    approved, reason = risk.approve_buy(
+        notional=25,
+        position=PositionState(),
+        latest_price=65000,
+        order_attempt_frequency=TradeFrequencyState(trades_last_10_minutes=2),
+    )
+
+    assert approved is False
+    assert reason == "max_order_attempts_per_10_minutes_reached"
+
+
+def test_scalping_buy_blocked_after_hourly_realized_loss_limit():
+    settings = Settings(_env_file=None, scalping_mode_enabled=True, max_loss_usd_per_hour=5)
+    risk = RiskManager(settings)
+
+    approved, reason = risk.approve_buy(
+        notional=25,
+        position=PositionState(),
+        latest_price=65000,
+        trade_frequency=TradeFrequencyState(realized_pnl_last_hour=-5),
+    )
+
+    assert approved is False
+    assert reason == "scalping_kill_switch:hourly_loss_limit"
+
+
+def test_non_scalping_buy_ignores_scalping_short_window_limits():
+    settings = Settings(_env_file=None, scalping_mode_enabled=False)
+    risk = RiskManager(settings)
+
+    approved, reason = risk.approve_buy(
+        notional=25,
+        position=PositionState(),
+        latest_price=65000,
+        trade_frequency=TradeFrequencyState(trades_last_10_minutes=100, realized_pnl_last_hour=-100),
+        order_attempt_frequency=TradeFrequencyState(trades_last_10_minutes=100),
+    )
+
+    assert approved is True
+    assert reason == "approved"
+
+
 def test_kill_switch_block_logs_risk_block(monkeypatch):
     logger = FakeLogger()
     monkeypatch.setattr(risk_manager, "get_logger", lambda: logger)

@@ -72,6 +72,7 @@ class ModelRegistry:
         thresholds: dict,
         training_start: str,
         training_end: str,
+        supports_independent_sell_probability: bool = False,
     ) -> dict[str, Any]:
         registry = {
             "active_model_path": model_path,
@@ -82,6 +83,7 @@ class ModelRegistry:
             "metrics": metrics,
             "thresholds": thresholds,
             "model_version": Path(model_path).stem,
+            "supports_independent_sell_probability": supports_independent_sell_probability,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(registry, indent=2), encoding="utf-8")
@@ -126,6 +128,7 @@ class ModelRegistry:
         model_version = str(metadata_version or registry_version or path_version)
         snapshot_metrics = metadata_metrics if isinstance(metadata_metrics, dict) else registry_metrics
         net_return, profit_factor_net, number_of_trades = _metric_snapshot(snapshot_metrics)
+        ambiguous_candle_ratio = _ambiguous_candle_ratio(snapshot_metrics)
 
         if registry_version is not None and str(registry_version) != path_version:
             return ActiveModelStatus(
@@ -289,6 +292,32 @@ class ModelRegistry:
                 model_version,
                 True,
             ), model
+        if ambiguous_candle_ratio is None:
+            return ActiveModelStatus(
+                active_path_str,
+                "rejected",
+                False,
+                "ambiguous_candle_ratio_unavailable",
+                promotion_reason,
+                net_return,
+                profit_factor_net,
+                number_of_trades,
+                model_version,
+                True,
+            ), model
+        if ambiguous_candle_ratio > self.settings.max_backtest_ambiguous_candle_ratio:
+            return ActiveModelStatus(
+                active_path_str,
+                "rejected",
+                False,
+                "ambiguous_candle_ratio_too_high",
+                promotion_reason,
+                net_return,
+                profit_factor_net,
+                number_of_trades,
+                model_version,
+                True,
+            ), model
 
         return ActiveModelStatus(
             active_path_str,
@@ -320,6 +349,12 @@ def _metric_snapshot(metrics: Any) -> tuple[float | None, float | None, int | No
         _metric_float(metrics.get("profit_factor_net"), allow_infinite=True),
         _metric_int(metrics.get("number_of_trades")),
     )
+
+
+def _ambiguous_candle_ratio(metrics: Any) -> float | None:
+    if not isinstance(metrics, dict):
+        return None
+    return _metric_float(metrics.get("ambiguous_candle_ratio", 0.0))
 
 
 def _metric_float(value: object, *, allow_infinite: bool = False) -> float | None:

@@ -27,9 +27,11 @@ class PositionState:
 
 @dataclass
 class TradeFrequencyState:
+    trades_last_10_minutes: int = 0
     trades_last_hour: int = 0
     trades_today: int = 0
     consecutive_losses: int = 0
+    realized_pnl_last_hour: float = 0.0
     last_trade_at: datetime | None = None
 
 
@@ -255,6 +257,11 @@ class RiskManager:
         return reference
 
     def _approve_order_attempt_frequency(self, state: TradeFrequencyState) -> tuple[bool, str]:
+        if (
+            self._scalping_kill_switch_enabled()
+            and state.trades_last_10_minutes >= self.settings.max_order_attempts_per_10_minutes
+        ):
+            return False, "max_order_attempts_per_10_minutes_reached"
         if state.trades_last_hour >= self.settings.max_order_attempts_per_hour:
             return False, "max_order_attempts_per_hour_reached"
         if state.trades_today >= self.settings.max_order_attempts_per_day:
@@ -262,6 +269,13 @@ class RiskManager:
         return True, "approved"
 
     def _approve_trade_frequency(self, state: TradeFrequencyState, *, now: datetime) -> tuple[bool, str]:
+        if self._scalping_kill_switch_enabled() and state.trades_last_10_minutes >= self.settings.max_trades_per_10_minutes:
+            return False, "max_trades_per_10_minutes_reached"
+        if (
+            self._scalping_kill_switch_enabled()
+            and state.realized_pnl_last_hour <= -abs(self.settings.max_loss_usd_per_hour)
+        ):
+            return False, "scalping_kill_switch:hourly_loss_limit"
         if state.trades_last_hour >= self.settings.max_trades_per_hour:
             return False, "max_trades_per_hour_reached"
         if state.trades_today >= self.settings.max_daily_trades:
@@ -276,6 +290,9 @@ class RiskManager:
             if elapsed < timedelta(seconds=self.settings.min_seconds_between_trades):
                 return False, "trade_cooldown_active"
         return True, "approved"
+
+    def _scalping_kill_switch_enabled(self) -> bool:
+        return self.settings.scalping_mode_enabled and self.settings.scalping_kill_switch_enabled
 
     def _block(self, reason: str) -> tuple[bool, str]:
         self.logger.event("risk_block", symbol=ALLOWED_SYMBOL, reason=reason)

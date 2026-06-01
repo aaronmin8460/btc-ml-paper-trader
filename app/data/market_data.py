@@ -309,6 +309,10 @@ class MarketDataClient:
         cached = self._bars_cache.get((symbol, timeframe, desired_limit))
         return self._cache_age_seconds(cached[0]) if cached else None
 
+    def quote_cache_age_seconds(self, *, symbol: str = ALLOWED_SYMBOL) -> float | None:
+        cached = self._quote_cache.get(symbol)
+        return self._cache_age_seconds(cached[0]) if cached else None
+
     def _get_quote_cache(self, symbol: str, *, force_refresh: bool) -> dict[str, Any] | None:
         cached = self._quote_cache.get(symbol)
         age = self._cache_age_seconds(cached[0]) if cached else None

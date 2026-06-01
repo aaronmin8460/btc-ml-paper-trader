@@ -18,13 +18,26 @@ class Repository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def add_signal(self, action: str, buy_probability: float, sell_probability: float, reason: str) -> Signal:
+    def add_signal(
+        self,
+        action: str,
+        buy_probability: float,
+        sell_probability: float,
+        reason: str,
+        *,
+        spread_bps: float | None = None,
+        quote_imbalance: float | None = None,
+        model_version: str | None = None,
+    ) -> Signal:
         signal = Signal(
             symbol=ALLOWED_SYMBOL,
             action=action,
             buy_probability=buy_probability,
             sell_probability=sell_probability,
             reason=reason,
+            spread_bps=_safe_float(spread_bps),
+            quote_imbalance=_safe_float(quote_imbalance),
+            model_version=str(model_version) if model_version else None,
         )
         self.db.add(signal)
         self.db.commit()
@@ -55,13 +68,38 @@ class Repository:
         self.db.refresh(order)
         return order
 
-    def add_trade(self, *, side: str, qty: float, price: float, pnl: float = 0.0) -> Trade:
+    def add_trade(
+        self,
+        *,
+        side: str,
+        qty: float,
+        price: float,
+        pnl: float = 0.0,
+        entry_price: float | None = None,
+        exit_price: float | None = None,
+        notional: float | None = None,
+        gross_pnl: float | None = None,
+        net_pnl: float | None = None,
+        fee_amount: float | None = None,
+        slippage_amount: float | None = None,
+        hold_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> Trade:
         trade = Trade(
             symbol=ALLOWED_SYMBOL,
             side=side,
             qty=qty,
             price=price,
             pnl=pnl,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            notional=notional,
+            gross_pnl=gross_pnl,
+            net_pnl=net_pnl,
+            fee_amount=fee_amount,
+            slippage_amount=slippage_amount,
+            hold_seconds=hold_seconds,
+            reason=reason,
         )
         self.db.add(trade)
         self.db.commit()
@@ -76,6 +114,15 @@ class Repository:
         price: float,
         pnl: float,
         created_at: datetime | None = None,
+        entry_price: float | None = None,
+        exit_price: float | None = None,
+        notional: float | None = None,
+        gross_pnl: float | None = None,
+        net_pnl: float | None = None,
+        fee_amount: float | None = None,
+        slippage_amount: float | None = None,
+        hold_seconds: float | None = None,
+        reason: str | None = None,
     ) -> Trade:
         trade = Trade(
             symbol=ALLOWED_SYMBOL,
@@ -84,6 +131,15 @@ class Repository:
             price=price,
             pnl=pnl,
             created_at=created_at or utc_now(),
+            entry_price=entry_price,
+            exit_price=exit_price,
+            notional=notional,
+            gross_pnl=gross_pnl,
+            net_pnl=net_pnl,
+            fee_amount=fee_amount,
+            slippage_amount=slippage_amount,
+            hold_seconds=hold_seconds,
+            reason=reason,
         )
         self.db.add(trade)
         self.db.commit()
@@ -294,8 +350,50 @@ class Repository:
             .all()
         )
 
+    def add_risk_event(
+        self,
+        *,
+        event_type: str,
+        reason: str,
+        created_at: datetime | None = None,
+    ) -> RiskEvent:
+        event = RiskEvent(
+            symbol=ALLOWED_SYMBOL,
+            event_type=event_type,
+            reason=reason,
+            created_at=created_at or utc_now(),
+        )
+        self.db.add(event)
+        self.db.commit()
+        self.db.refresh(event)
+        return event
+
+    def latest_scalping_kill_switch_event(self) -> RiskEvent | None:
+        return (
+            self.db.query(RiskEvent)
+            .filter(
+                RiskEvent.symbol == ALLOWED_SYMBOL,
+                RiskEvent.event_type.in_({"scalping_kill_switch_pause", "scalping_kill_switch_resume"}),
+            )
+            .order_by(desc(RiskEvent.created_at), desc(RiskEvent.id))
+            .first()
+        )
+
     def recent_model_runs(self, limit: int = 100) -> list[ModelRun]:
         return self.db.query(ModelRun).order_by(desc(ModelRun.created_at)).limit(limit).all()
+
+    def realized_trade_summary_since(self, since: datetime) -> dict[str, float | int | None]:
+        trades = (
+            self.db.query(Trade)
+            .filter(Trade.symbol == ALLOWED_SYMBOL, func.lower(Trade.side) == "sell", Trade.created_at >= since)
+            .all()
+        )
+        net_pnls = [float(trade.net_pnl if trade.net_pnl is not None else trade.pnl) for trade in trades]
+        return {
+            "realized_pnl": float(sum(net_pnls)),
+            "total_trades": len(trades),
+            "win_rate": (sum(1 for pnl in net_pnls if pnl > 0) / len(net_pnls)) if net_pnls else None,
+        }
 
     def trade_frequency_state(self, now: datetime | None = None) -> TradeFrequencyState:
         """Compatibility alias for filled-order trade frequency limits."""
@@ -307,8 +405,10 @@ class Repository:
         if current_time.tzinfo is None:
             current_time = current_time.replace(tzinfo=UTC)
         hour_start = current_time - timedelta(hours=1)
+        ten_minutes_start = current_time - timedelta(minutes=10)
         day_start = current_time.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
+        attempts_last_10_minutes = self.order_attempt_count_since(ten_minutes_start)
         attempts_last_hour = len(self.recent_order_attempts_since(hour_start))
         attempts_today = len(self.recent_order_attempts_since(day_start))
         last_order = self.latest_order()
@@ -318,19 +418,22 @@ class Repository:
             last_order_at = last_order_at.replace(tzinfo=UTC)
 
         return TradeFrequencyState(
+            trades_last_10_minutes=attempts_last_10_minutes,
             trades_last_hour=attempts_last_hour,
             trades_today=attempts_today,
             last_trade_at=last_order_at,
         )
 
     def filled_trade_frequency_state(self, now: datetime | None = None) -> TradeFrequencyState:
-        """Counts only BTC/USD orders whose status is filled."""
+        """Counts BTC/USD orders with at least one fill."""
         current_time = now or utc_now()
         if current_time.tzinfo is None:
             current_time = current_time.replace(tzinfo=UTC)
         hour_start = current_time - timedelta(hours=1)
+        ten_minutes_start = current_time - timedelta(minutes=10)
         day_start = current_time.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
+        filled_last_10_minutes = self.filled_trade_count_since(ten_minutes_start)
         filled_last_hour = len(self.recent_filled_orders_since(hour_start))
         filled_today = len(self.recent_filled_orders_since(day_start))
         last_filled_order = (
@@ -345,11 +448,62 @@ class Repository:
             last_filled_at = last_filled_at.replace(tzinfo=UTC)
 
         return TradeFrequencyState(
+            trades_last_10_minutes=filled_last_10_minutes,
             trades_last_hour=filled_last_hour,
             trades_today=filled_today,
             consecutive_losses=self._consecutive_losses(),
+            realized_pnl_last_hour=self.realized_pnl_since(hour_start),
             last_trade_at=last_filled_at,
         )
+
+    def order_attempt_count_last_10_minutes(self, now: datetime | None = None) -> int:
+        return self.order_attempt_count_since(_ensure_utc(now or utc_now()) - timedelta(minutes=10))
+
+    def filled_trade_count_last_10_minutes(self, now: datetime | None = None) -> int:
+        return self.filled_trade_count_since(_ensure_utc(now or utc_now()) - timedelta(minutes=10))
+
+    def realized_pnl_last_hour(self, now: datetime | None = None) -> float:
+        return self.realized_pnl_since(_ensure_utc(now or utc_now()) - timedelta(hours=1))
+
+    def order_attempt_count_since(self, since: datetime) -> int:
+        return int(
+            self.db.query(func.count(Order.id))
+            .filter(Order.symbol == ALLOWED_SYMBOL, Order.created_at >= since)
+            .scalar()
+            or 0
+        )
+
+    def filled_trade_count_since(self, since: datetime) -> int:
+        return int(
+            self.db.query(func.count(Order.id))
+            .filter(Order.symbol == ALLOWED_SYMBOL, Order.created_at >= since, _filled_order_filter())
+            .scalar()
+            or 0
+        )
+
+    def realized_pnl_since(self, since: datetime) -> float:
+        return float(
+            self.db.query(func.sum(Trade.pnl))
+            .filter(Trade.symbol == ALLOWED_SYMBOL, func.lower(Trade.side) == "sell", Trade.created_at >= since)
+            .scalar()
+            or 0.0
+        )
+
+    def consecutive_ioc_canceled_count(self, *, limit: int = 1000) -> int:
+        orders = (
+            self.db.query(Order)
+            .filter(Order.symbol == ALLOWED_SYMBOL)
+            .order_by(desc(Order.created_at), desc(Order.id))
+            .limit(max(1, limit))
+            .all()
+        )
+        consecutive = 0
+        for order in orders:
+            if str(order.status or "").lower() == "canceled" and _is_limit_ioc_order(order.raw_response):
+                consecutive += 1
+                continue
+            break
+        return consecutive
 
     def recent_order_attempts_since(self, since: datetime) -> list[Order]:
         return (
@@ -426,4 +580,10 @@ def _is_limit_ioc_order(raw_response: str | None) -> bool:
 
 
 def _filled_order_filter():
-    return func.lower(Order.status) == "filled"
+    return func.lower(Order.status).in_({"filled", "partially_filled"})
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

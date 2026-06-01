@@ -1,5 +1,6 @@
 import json
 import math
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -23,8 +24,10 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 SECRET_KEY_PARTS = ("secret", "token", "key", "webhook", "authorization", "password")
 RISK_BLOCK_REASONS = {
     "max_order_attempts_per_hour_reached",
+    "max_order_attempts_per_10_minutes_reached",
     "max_order_attempts_per_day_reached",
     "max_trades_per_hour_reached",
+    "max_trades_per_10_minutes_reached",
     "max_daily_trades_reached",
     "max_consecutive_losses_reached",
     "trade_cooldown_active",
@@ -47,6 +50,15 @@ RISK_BLOCK_REASONS = {
     "model_unavailable",
     "profit_guard_holding_until_profitable",
     "profit_guard_holding_at_loss",
+    "stale_market_data",
+    "spread_too_wide",
+    "spread_unavailable",
+    "quote_imbalance_unavailable",
+    "quote_imbalance_too_weak",
+    "scalping_kill_switch:hourly_loss_limit",
+    "scalping_kill_switch:ioc_cancel_streak",
+    "scalping_kill_switch:loss_streak",
+    "scalping_kill_switch:runtime_errors",
 }
 
 
@@ -56,6 +68,7 @@ async def dashboard_summary(request: Request) -> dict:
     trader = _trader_from_request(request)
     scheduler = getattr(request.app.state, "scheduler", None)
     training_status = _training_scheduler_status(getattr(request.app.state, "training_scheduler", None), settings)
+    pause_status = _scheduler_pause_status(scheduler)
     market = MarketDataClient(settings)
     broker = getattr(trader, "broker", AlpacaClient(settings))
 
@@ -68,6 +81,7 @@ async def dashboard_summary(request: Request) -> dict:
         order_summary = repo.order_summary()
         latest_model_run = repo.recent_model_runs(1)
         ioc_cancel_summary = _ioc_cancel_summary(settings, repo)
+        today_trade_summary = repo.realized_trade_summary_since(_utc_day_start())
 
     position = await _current_position(trader)
     account_summary = await _account_summary(broker)
@@ -84,11 +98,20 @@ async def dashboard_summary(request: Request) -> dict:
         "paper_trading_only": settings.paper_trading_only,
         "trading_enabled": settings.trading_enabled,
         "auto_trade_enabled": settings.auto_trade_enabled,
+        "scalping_mode_enabled": settings.scalping_mode_enabled,
         **training_status,
         "scheduler_running": getattr(scheduler, "running", None),
+        "scheduler_paused": bool(pause_status.get("paused")),
+        "pause_reason": pause_status.get("pause_reason"),
+        "scheduler_pause_reason": pause_status.get("pause_reason"),
+        "scheduler_paused_at": pause_status.get("paused_at"),
         "latest_btc_price": market_summary.get("latest_close"),
         "latest_signal": _serialize_signal(latest_signal) if latest_signal else None,
         "current_position": _serialize_position(position),
+        "current_unrealized_pnl": trade_metrics.get("unrealized_pnl"),
+        "realized_pnl_today": today_trade_summary["realized_pnl"],
+        "total_trades_today": today_trade_summary["total_trades"],
+        "win_rate_today": today_trade_summary["win_rate"],
         **profit_guard,
         "alpaca_account": account_summary,
         "alpaca_calls_last_minute": api_budget.get("calls_last_minute"),
@@ -111,6 +134,7 @@ async def dashboard_summary(request: Request) -> dict:
         **order_summary,
         "total_trades": len(trades),
         **trade_metrics,
+        "latest_order": _serialize_order(latest_order) if latest_order else None,
         "last_order": _serialize_order(latest_order) if latest_order else None,
         "last_trade": _serialize_trade(latest_trade) if latest_trade else None,
         "ioc_cancel_guard": ioc_cancel_summary,
@@ -118,6 +142,8 @@ async def dashboard_summary(request: Request) -> dict:
             "latest_timestamp": market_summary.get("latest_timestamp"),
             "current_utc_time": market_summary.get("current_utc_time"),
             "latest_bar_age_seconds": market_summary.get("latest_bar_age_seconds"),
+            "quote_timestamp": market_summary.get("quote_timestamp"),
+            "quote_age_seconds": market_summary.get("quote_age_seconds"),
             "cache_age_seconds": market_summary.get("cache_age_seconds"),
         },
     }
@@ -131,17 +157,79 @@ async def dashboard_signals(limit: int = Query(default=100, ge=1)) -> list[dict]
 
 
 @router.get("/orders")
-async def dashboard_orders(limit: int = Query(default=100, ge=1)) -> list[dict]:
+async def dashboard_orders(limit: int = Query(default=50, ge=1)) -> list[dict]:
     with SessionLocal() as db:
         rows = Repository(db).recent_orders(_cap_limit(limit))
         return [_serialize_order(row) for row in rows]
 
 
 @router.get("/trades")
-async def dashboard_trades(limit: int = Query(default=100, ge=1)) -> list[dict]:
+async def dashboard_trades(limit: int = Query(default=50, ge=1)) -> list[dict]:
     with SessionLocal() as db:
         rows = Repository(db).recent_trades(_cap_limit(limit))
         return [_serialize_trade(row) for row in rows]
+
+
+@router.get("/risk")
+async def dashboard_risk(request: Request) -> dict:
+    settings = _settings_from_request(request)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    pause_status = _scheduler_pause_status(scheduler)
+    now = datetime.now(UTC)
+    with SessionLocal() as db:
+        repo = Repository(db)
+        recent_signals = repo.recent_signals(500)
+        recent_risk_events = repo.recent_risk_events(100)
+        trade_frequency = repo.filled_trade_frequency_state(now=now)
+        order_attempt_frequency = repo.order_attempt_frequency_state(now=now)
+        daily_trade_summary = repo.realized_trade_summary_since(_utc_day_start(now))
+        hourly_realized_pnl = repo.realized_pnl_last_hour(now=now)
+        latest_kill_switch_event = repo.latest_scalping_kill_switch_event()
+        ioc_cancel_summary = _ioc_cancel_summary(settings, repo)
+    return {
+        "symbol": settings.symbol,
+        "active_risk_blocks": _active_risk_blocks(
+            recent_signals,
+            paused=bool(pause_status.get("paused")),
+            pause_reason=pause_status.get("pause_reason"),
+            paused_at=pause_status.get("paused_at"),
+        ),
+        "recent_risk_block_counts": _recent_risk_block_counts(recent_signals, now=now),
+        "trade_frequency_state": _frequency_state_payload(
+            trade_frequency,
+            ten_minute_limit=settings.max_trades_per_10_minutes,
+            hourly_limit=settings.max_trades_per_hour,
+            daily_limit=settings.max_daily_trades,
+        ),
+        "order_attempt_frequency_state": _frequency_state_payload(
+            order_attempt_frequency,
+            ten_minute_limit=settings.max_order_attempts_per_10_minutes,
+            hourly_limit=settings.max_order_attempts_per_hour,
+            daily_limit=settings.max_order_attempts_per_day,
+        ),
+        "daily_loss_state": _loss_state(
+            realized_pnl=daily_trade_summary["realized_pnl"],
+            limit_usd=settings.max_daily_loss_usd,
+        ),
+        "hourly_loss_state": _loss_state(
+            realized_pnl=hourly_realized_pnl,
+            limit_usd=settings.max_loss_usd_per_hour,
+        ),
+        "kill_switch_state": {
+            "enabled": settings.scalping_mode_enabled and settings.scalping_kill_switch_enabled,
+            "paused": bool(pause_status.get("paused")),
+            "pause_reason": pause_status.get("pause_reason"),
+            "paused_at": pause_status.get("paused_at"),
+            "latest_persisted_event": _serialize_risk_event(latest_kill_switch_event),
+        },
+        "ioc_cancel_guard": ioc_cancel_summary,
+        "recent_risk_events": [_serialize_risk_event(event) for event in recent_risk_events],
+    }
+
+
+@router.get("/model")
+async def dashboard_model(request: Request) -> dict:
+    return _dashboard_model_payload(_settings_from_request(request))
 
 
 @router.get("/equity-curve")
@@ -269,13 +357,16 @@ async def _market_snapshot(settings: Settings, market: MarketDataClient) -> dict
     except Exception:
         quote = None
 
+    quote_cache_age_seconds = None
+    if hasattr(market, "quote_cache_age_seconds"):
+        quote_cache_age_seconds = market.quote_cache_age_seconds(symbol=settings.symbol)
     latest_bar = _latest_bar_snapshot(bars)
     return {
         "symbol": settings.symbol,
         "timeframe": settings.timeframe,
         **latest_bar,
         "current_utc_time": iso_utc_now(),
-        **_quote_snapshot(quote),
+        **_quote_snapshot(quote, cache_age_seconds=quote_cache_age_seconds),
         "cache_age_seconds": _safe_float(cache_age_seconds),
         "bars_count": len(bars),
     }
@@ -517,37 +608,85 @@ def _max_drawdown(pnl_values: list[float]) -> float:
 
 
 def _serialize_signal(signal: Signal) -> dict:
+    timestamp = _serialize_timestamp(signal.created_at)
     return {
-        "created_at": _serialize_timestamp(signal.created_at),
+        "timestamp": timestamp,
+        "created_at": timestamp,
         "symbol": signal.symbol,
         "action": signal.action,
         "buy_probability": _safe_float(signal.buy_probability),
         "sell_probability": _safe_float(signal.sell_probability),
         "reason": signal.reason,
+        "spread_bps": _safe_float(signal.spread_bps),
+        "quote_imbalance": _safe_float(signal.quote_imbalance),
+        "model_version": signal.model_version,
     }
 
 
 def _serialize_order(order: Order) -> dict:
+    raw_response = _parse_order_raw_response(order.raw_response)
+    raw = raw_response if isinstance(raw_response, dict) else {}
+    timestamp = _serialize_timestamp(order.created_at)
     return {
-        "created_at": _serialize_timestamp(order.created_at),
+        "local_order_id": order.id,
+        "order_id": order.broker_order_id,
+        "timestamp": timestamp,
+        "created_at": timestamp,
         "symbol": order.symbol,
         "side": order.side,
         "status": order.status,
         "notional": _safe_float(order.notional),
         "qty": _safe_float(order.qty),
         "broker_order_id": order.broker_order_id,
-        "raw_response": _parse_order_raw_response(order.raw_response),
+        "order_type": raw.get("order_type") or raw.get("type"),
+        "time_in_force": raw.get("time_in_force"),
+        "limit_price": _safe_float(raw.get("limit_price")),
+        "filled_qty": _safe_float(raw.get("filled_qty")),
+        "filled_avg_price": _safe_float(raw.get("filled_avg_price")),
+        "fee_amount": _safe_float(raw.get("fee_amount")),
+        "slippage_amount": _safe_float(raw.get("slippage_amount")),
+        "cancel_reason": _order_cancel_reason(order.status, raw),
+        "raw_response": raw_response,
     }
 
 
 def _serialize_trade(trade: Trade) -> dict:
+    timestamp = _serialize_timestamp(trade.created_at)
+    qty = _safe_float(trade.qty)
+    price = _safe_float(trade.price)
+    entry_price = _safe_float(trade.entry_price)
+    exit_price = _safe_float(trade.exit_price)
+    if entry_price is None and str(trade.side).lower() == "buy":
+        entry_price = price
+    if exit_price is None and str(trade.side).lower() == "sell":
+        exit_price = price
     return {
-        "created_at": _serialize_timestamp(trade.created_at),
+        "timestamp": timestamp,
+        "created_at": timestamp,
         "symbol": trade.symbol,
         "side": trade.side,
-        "qty": _safe_float(trade.qty),
-        "price": _safe_float(trade.price),
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "qty": qty,
+        "notional": _safe_float(trade.notional) or _multiply(qty, exit_price or entry_price),
+        "gross_pnl": _safe_float(trade.gross_pnl),
+        "net_pnl": _safe_float(trade.net_pnl if trade.net_pnl is not None else trade.pnl),
+        "fee_amount": _safe_float(trade.fee_amount),
+        "slippage_amount": _safe_float(trade.slippage_amount),
+        "hold_seconds": _safe_float(trade.hold_seconds),
+        "reason": trade.reason,
+        "price": price,
         "pnl": _safe_float(trade.pnl),
+    }
+
+
+def _serialize_risk_event(event: Any | None) -> dict | None:
+    if event is None:
+        return None
+    return {
+        "timestamp": _serialize_timestamp(getattr(event, "created_at", None)),
+        "event_type": getattr(event, "event_type", None),
+        "reason": getattr(event, "reason", None),
     }
 
 
@@ -587,6 +726,17 @@ def _parse_order_raw_response(raw_response: str | None) -> Any:
     return _redact_secrets(parsed)
 
 
+def _order_cancel_reason(status: str, raw_response: dict[str, Any]) -> str | None:
+    explicit = raw_response.get("cancel_reason") or raw_response.get("reason")
+    if explicit:
+        return str(explicit)
+    if str(status or "").lower() not in {"canceled", "cancelled"}:
+        return None
+    order_type = str(raw_response.get("order_type") or raw_response.get("type") or "").lower()
+    time_in_force = str(raw_response.get("time_in_force") or "").lower()
+    return "ioc_no_fill" if order_type == "limit" and time_in_force == "ioc" else "broker_canceled"
+
+
 def _latest_model_summary(model_run: Any | None) -> dict:
     if model_run is None:
         return {
@@ -606,6 +756,112 @@ def _latest_model_summary(model_run: Any | None) -> dict:
         "latest_model_profit_factor": _safe_float(metrics.get("profit_factor_net")),
         "latest_model_accepted": status == "accepted" if status is not None else None,
         "latest_model_rejected_reason": None if status == "accepted" else metrics.get("promotion_reason") or metrics.get("reason"),
+    }
+
+
+def _dashboard_model_payload(settings: Settings) -> dict:
+    registry = ModelRegistry(settings)
+    registry_data = _sanitize_mapping(registry.read())
+    active_model = registry.validate_active_model()
+    metrics = registry_data.get("metrics") if isinstance(registry_data.get("metrics"), dict) else {}
+    feature_columns = registry_data.get("feature_columns")
+    return {
+        "active_model_path": active_model.active_model_path,
+        "active_model_status": active_model.status,
+        "model_version": active_model.model_version or registry_data.get("model_version"),
+        "trained_at": registry_data.get("created_at") or registry_data.get("training_end"),
+        "feature_columns": list(feature_columns) if isinstance(feature_columns, list) else [],
+        "validation_metrics": metrics,
+        "promotion_reason": active_model.promotion_reason or metrics.get("promotion_reason") or metrics.get("reason"),
+        "active_model_valid": active_model.valid,
+        "active_model_invalid_reason": active_model.invalid_reason,
+        "supports_independent_sell_probability": bool(
+            registry_data.get("supports_independent_sell_probability")
+        ),
+    }
+
+
+def _active_risk_blocks(
+    signals: list[Signal],
+    *,
+    paused: bool,
+    pause_reason: str | None,
+    paused_at: str | None,
+) -> list[dict]:
+    blocks: list[dict] = []
+    if paused and pause_reason:
+        blocks.append(
+            {
+                "reason": pause_reason,
+                "source": "scheduler_pause",
+                "timestamp": paused_at,
+            }
+        )
+    if signals:
+        latest = signals[0]
+        if latest.action == "hold" and latest.reason in RISK_BLOCK_REASONS:
+            blocks.append(
+                {
+                    "reason": latest.reason,
+                    "source": "latest_signal",
+                    "timestamp": _serialize_timestamp(latest.created_at),
+                }
+            )
+    return blocks
+
+
+def _recent_risk_block_counts(signals: list[Signal], *, now: datetime) -> dict:
+    window_seconds = 3600
+    cutoff = _ensure_datetime_utc(now) - timedelta(seconds=window_seconds)
+    counts = Counter(
+        signal.reason
+        for signal in signals
+        if signal.action == "hold"
+        and signal.reason in RISK_BLOCK_REASONS
+        and (_ensure_datetime_utc(signal.created_at) or cutoff) >= cutoff
+    )
+    return {
+        "window_seconds": window_seconds,
+        "total": sum(counts.values()),
+        "by_reason": dict(sorted(counts.items())),
+    }
+
+
+def _frequency_state_payload(
+    state: Any,
+    *,
+    ten_minute_limit: int,
+    hourly_limit: int,
+    daily_limit: int,
+) -> dict:
+    last_10_minutes = int(getattr(state, "trades_last_10_minutes", 0) or 0)
+    last_hour = int(getattr(state, "trades_last_hour", 0) or 0)
+    today = int(getattr(state, "trades_today", 0) or 0)
+    return {
+        "last_10_minutes": last_10_minutes,
+        "last_hour": last_hour,
+        "today": today,
+        "last_event_at": _serialize_timestamp(getattr(state, "last_trade_at", None)),
+        "limits": {
+            "last_10_minutes": ten_minute_limit,
+            "last_hour": hourly_limit,
+            "today": daily_limit,
+        },
+        "blocked": (
+            last_10_minutes >= ten_minute_limit
+            or last_hour >= hourly_limit
+            or today >= daily_limit
+        ),
+    }
+
+
+def _loss_state(*, realized_pnl: float | int | None, limit_usd: float) -> dict:
+    pnl = _safe_float(realized_pnl) or 0.0
+    limit = abs(float(limit_usd))
+    return {
+        "realized_pnl": pnl,
+        "loss_limit_usd": limit,
+        "blocked": pnl <= -limit,
     }
 
 
@@ -713,6 +969,12 @@ def _safe_percentage(numerator: int | float | None, denominator: int | float | N
     return numerator_value / denominator_value
 
 
+def _multiply(left: float | None, right: float | None) -> float | None:
+    if left is None or right is None:
+        return None
+    return left * right
+
+
 def _quote_float(quote: dict[str, Any] | None, *keys: str) -> float | None:
     if not quote:
         return None
@@ -734,7 +996,7 @@ def _latest_bar_snapshot(bars: pd.DataFrame) -> dict:
     }
 
 
-def _quote_snapshot(quote: dict[str, Any] | None) -> dict:
+def _quote_snapshot(quote: dict[str, Any] | None, *, cache_age_seconds: float | None = None) -> dict:
     bid = _quote_float(quote, "bid_price", "bp", "bid")
     ask = _quote_float(quote, "ask_price", "ap", "ask")
     bid_size = _quote_float(quote, "bid_size", "bs")
@@ -746,6 +1008,7 @@ def _quote_snapshot(quote: dict[str, Any] | None) -> dict:
         if bid_size is not None and ask_size is not None and (bid_size + ask_size) != 0
         else None
     )
+    quote_timestamp = _quote_timestamp(quote)
     return {
         "latest_quote": _sanitize_mapping(quote or {}),
         "bid_price": bid,
@@ -753,7 +1016,19 @@ def _quote_snapshot(quote: dict[str, Any] | None) -> dict:
         "mid_price": mid_price,
         "spread_bps": _safe_float(spread_bps),
         "quote_imbalance": _safe_float(quote_imbalance),
+        "quote_timestamp": quote_timestamp,
+        "quote_age_seconds": _safe_float(_bar_age_seconds(quote_timestamp)) if quote_timestamp else _safe_float(cache_age_seconds),
     }
+
+
+def _quote_timestamp(quote: dict[str, Any] | None) -> str | None:
+    if not quote:
+        return None
+    for key in ("timestamp", "t", "quote_timestamp"):
+        timestamp = _serialize_timestamp(quote.get(key))
+        if timestamp is not None:
+            return timestamp
+    return None
 
 
 def _closed_trade_pnls(trades: list[Trade]) -> list[float]:
@@ -773,6 +1048,11 @@ def _bar_age_seconds(value: Any) -> float | None:
         return None
     timestamp = datetime.fromisoformat(timestamp_iso)
     return max(0.0, (datetime.now(UTC) - timestamp).total_seconds())
+
+
+def _utc_day_start(value: datetime | None = None) -> datetime:
+    current = _ensure_datetime_utc(value or datetime.now(UTC)) or datetime.now(UTC)
+    return current.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _cap_limit(limit: int) -> int:

@@ -417,7 +417,7 @@ def test_api_hard_budget_blocks_buy_but_not_sell():
         position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
         trading_enabled=True,
         api_budget=exhausted_budget,
-        quote={"bid_price": 65200, "ask_price": 65210},
+        quote={"bid_price": 65400, "ask_price": 65410},
     )
 
     assert buy.action == "hold"
@@ -442,7 +442,7 @@ def test_account_drawdown_blocks_buy_but_not_sell():
         position=PositionState(qty=0.01, avg_entry_price=65000, highest_price=65000),
         trading_enabled=True,
         account_state=AccountState(available=True, equity=96_000, buying_power=1_000, drawdown_pct=0.04),
-        quote={"bid_price": 65200, "ask_price": 65210},
+        quote={"bid_price": 65400, "ask_price": 65410},
     )
 
     assert buy.action == "hold"
@@ -798,6 +798,21 @@ def test_model_sell_is_blocked_at_loss():
 
     assert decision.action == "hold"
     assert decision.reason == "profit_guard_holding_until_profitable"
+
+
+def test_decision_engine_complements_buy_probability_when_sell_probability_is_missing():
+    settings = Settings(_env_file=None, scalping_mode_enabled=False)
+    engine = DecisionEngine(settings)
+
+    decision = engine.decide(
+        prediction={"symbol": "BTC/USD", "buy_probability": 0.2},
+        feature_row=_feature_row(),
+        position=PositionState(),
+        trading_enabled=True,
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "buy_probability_below_threshold"
 
 
 def test_emergency_stop_loss_is_allowed_only_when_enabled():

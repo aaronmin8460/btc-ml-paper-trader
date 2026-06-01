@@ -28,6 +28,9 @@ class Signal(Base):
     buy_probability: Mapped[float] = mapped_column(Float)
     sell_probability: Mapped[float] = mapped_column(Float)
     reason: Mapped[str] = mapped_column(Text)
+    spread_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quote_imbalance: Mapped[float | None] = mapped_column(Float, nullable=True)
+    model_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class Order(Base):
@@ -74,6 +77,15 @@ class Trade(Base):
     qty: Mapped[float] = mapped_column(Float)
     price: Mapped[float] = mapped_column(Float)
     pnl: Mapped[float] = mapped_column(Float, default=0)
+    entry_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    notional: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gross_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    net_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fee_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    slippage_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hold_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ModelRun(Base):

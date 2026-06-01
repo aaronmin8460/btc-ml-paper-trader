@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from app.backtest.scalping import backtest_assumptions, calculate_fee_aware_metrics, walk_forward_fee_aware_backtest
 from app.config import Settings
@@ -66,6 +67,14 @@ def test_backtest_report_metrics_include_gross_and_net_fields():
         "max_drawdown",
         "fees_paid_estimate",
         "slippage_paid_estimate",
+        "total_fees",
+        "total_slippage",
+        "total_spread_cost",
+        "number_of_canceled_orders",
+        "partial_fill_count",
+        "average_hold_bars",
+        "win_rate_net",
+        "ambiguous_candle_count",
     ]:
         assert key in metrics
     assert metrics["gross_return"] != metrics["net_return"]
@@ -88,4 +97,79 @@ def test_existing_walk_forward_validation_still_works():
 
     assert metrics["rows"] == len(dataset)
     assert "precision" in metrics
+    assert "sell_precision" in metrics
+    assert "sell_class_balance" in metrics
     assert "number_of_trades" in metrics
+
+
+def test_ambiguous_scalping_candle_is_counted_as_stop_loss():
+    trades = pd.DataFrame(
+        {
+            "close": [100.0],
+            "buy_quality_label": [1],
+            "buy_exit_return_pct": [0.01],
+            "buy_exit_reason": ["ambiguous_stop_first"],
+        }
+    )
+
+    metrics = calculate_fee_aware_metrics(
+        trades,
+        _settings(scalping_mode_enabled=True, max_spread_bps=0, scalping_label_stop_loss_pct=0.001),
+    )
+
+    assert metrics["ambiguous_candle_count"] == 1
+    assert metrics["ambiguous_candle_ratio"] == 1.0
+    assert metrics["gross_return_pct"] == pytest.approx(-0.001)
+    assert metrics["win_rate_net"] == 0.0
+
+
+def test_scalping_backtest_uses_configured_spread_when_quote_is_missing():
+    trades = pd.DataFrame({"close": [100.0], "buy_quality_label": [1], "buy_exit_return_pct": [0.01]})
+
+    metrics = calculate_fee_aware_metrics(
+        trades,
+        _settings(scalping_mode_enabled=True, max_spread_bps=10),
+    )
+
+    assert metrics["total_spread_cost"] > 0
+    assert metrics["spread_paid_estimate"] == metrics["total_spread_cost"]
+    assert metrics["net_return_pct"] < metrics["gross_return_pct"]
+
+
+def test_canceled_ioc_entry_is_not_counted_as_a_win():
+    trades = pd.DataFrame(
+        {
+            "close": [100.0],
+            "bid_price": [99.9],
+            "ask_price": [100.1],
+            "entry_limit_price": [100.0],
+            "buy_quality_label": [1],
+            "buy_exit_return_pct": [0.01],
+        }
+    )
+
+    metrics = calculate_fee_aware_metrics(trades, _settings(order_type="limit", time_in_force="ioc"))
+
+    assert metrics["valid"] is False
+    assert metrics["reason"] == "no_filled_trades"
+    assert metrics["number_of_canceled_orders"] == 1
+    assert metrics["number_of_trades"] == 0
+    assert metrics["win_rate_net"] == 0.0
+
+
+def test_backtest_tracks_partial_entry_and_exit_fills():
+    trades = pd.DataFrame(
+        {
+            "close": [100.0],
+            "bid_size": [0.25],
+            "ask_size": [0.5],
+            "buy_quality_label": [1],
+            "buy_exit_return_pct": [0.01],
+        }
+    )
+
+    metrics = calculate_fee_aware_metrics(trades, _settings(order_type="limit", time_in_force="ioc"))
+
+    assert metrics["valid"] is True
+    assert metrics["number_of_trades"] == 1
+    assert metrics["partial_fill_count"] == 2

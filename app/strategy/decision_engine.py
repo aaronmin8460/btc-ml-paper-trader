@@ -51,7 +51,7 @@ class DecisionEngine:
         symbol = prediction.get("symbol", ALLOWED_SYMBOL)
         assert_btc_only(symbol, context="strategy_decision")
         buy_probability = float(prediction["buy_probability"])
-        sell_probability = float(prediction["sell_probability"])
+        sell_probability = _sell_probability(prediction, buy_probability=buy_probability)
         latest_price = float(feature_row["close"])
         market_price = _quote_mid_price(quote) or latest_price
         expected_exit_price = self.risk.estimated_exit_price(quote=quote, latest_price=market_price) or 0.0
@@ -319,6 +319,13 @@ def _quote_float(quote: dict | None, *keys: str) -> float | None:
 def _model_unavailable(prediction: dict, settings: Settings) -> bool:
     source = str(prediction.get("prediction_source") or prediction.get("source") or "").lower()
     return source.startswith("fallback") and not settings.allow_fallback_trading
+
+
+def _sell_probability(prediction: dict, *, buy_probability: float) -> float:
+    try:
+        return float(prediction["sell_probability"])
+    except (KeyError, TypeError, ValueError):
+        return max(0.0, min(1.0, 1.0 - buy_probability))
 
 
 def _timestamp_within_seconds(value: datetime | None, *, now: datetime, seconds: int | float) -> bool:

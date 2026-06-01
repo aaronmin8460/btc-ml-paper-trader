@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     discord_alert_on_order: bool = True
     discord_alert_on_error: bool = True
     discord_alert_on_model: bool = False
+    discord_alert_cooldown_seconds: int = 60
     discord_risk_alert_cooldown_seconds: int = 300
 
     circuit_breaker_enabled: bool = True
@@ -68,28 +69,56 @@ class Settings(BaseSettings):
     max_drawdown_pct: float = 0.05
     max_open_positions: int = 1
 
+    strategy_mode: str = "rule_scalping"
     scalping_mode_enabled: bool = False
-    max_spread_bps: float = 10
+    max_spread_bps: float = 5
     max_slippage_bps: float = 8
-    min_quote_imbalance: float = -0.05
-    max_trades_per_hour: int = 1000
-    max_daily_trades: int = 10000
+    min_quote_imbalance: float = 0.0
+    max_trades_per_hour: int = 5
+    max_trades_per_10_minutes: int = 10
+    max_daily_trades: int = 20
     max_order_attempts_per_hour: int = 30
+    max_order_attempts_per_10_minutes: int = 20
     max_order_attempts_per_day: int = 100
-    max_consecutive_losses: int = 3
-    min_seconds_between_trades: int = 0
+    max_consecutive_losses: int = 2
+    max_loss_usd_per_hour: float = 5
+    max_consecutive_ioc_cancels: int = 5
+    min_seconds_between_trades: int = 180
+    scalping_kill_switch_enabled: bool = True
+    scalping_pause_after_loss_streak_seconds: int = 900
+    scalping_pause_after_runtime_errors_seconds: int = 900
 
     scalping_entry_dip_pct: float = 0.0005
-    scalping_take_profit_pct: float = 0.0015
-    scalping_stop_loss_pct: float = 0.001
-    scalping_trailing_stop_pct: float = 0.0008
+    scalping_take_profit_pct: float = 0.006
+    scalping_stop_loss_pct: float = 0.003
+    scalping_trailing_stop_pct: float = 0.002
+    scalping_label_horizon_bars: int = 3
+    scalping_label_take_profit_pct: float = 0.0012
+    scalping_label_stop_loss_pct: float = 0.0008
+    scalping_label_min_net_profit_pct: float = 0.0002
     scalping_min_momentum_pct: float = -0.0005
-    scalping_max_position_seconds: int = 90
+    scalping_max_position_seconds: int = 900
+    scalping_max_data_age_seconds: int = 120
+    scalping_min_hold_seconds: int = 0
     scalping_buy_probability_floor: float = 0.50
     scalping_confidence_gap_required: float = 0.04
+    scalping_sell_probability_floor: float = 0.55
+    scalping_exit_confidence_gap_required: float = 0.04
     scalping_sell_on_weak_quote: bool = True
     scalping_quote_imbalance_exit: float = -0.10
+    scalping_profit_guard_enabled: bool = False
     min_hold_seconds_before_weak_quote_exit: int = 30
+
+    rule_rsi_min: float = 40
+    rule_rsi_max: float = 60
+    rule_min_normalized_volume: float = 1.1
+    rule_ema_touch_tolerance_pct: float = 0.0015
+    rule_vwap_touch_tolerance_pct: float = 0.0015
+    rule_max_vwap_distance_pct: float = 0.01
+    rule_require_vwap_above: bool = True
+    rule_min_score_to_buy: int = 10
+    rule_trend_5m_required: bool = True
+    rule_trend_15m_required: bool = True
 
     profit_only_exit_enabled: bool = True
     min_net_exit_profit_pct: float = 0.002
@@ -115,6 +144,7 @@ class Settings(BaseSettings):
     maker_fee_bps: float = 15
     slippage_bps: float = 10
     backtest_use_taker_fees: bool = True
+    paper_execution_mode: str = "alpaca_paper"
     paper_fee_bps: float = 0
     paper_slippage_bps: float = 0
 
@@ -146,6 +176,7 @@ class Settings(BaseSettings):
     max_backtest_drawdown_pct: float = 0.01
     min_backtest_profit_factor: float = 1.2
     min_backtest_trades: int = 30
+    max_backtest_ambiguous_candle_ratio: float = 0.10
     model_promotion_require_positive_net_return: bool = True
 
     @field_validator("symbol")
@@ -153,6 +184,13 @@ class Settings(BaseSettings):
     def symbol_must_be_btc_usd(cls, value: str) -> str:
         if value != ALLOWED_SYMBOL:
             raise ValueError("This project is hard-limited to BTC/USD only.")
+        return value
+
+    @field_validator("strategy_mode")
+    @classmethod
+    def strategy_mode_must_be_rule_scalping(cls, value: str) -> str:
+        if value != "rule_scalping":
+            raise ValueError("STRATEGY_MODE must be rule_scalping.")
         return value
 
     @field_validator("order_type")
@@ -169,6 +207,14 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in {"gtc", "ioc"}:
             raise ValueError("TIME_IN_FORCE must be gtc or ioc.")
+        return normalized
+
+    @field_validator("paper_execution_mode")
+    @classmethod
+    def paper_execution_mode_must_be_supported(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"alpaca_paper", "local_simulated"}:
+            raise ValueError("PAPER_EXECUTION_MODE must be alpaca_paper or local_simulated.")
         return normalized
 
     @field_validator("taker_fee_bps", "maker_fee_bps", "slippage_bps", "paper_fee_bps", "paper_slippage_bps")
@@ -193,12 +239,23 @@ class Settings(BaseSettings):
         "ioc_cancel_cooldown_seconds",
         "ioc_cancel_escalation_cooldown_seconds",
         "discord_risk_alert_cooldown_seconds",
+        "discord_alert_cooldown_seconds",
         "max_same_risk_blocks_before_pause",
         "max_runtime_errors_before_pause",
         "circuit_breaker_window_seconds",
         "max_order_attempts_per_hour",
+        "max_trades_per_10_minutes",
+        "max_order_attempts_per_10_minutes",
         "max_order_attempts_per_day",
+        "max_loss_usd_per_hour",
+        "max_consecutive_ioc_cancels",
+        "scalping_pause_after_loss_streak_seconds",
+        "scalping_pause_after_runtime_errors_seconds",
         "scalping_max_position_seconds",
+        "scalping_max_data_age_seconds",
+        "scalping_min_hold_seconds",
+        "scalping_sell_probability_floor",
+        "scalping_exit_confidence_gap_required",
         "min_hold_seconds_before_weak_quote_exit",
         "max_account_daily_loss_usd",
         "max_account_daily_loss_pct",
@@ -207,6 +264,7 @@ class Settings(BaseSettings):
         "max_backtest_drawdown_pct",
         "min_backtest_profit_factor",
         "min_backtest_trades",
+        "max_backtest_ambiguous_candle_ratio",
         "auto_train_interval_seconds",
         "auto_train_startup_delay_seconds",
         "auto_train_min_bars",
@@ -214,11 +272,28 @@ class Settings(BaseSettings):
         "exit_profit_buffer_bps",
         "emergency_stop_loss_pct",
         "trailing_stop_arm_profit_pct",
+        "scalping_label_take_profit_pct",
+        "scalping_label_stop_loss_pct",
+        "scalping_label_min_net_profit_pct",
     )
     @classmethod
     def runtime_timing_values_must_be_non_negative(cls, value: float) -> float:
         if value < 0:
             raise ValueError("Runtime timing and rate limit values must be non-negative.")
+        return value
+
+    @field_validator("max_backtest_ambiguous_candle_ratio")
+    @classmethod
+    def ambiguous_candle_ratio_must_not_exceed_one(cls, value: float) -> float:
+        if value > 1:
+            raise ValueError("MAX_BACKTEST_AMBIGUOUS_CANDLE_RATIO must not exceed 1.")
+        return value
+
+    @field_validator("scalping_label_horizon_bars")
+    @classmethod
+    def scalping_label_horizon_must_be_ultra_short(cls, value: int) -> int:
+        if not 1 <= value <= 3:
+            raise ValueError("SCALPING_LABEL_HORIZON_BARS must be between 1 and 3.")
         return value
 
     @field_validator("alpaca_max_calls_per_minute")

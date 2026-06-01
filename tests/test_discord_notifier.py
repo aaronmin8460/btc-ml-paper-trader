@@ -203,6 +203,7 @@ async def test_error_alert_uses_embed(recording_http, fake_logger):
     assert fields["Where"] == "trader.run_once"
     assert fields["Error Type"] == "RuntimeError"
     assert fields["Error Message"] == "boom"
+    assert fields["Alert Type"] == "runtime_error"
 
 
 @pytest.mark.anyio
@@ -220,6 +221,53 @@ async def test_risk_alert_uses_embed(recording_http, fake_logger):
 
 
 @pytest.mark.anyio
+async def test_repeated_identical_risk_alert_is_throttled(recording_http, fake_logger):
+    notifier = DiscordNotifier(enabled_settings(discord_alert_cooldown_seconds=60))
+
+    await notifier.risk_alert("trade_cooldown_active")
+    await notifier.risk_alert("trade_cooldown_active")
+
+    assert len(recording_http.requests) == 1
+    assert fake_logger.events == [("discord_alert_throttled", {"alert_type": "risk_block"})]
+
+
+@pytest.mark.anyio
+async def test_stale_data_risk_uses_stale_data_alert_type(recording_http, fake_logger):
+    notifier = DiscordNotifier(enabled_settings())
+
+    await notifier.risk_alert("stale_market_data")
+
+    fields = {
+        item["name"]: item["value"]
+        for item in recording_http.requests[0]["json"]["embeds"][0]["fields"]
+    }
+    assert fields["Alert Type"] == "stale_data_block"
+
+
+@pytest.mark.anyio
+async def test_canceled_order_uses_order_canceled_alert_type(recording_http, fake_logger):
+    notifier = DiscordNotifier(enabled_settings())
+
+    await notifier.order_alert("buy", "canceled", notional=25, qty=None, broker_order_id="order-123")
+
+    fields = {
+        item["name"]: item["value"]
+        for item in recording_http.requests[0]["json"]["embeds"][0]["fields"]
+    }
+    assert fields["Alert Type"] == "order_canceled"
+
+
+@pytest.mark.anyio
+async def test_invalid_webhook_does_not_raise(fake_logger):
+    notifier = DiscordNotifier(enabled_settings(discord_webhook_url="not-a-valid-webhook"))
+
+    await notifier.risk_alert("stale_market_data")
+
+    assert fake_logger.events
+    assert fake_logger.events[0][0] == "discord_alert_failed"
+
+
+@pytest.mark.anyio
 async def test_auto_trading_paused_alert_uses_embed(recording_http, fake_logger):
     notifier = DiscordNotifier(enabled_settings())
 
@@ -231,6 +279,7 @@ async def test_auto_trading_paused_alert_uses_embed(recording_http, fake_logger)
     assert embed["color"] == DISCORD_RED
     assert fields["Symbol"] == "BTC/USD"
     assert fields["Reason"] == "repeated_risk_block:trade_cooldown_active"
+    assert fields["Alert Type"] == "kill_switch_pause"
 
 
 @pytest.mark.anyio

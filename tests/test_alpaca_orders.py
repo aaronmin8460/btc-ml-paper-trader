@@ -224,3 +224,34 @@ async def test_get_position_falls_back_to_legacy_crypto_symbol(recording_httpx):
 
     assert recording_httpx.requests[0]["url"].endswith("/v2/positions/BTC%2FUSD")
     assert recording_httpx.requests[1]["url"].endswith("/v2/positions/BTCUSD")
+
+
+@pytest.mark.anyio
+async def test_local_simulated_order_does_not_submit_to_alpaca(recording_httpx):
+    client = AlpacaClient(
+        _live_paper_settings(
+            paper_execution_mode="local_simulated",
+            paper_fee_bps=25,
+            paper_slippage_bps=10,
+        )
+    )
+
+    result = await client.submit_order(
+        symbol="BTC/USD",
+        side="buy",
+        notional=100,
+        current_position_qty=0,
+        quote={"bid_price": 99, "ask_price": 100, "ask_size": 0.25},
+        latest_price=99.5,
+    )
+    position = await client.get_position()
+
+    assert recording_httpx.requests == []
+    assert result["status"] == "partially_filled"
+    assert result["filled_qty"] == pytest.approx(0.25)
+    assert result["filled_avg_price"] == pytest.approx(100.1)
+    assert result["fee_amount"] == pytest.approx(0.0625625)
+    assert result["slippage_amount"] == pytest.approx(0.025)
+    assert result["spread_bps"] == pytest.approx(100.50251256)
+    assert position is not None
+    assert float(position["qty"]) == pytest.approx(0.25)

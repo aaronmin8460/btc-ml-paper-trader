@@ -5,8 +5,7 @@ import pandas as pd
 
 from app.config import Settings, get_settings
 from app.backtest.scalping import walk_forward_fee_aware_backtest
-from app.data.dataset_builder import build_training_dataset
-from app.data.feature_engineering import BAR_FEATURE_COLUMNS
+from app.data.dataset_builder import build_training_dataset, training_feature_columns
 from app.ml.model import MLSignalModel, tune_tree_params
 from app.ml.registry import ModelRegistry
 from app.ml.validation import promotion_decision, walk_forward_validate
@@ -22,11 +21,13 @@ def train_model_from_bars(
     settings = settings or get_settings()
     logger = get_logger()
     training_start = datetime.now(UTC).isoformat()
-    take_profit_pct = settings.scalping_take_profit_pct if settings.scalping_mode_enabled else settings.take_profit_pct
-    stop_loss_pct = settings.scalping_stop_loss_pct if settings.scalping_mode_enabled else settings.stop_loss_pct
+    take_profit_pct = settings.scalping_label_take_profit_pct if settings.scalping_mode_enabled else settings.take_profit_pct
+    stop_loss_pct = settings.scalping_label_stop_loss_pct if settings.scalping_mode_enabled else settings.stop_loss_pct
     threshold = settings.scalping_buy_probability_floor if settings.scalping_mode_enabled else settings.min_buy_probability
+    feature_columns = training_feature_columns(settings.scalping_mode_enabled)
     dataset = build_training_dataset(
         bars,
+        scalping_label_horizon_bars=settings.scalping_label_horizon_bars,
         take_profit_pct=take_profit_pct,
         stop_loss_pct=stop_loss_pct,
         scalping_mode_enabled=settings.scalping_mode_enabled,
@@ -35,7 +36,7 @@ def train_model_from_bars(
         fee_bps_per_side=_backtest_fee_bps(settings),
         slippage_bps_per_side=settings.slippage_bps,
         spread_cost_pct=(settings.max_spread_bps / 10_000) if settings.scalping_mode_enabled else 0.0,
-        min_net_exit_profit_pct=settings.min_net_exit_profit_pct if settings.scalping_mode_enabled else 0.0,
+        min_net_exit_profit_pct=settings.scalping_label_min_net_profit_pct if settings.scalping_mode_enabled else 0.0,
         exit_profit_buffer_bps=settings.exit_profit_buffer_bps if settings.scalping_mode_enabled else 0.0,
     )
     class_counts = {
@@ -59,12 +60,15 @@ def train_model_from_bars(
         threshold=threshold,
         take_profit_pct=take_profit_pct,
         stop_loss_pct=stop_loss_pct,
+        feature_columns=feature_columns,
+        sell_threshold=settings.min_sell_probability,
     )
     fee_metrics = walk_forward_fee_aware_backtest(
         dataset,
         settings,
         min_train_rows=settings.min_training_rows,
         threshold=threshold,
+        feature_columns=feature_columns,
     )
     metrics.update(_promotion_performance_metrics(fee_metrics, starting_equity=starting_equity))
     accepted, reason = promotion_decision(
@@ -77,6 +81,7 @@ def train_model_from_bars(
         max_backtest_drawdown_pct=settings.max_backtest_drawdown_pct,
         min_backtest_profit_factor=settings.min_backtest_profit_factor,
         min_backtest_trades=settings.min_backtest_trades,
+        max_ambiguous_candle_ratio=settings.max_backtest_ambiguous_candle_ratio,
         require_positive_net_return=settings.model_promotion_require_positive_net_return,
     )
     metrics["promotion_reason"] = reason
@@ -89,12 +94,13 @@ def train_model_from_bars(
         _record_model_run(version, "rejected", metrics)
         return {"model_path": None, "accepted": False, "reason": metrics["reason"], "metrics": metrics, "registry": None}
 
-    tuned_params = tune_tree_params(dataset, BAR_FEATURE_COLUMNS) if settings.optuna_enabled else {}
-    model = MLSignalModel(feature_columns=BAR_FEATURE_COLUMNS).train(dataset, tuned_params=tuned_params)
+    tuned_params = tune_tree_params(dataset, feature_columns) if settings.optuna_enabled else {}
+    model = MLSignalModel(feature_columns=feature_columns).train(dataset, tuned_params=tuned_params, model_version=version)
     model.metadata["validation_metrics"] = metrics
     model.metadata["promotion_reason"] = reason
     model.metadata["model_version"] = version
     model.metadata["tuned_params"] = tuned_params
+    model.metadata["dataset_metadata"] = dataset_metadata(settings, feature_columns=feature_columns)
     model_path = Path(settings.model_dir) / f"{version}.joblib"
     model.save(model_path)
     training_end = datetime.now(UTC).isoformat()
@@ -102,7 +108,7 @@ def train_model_from_bars(
     if accepted:
         registry = ModelRegistry(settings).promote(
             model_path=str(model_path),
-            feature_columns=BAR_FEATURE_COLUMNS,
+            feature_columns=feature_columns,
             metrics=metrics,
             thresholds={
                 "min_buy_probability": threshold,
@@ -111,6 +117,7 @@ def train_model_from_bars(
             },
             training_start=training_start,
             training_end=training_end,
+            supports_independent_sell_probability=model.supports_independent_sell_probability,
         )
         logger.event("model_promotion", model_path=str(model_path), metrics=metrics, reason=reason)
     else:
@@ -130,8 +137,20 @@ def _promotion_performance_metrics(fee_metrics: dict, *, starting_equity: float 
         "ending_equity": ending_equity,
         "gross_return_pct": gross_return_pct,
         "net_return_pct": net_return_pct,
+        "number_of_trades": fee_metrics.get("number_of_trades"),
+        "number_of_canceled_orders": fee_metrics.get("number_of_canceled_orders"),
+        "partial_fill_count": fee_metrics.get("partial_fill_count"),
+        "evaluated_signal_count": fee_metrics.get("evaluated_signal_count"),
+        "ambiguous_candle_count": fee_metrics.get("ambiguous_candle_count"),
+        "ambiguous_candle_ratio": fee_metrics.get("ambiguous_candle_ratio"),
+        "win_rate_net": fee_metrics.get("win_rate_net"),
+        "average_hold_bars": fee_metrics.get("average_hold_bars"),
         "fees_paid_estimate": fee_metrics.get("fees_paid_estimate"),
         "slippage_paid_estimate": fee_metrics.get("slippage_paid_estimate"),
+        "spread_paid_estimate": fee_metrics.get("spread_paid_estimate"),
+        "total_fees": fee_metrics.get("total_fees"),
+        "total_slippage": fee_metrics.get("total_slippage"),
+        "total_spread_cost": fee_metrics.get("total_spread_cost"),
         "max_drawdown_pct": fee_metrics.get("max_drawdown_pct", fee_metrics.get("max_drawdown")),
         "profit_factor_net": fee_metrics.get("profit_factor_net"),
         "average_trade_pnl": fee_metrics.get("average_trade_pnl"),
@@ -144,6 +163,21 @@ def _promotion_performance_metrics(fee_metrics: dict, *, starting_equity: float 
 
 def _backtest_fee_bps(settings: Settings) -> float:
     return settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps
+
+
+def dataset_metadata(settings: Settings, *, feature_columns: list[str]) -> dict:
+    scalping_mode_enabled = settings.scalping_mode_enabled
+    return {
+        "feature_set_name": "scalping_bar_features_v1" if scalping_mode_enabled else "legacy_bar_features_v1",
+        "feature_columns": list(feature_columns),
+        "horizon_bars": settings.scalping_label_horizon_bars if scalping_mode_enabled else 12,
+        "take_profit_pct": settings.scalping_label_take_profit_pct if scalping_mode_enabled else settings.take_profit_pct,
+        "stop_loss_pct": settings.scalping_label_stop_loss_pct if scalping_mode_enabled else settings.stop_loss_pct,
+        "fee_bps_per_side": _backtest_fee_bps(settings),
+        "slippage_bps_per_side": settings.slippage_bps,
+        "spread_cost_pct": (settings.max_spread_bps / 10_000) if scalping_mode_enabled else 0.0,
+        "min_net_profit_pct": settings.scalping_label_min_net_profit_pct if scalping_mode_enabled else 0.0,
+    }
 
 
 def _record_model_run(model_version: str, status: str, metrics: dict) -> None:

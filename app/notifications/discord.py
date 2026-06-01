@@ -28,6 +28,7 @@ class DiscordNotifier:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self.logger = get_logger()
+        self._last_alert_sent_at: dict[str, datetime] = {}
 
     @property
     def enabled(self) -> bool:
@@ -52,9 +53,19 @@ class DiscordNotifier:
         fields: list[dict[str, Any]] | None = None,
         color: int | None = None,
         footer: str | None = None,
-    ) -> None:
+        *,
+        alert_type: str | None = None,
+        cooldown_key: str | None = None,
+    ) -> bool:
         if not self.enabled:
-            return
+            return False
+        throttle_key = _alert_throttle_key(alert_type, cooldown_key)
+        if throttle_key and self._alert_is_throttled(throttle_key):
+            try:
+                self.logger.event("discord_alert_throttled", alert_type=alert_type)
+            except Exception:
+                pass
+            return False
 
         embed: dict[str, Any] = {
             "title": truncate(title, EMBED_TITLE_LIMIT),
@@ -76,7 +87,10 @@ class DiscordNotifier:
             "allowed_mentions": {"parse": []},
         }
 
-        await self._post_payload(payload)
+        sent = await self._post_payload(payload)
+        if sent and throttle_key:
+            self._last_alert_sent_at[throttle_key] = datetime.now(UTC)
+        return sent
 
     async def signal_alert(
         self,
@@ -90,6 +104,10 @@ class DiscordNotifier:
         quote_imbalance: float | None = None,
         latest_price: float | None = None,
         mid_price: float | None = None,
+        bar_age_seconds: float | None = None,
+        quote_age_seconds: float | None = None,
+        prediction_source: str | None = None,
+        model_version: str | None = None,
     ) -> None:
         if not self.settings.discord_alert_on_signal:
             return
@@ -100,18 +118,25 @@ class DiscordNotifier:
         await self.send_embed(
             title=f"{symbol} Signal: {action_text}",
             fields=[
+                field("Alert Type", "signal"),
                 field("Action", action_text),
                 field("Reason", reason),
                 field("Buy Probability", format_probability(buy_probability)),
                 field("Sell Probability", format_probability(sell_probability)),
+                field("Prediction Source", prediction_source),
+                field("Model Version", model_version),
                 field("Latest Price", format_usd(latest_price)),
                 field("Mid Price", format_usd(mid_price)),
                 field("Spread bps", format_number(spread_bps, digits=2)),
                 field("Quote Imbalance", format_number(quote_imbalance, digits=4)),
+                field("Bar Age Seconds", format_number(bar_age_seconds, digits=2)),
+                field("Quote Age Seconds", format_number(quote_age_seconds, digits=2)),
                 field("Timestamp", utc_timestamp()),
             ],
             color=action_color(action),
             footer="BTC/USD paper trading only",
+            alert_type="signal",
+            cooldown_key=f"{symbol}:{action.lower()}:{reason}",
         )
 
     async def order_alert(
@@ -124,24 +149,43 @@ class DiscordNotifier:
         *,
         order_type: str | None = None,
         time_in_force: str | None = None,
+        local_order_id: str | int | None = None,
+        limit_price: float | None = None,
+        filled_qty: float | None = None,
+        filled_avg_price: float | None = None,
+        fee_amount: float | None = None,
+        slippage_amount: float | None = None,
+        cancel_reason: str | None = None,
     ) -> None:
         if not self.settings.discord_alert_on_order:
             return
 
+        alert_type = _order_alert_type(side=side, status=status)
         await self.send_embed(
             title=f"{ALLOWED_SYMBOL} Paper Order",
             fields=[
+                field("Alert Type", alert_type),
                 field("Side", side.upper()),
                 field("Status", status),
-                field("Notional", format_usd(notional)),
+                field("Requested Notional", format_usd(notional)),
+                field("Requested Quantity", format_number(qty, digits=8)),
                 field("Quantity", format_number(qty, digits=8)),
                 field("Order Type", order_type or "n/a"),
                 field("Time in Force", time_in_force or "n/a"),
                 field("Broker Order ID", broker_order_id or "n/a"),
+                field("Local Order ID", local_order_id),
+                field("Limit Price", format_usd(limit_price)),
+                field("Filled Quantity", format_number(filled_qty, digits=8)),
+                field("Filled Average Price", format_usd(filled_avg_price)),
+                field("Fee Amount", format_usd(fee_amount)),
+                field("Slippage Amount", format_usd(slippage_amount)),
+                field("Cancel Reason", cancel_reason),
                 field("Timestamp", utc_timestamp()),
             ],
-            color=action_color(side),
-            footer="Alpaca paper order",
+            color=DISCORD_ORANGE if alert_type == "order_canceled" else action_color(side),
+            footer="BTC/USD paper order",
+            alert_type=alert_type,
+            cooldown_key=str(broker_order_id or local_order_id or f"{side}:{status}"),
         )
 
     async def error_alert(self, where: str, error: Exception | str, *, force: bool = False) -> None:
@@ -152,6 +196,7 @@ class DiscordNotifier:
         await self.send_embed(
             title="Trading Bot Error",
             fields=[
+                field("Alert Type", "runtime_error"),
                 field("Where", where),
                 field("Error Type", error_type),
                 field("Error Message", str(error)),
@@ -159,31 +204,53 @@ class DiscordNotifier:
             ],
             color=DISCORD_RED,
             footer="Notifier failure cannot stop trading flow",
+            alert_type="runtime_error",
+            cooldown_key=f"{where}:{error_type}:{error}",
         )
 
-    async def risk_alert(self, reason: str) -> None:
+    async def risk_alert(
+        self,
+        reason: str,
+        *,
+        relevant_limit: Any = None,
+        current_value: Any = None,
+        reset_time: Any = None,
+    ) -> None:
+        alert_type = "stale_data_block" if reason == "stale_market_data" else "risk_block"
         await self.send_embed(
             title="Risk Guard Triggered",
             fields=[
+                field("Alert Type", alert_type),
                 field("Symbol", ALLOWED_SYMBOL),
                 field("Reason", reason),
+                field("Relevant Limit", relevant_limit),
+                field("Current Value", current_value),
+                field("Reset Time", reset_time),
                 field("Timestamp", utc_timestamp()),
             ],
             color=DISCORD_ORANGE,
             footer="Paper trading risk guard",
+            alert_type=alert_type,
+            cooldown_key=reason,
         )
 
     async def auto_trading_paused_alert(self, reason: str) -> None:
         await self.send_embed(
             title="Auto trading paused",
             fields=[
+                field("Alert Type", "kill_switch_pause"),
                 field("Symbol", ALLOWED_SYMBOL),
                 field("Reason", reason),
                 field("Timestamp", utc_timestamp()),
             ],
             color=DISCORD_RED,
             footer="Runtime circuit breaker",
+            alert_type="kill_switch_pause",
+            cooldown_key=reason,
         )
+
+    async def kill_switch_pause_alert(self, reason: str) -> None:
+        await self.auto_trading_paused_alert(reason)
 
     async def model_alert(
         self,
@@ -207,15 +274,26 @@ class DiscordNotifier:
             ],
             color=DISCORD_GREEN if accepted else DISCORD_RED,
             footer="BTC/USD paper model validation",
+            alert_type="model_result",
+            cooldown_key=f"{model_path}:{accepted}:{reason}",
         )
 
-    async def _post_payload(self, payload: dict[str, Any]) -> None:
+    async def _post_payload(self, payload: dict[str, Any]) -> bool:
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(self.settings.discord_webhook_url.strip(), json=payload)
                 response.raise_for_status()
+            return True
         except Exception as exc:
             self._log_failure(exc)
+            return False
+
+    def _alert_is_throttled(self, throttle_key: str) -> bool:
+        sent_at = self._last_alert_sent_at.get(throttle_key)
+        if sent_at is None:
+            return False
+        elapsed = (datetime.now(UTC) - sent_at).total_seconds()
+        return elapsed < self.settings.discord_alert_cooldown_seconds
 
     def _log_failure(self, exc: Exception) -> None:
         payload: dict[str, Any] = {"error_type": type(exc).__name__}
@@ -307,3 +385,18 @@ def safe_float(value: float | int | None) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _order_alert_type(*, side: str, status: str) -> str:
+    normalized_status = str(status).lower()
+    if normalized_status in {"canceled", "cancelled"}:
+        return "order_canceled"
+    if normalized_status in {"filled", "partially_filled"}:
+        return "buy_order_filled" if str(side).lower() == "buy" else "sell_order_filled"
+    return "order_submitted"
+
+
+def _alert_throttle_key(alert_type: str | None, cooldown_key: str | None) -> str | None:
+    if not alert_type:
+        return None
+    return f"{alert_type}:{cooldown_key or ''}"

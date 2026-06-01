@@ -24,6 +24,11 @@ def test_sell_cannot_happen_without_position():
         validate_order_request("BTC/USD", "sell", qty=0.01, current_position_qty=0)
 
 
+def test_sell_cannot_exceed_current_position():
+    with pytest.raises(LongOnlyViolation):
+        validate_order_request("BTC/USD", "sell", qty=0.02, current_position_qty=0.01)
+
+
 def test_env_defaults_are_safe():
     settings = Settings(_env_file=None)
     assert settings.trading_enabled is False
