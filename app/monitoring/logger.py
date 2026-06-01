@@ -65,8 +65,11 @@ class JsonlLogger:
     def __init__(self, name: str = "btc_ml_paper_trader") -> None:
         self.name = name
         self.settings = get_settings()
-        Path(self.settings.log_dir).mkdir(parents=True, exist_ok=True)
-        self.file_path = Path(self.settings.log_dir) / "events.jsonl"
+        self.file_path: Path | None = Path(self.settings.log_dir) / "events.jsonl"
+        try:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self.file_path = None
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.INFO)
         if not self.logger.handlers:
@@ -82,8 +85,12 @@ class JsonlLogger:
             **normalize_event_payload(event_type, payload, timestamp=timestamp),
         }
         line = json.dumps(record, default=_json_default, separators=(",", ":"))
-        with self.file_path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        if self.file_path is not None:
+            try:
+                with self.file_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
         self.logger.info(line)
 
 

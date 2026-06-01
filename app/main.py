@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy import text
 
 from app.api.dashboard import router as dashboard_router
 from app.config import Settings, get_settings
@@ -97,16 +99,36 @@ configure_frontend_static(app)
 @app.on_event("startup")
 async def startup() -> None:
     init_db()
-    scheduler.restore_pause_state()
+    pause_restored = scheduler.restore_pause_state()
+    scheduler_started = False
     if settings.auto_trade_enabled:
-        scheduler.start()
+        scheduler_started = scheduler.start()
     if settings.auto_train_enabled:
         training_scheduler.start()
+    _log_application_startup(
+        scheduler_started=scheduler_started,
+        pause_restored=pause_restored,
+    )
 
 
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok", "paper_trading_only": settings.paper_trading_only, "symbol": settings.symbol}
+
+
+@app.get("/health/deep")
+async def health_deep() -> JSONResponse:
+    checks = _deep_health_checks()
+    healthy = all(check.get("ok") is True for check in checks.values())
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={
+            "status": "ok" if healthy else "degraded",
+            "paper_trading_only": settings.paper_trading_only,
+            "symbol": settings.symbol,
+            "checks": checks,
+        },
+    )
 
 
 @app.get("/config/safe", dependencies=[Depends(require_admin)])
@@ -197,6 +219,11 @@ async def admin_status() -> dict:
     return scheduler_status_payload(runtime_scheduler())
 
 
+@app.get("/scheduler/status", dependencies=[Depends(require_admin)])
+async def scheduler_status() -> dict:
+    return scheduler_status_payload(runtime_scheduler())
+
+
 @app.get("/admin/training/status", dependencies=[Depends(require_admin)])
 async def admin_training_status() -> dict:
     return training_scheduler_status_payload(runtime_training_scheduler())
@@ -233,9 +260,73 @@ def scheduler_status_payload(active_scheduler) -> dict:
             "auto_trade_enabled": settings.auto_trade_enabled,
             "trading_enabled": settings.trading_enabled,
             "circuit_breaker_enabled": settings.circuit_breaker_enabled,
+            "runtime_error_count_window": None,
+            "runtime_error_window_seconds": settings.circuit_breaker_window_seconds,
+            "last_successful_run_at": None,
+            "last_runtime_error_at": None,
+            "last_runtime_error": None,
+            "last_stale_data_at": None,
+            "last_stale_data_reason": None,
         }
-    status["paused_at"] = serialize_timestamp(status.get("paused_at"))
+    for key in ["paused_at", "last_successful_run_at", "last_runtime_error_at", "last_stale_data_at"]:
+        status[key] = serialize_timestamp(status.get(key))
     return status
+
+
+def _deep_health_checks() -> dict:
+    checks = {
+        "database": {"ok": False},
+        "model_registry": {"ok": False},
+        "market_data_client": {"ok": False},
+        "scheduler": {"ok": False},
+        "paper_trading_only": {"ok": settings.paper_trading_only is True},
+        "symbol": {"ok": settings.symbol == "BTC/USD", "value": settings.symbol},
+    }
+    try:
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
+        checks["database"] = {"ok": True}
+    except Exception as exc:
+        checks["database"] = {"ok": False, "error_type": type(exc).__name__}
+    try:
+        registry = ModelRegistry(settings)
+        registry.read()
+        if registry.path.exists():
+            raw_registry = json.loads(registry.path.read_text(encoding="utf-8"))
+            if not isinstance(raw_registry, dict):
+                raise ValueError("Model registry must be a JSON object.")
+        checks["model_registry"] = {"ok": True, "configured": registry.path.exists()}
+    except Exception as exc:
+        checks["model_registry"] = {"ok": False, "error_type": type(exc).__name__}
+    try:
+        market = MarketDataClient(settings)
+        configured = market.settings.symbol == "BTC/USD"
+        checks["market_data_client"] = {"ok": configured, "symbol": market.settings.symbol}
+    except Exception as exc:
+        checks["market_data_client"] = {"ok": False, "error_type": type(exc).__name__}
+    try:
+        status = scheduler_status_payload(runtime_scheduler())
+        checks["scheduler"] = {"ok": True, **status}
+    except Exception as exc:
+        checks["scheduler"] = {"ok": False, "error_type": type(exc).__name__}
+    return checks
+
+
+def _log_application_startup(*, scheduler_started: bool, pause_restored: bool) -> None:
+    try:
+        get_logger().event(
+            "application_startup",
+            symbol=settings.symbol,
+            paper_trading_only=settings.paper_trading_only,
+            trading_enabled=settings.trading_enabled,
+            auto_trade_enabled=settings.auto_trade_enabled,
+            scheduler_started=scheduler_started,
+            scheduler_paused=scheduler.paused,
+            scheduler_pause_restored=pause_restored,
+            scheduler_pause_reason=scheduler.pause_reason,
+        )
+    except Exception:
+        pass
 
 
 def training_scheduler_status_payload(value) -> dict:

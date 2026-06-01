@@ -292,6 +292,12 @@ def test_config_still_rejects_unsafe_symbol_and_non_paper_mode():
         Settings(_env_file=None, paper_execution_mode="live")
 
     with pytest.raises(ValueError):
+        Settings(_env_file=None, alpaca_paper_base_url="https://api.alpaca.markets")
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, alpaca_paper_base_url="https://paper-api.alpaca.markets.example.com")
+
+    with pytest.raises(ValueError):
         Settings(_env_file=None, alpaca_max_calls_per_minute=0)
 
     with pytest.raises(ValueError):

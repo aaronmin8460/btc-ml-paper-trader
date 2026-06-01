@@ -315,8 +315,10 @@ class Settings(BaseSettings):
     def enforce_paper_only(self) -> "Settings":
         if not self.paper_trading_only:
             raise ValueError("PAPER_TRADING_ONLY must remain true; live trading is not implemented.")
-        if "paper-api.alpaca.markets" not in self.alpaca_paper_base_url:
+        normalized_paper_url = self.alpaca_paper_base_url.rstrip("/")
+        if normalized_paper_url != "https://paper-api.alpaca.markets":
             raise ValueError("Only Alpaca paper trading base URL is allowed.")
+        self.alpaca_paper_base_url = normalized_paper_url
         if self.max_open_positions != 1:
             raise ValueError("BTC-only MVP supports exactly one open position.")
         return self

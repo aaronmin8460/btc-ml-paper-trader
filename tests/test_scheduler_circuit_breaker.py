@@ -100,6 +100,25 @@ async def test_pause_prevents_run_once():
 
 
 @pytest.mark.anyio
+async def test_scheduler_does_not_start_when_auto_trade_is_disabled():
+    scheduler = TradingScheduler(FakeTrader(), _settings(auto_trade_enabled=False))
+
+    assert scheduler.start() is False
+    assert scheduler.running is False
+
+
+@pytest.mark.anyio
+async def test_scheduler_starts_only_one_loop_per_process():
+    scheduler = TradingScheduler(FakeTrader(), _settings())
+
+    assert scheduler.start() is True
+    assert scheduler.start() is False
+    assert scheduler.running is True
+    assert await scheduler.stop() is True
+    assert scheduler.running is False
+
+
+@pytest.mark.anyio
 async def test_resume_clears_pause():
     scheduler = TradingScheduler(FakeTrader(), _settings())
 
@@ -219,6 +238,67 @@ async def test_scalping_runtime_errors_pause_with_clear_reason(tmp_path, monkeyp
 
 
 @pytest.mark.anyio
+async def test_scheduler_runtime_state_persists_success_stale_data_and_error(tmp_path, monkeypatch):
+    engine, Session = _persisted_scheduler_session(tmp_path, monkeypatch)
+    trader = FakeTrader(
+        results=[_risk_result("stale_market_data")],
+        errors=[RuntimeError("private details are not persisted")],
+    )
+    settings = _settings(max_runtime_errors_before_pause=1)
+    try:
+        scheduler = TradingScheduler(trader, settings)
+
+        assert await scheduler.run_pending_once() is False
+        assert scheduler.pause_reason == "repeated_runtime_errors"
+        scheduler.resume()
+        assert await scheduler.run_pending_once() is True
+
+        with Session() as db:
+            stored = Repository(db).scheduler_state()
+            assert stored is not None
+            assert stored.paused is False
+            assert stored.last_successful_run_at is not None
+            assert stored.last_runtime_error_at is not None
+            assert stored.last_runtime_error == "RuntimeError"
+            assert "private details" not in stored.last_runtime_error
+            assert stored.last_stale_data_at is not None
+            assert stored.last_stale_data_reason == "stale_market_data"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_persisted_manual_pause_stays_paused_until_explicit_resume(tmp_path, monkeypatch):
+    engine, Session = _persisted_scheduler_session(tmp_path, monkeypatch)
+    settings = _settings()
+    try:
+        scheduler = TradingScheduler(FakeTrader(), settings)
+        assert await scheduler.pause("manual_pause") is True
+        assert scheduler.paused_at is not None
+
+        restarted = TradingScheduler(FakeTrader(), settings)
+        assert restarted.restore_pause_state(now=scheduler.paused_at + timedelta(days=30)) is True
+        assert restarted.paused is True
+        assert restarted.pause_reason == "manual_pause"
+
+        with Session() as db:
+            stored = Repository(db).scheduler_state()
+            assert stored is not None
+            assert stored.paused is True
+            assert stored.pause_reason == "manual_pause"
+
+        assert restarted.resume() is True
+        with Session() as db:
+            stored = Repository(db).scheduler_state()
+            assert stored is not None
+            assert stored.paused is False
+            assert stored.pause_reason is None
+            assert stored.paused_at is None
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_ioc_cancel_streak_pause_is_restored_after_restart(tmp_path, monkeypatch):
     engine, Session = _persisted_scheduler_session(tmp_path, monkeypatch)
     try:
@@ -281,3 +361,65 @@ def test_expired_scalping_pause_is_not_restored(tmp_path, monkeypatch):
             assert latest.event_type == "scalping_kill_switch_resume"
     finally:
         engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_application_startup_does_not_start_scheduler_when_auto_trade_is_disabled(monkeypatch):
+    from app import main
+
+    class StartupScheduler:
+        paused = False
+        pause_reason = None
+        starts = 0
+
+        def restore_pause_state(self):
+            return False
+
+        def start(self):
+            self.starts += 1
+            return True
+
+    class Logger:
+        def event(self, *args, **kwargs):
+            return None
+
+    scheduler = StartupScheduler()
+    monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "settings", _settings(auto_trade_enabled=False))
+    monkeypatch.setattr(main, "scheduler", scheduler)
+    monkeypatch.setattr(main, "get_logger", lambda: Logger())
+
+    await main.startup()
+
+    assert scheduler.starts == 0
+
+
+@pytest.mark.anyio
+async def test_application_startup_starts_scheduler_once_when_auto_trade_is_enabled(monkeypatch):
+    from app import main
+
+    class StartupScheduler:
+        paused = False
+        pause_reason = None
+        starts = 0
+
+        def restore_pause_state(self):
+            return False
+
+        def start(self):
+            self.starts += 1
+            return True
+
+    class Logger:
+        def event(self, *args, **kwargs):
+            return None
+
+    scheduler = StartupScheduler()
+    monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "settings", _settings(auto_trade_enabled=True))
+    monkeypatch.setattr(main, "scheduler", scheduler)
+    monkeypatch.setattr(main, "get_logger", lambda: Logger())
+
+    await main.startup()
+
+    assert scheduler.starts == 1

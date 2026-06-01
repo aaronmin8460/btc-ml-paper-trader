@@ -6,12 +6,13 @@ from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
 from app.config import ALLOWED_SYMBOL
-from app.db.models import AccountSnapshot, ModelRun, Order, RiskEvent, Signal, Trade
+from app.db.models import AccountSnapshot, ModelRun, Order, RiskEvent, SchedulerState, Signal, Trade
 from app.risk.risk_manager import TradeFrequencyState
 from app.utils.time import utc_now
 
 
 SECRET_KEY_PARTS = ("secret", "token", "key", "webhook", "authorization", "password")
+_UNSET = object()
 
 
 class Repository:
@@ -378,6 +379,43 @@ class Repository:
             .order_by(desc(RiskEvent.created_at), desc(RiskEvent.id))
             .first()
         )
+
+    def scheduler_state(self) -> SchedulerState | None:
+        return self.db.query(SchedulerState).filter(SchedulerState.symbol == ALLOWED_SYMBOL).first()
+
+    def update_scheduler_state(
+        self,
+        *,
+        paused: bool | object = _UNSET,
+        pause_reason: str | None | object = _UNSET,
+        paused_at: datetime | None | object = _UNSET,
+        last_successful_run_at: datetime | None | object = _UNSET,
+        last_runtime_error_at: datetime | None | object = _UNSET,
+        last_runtime_error: str | None | object = _UNSET,
+        last_stale_data_at: datetime | None | object = _UNSET,
+        last_stale_data_reason: str | None | object = _UNSET,
+    ) -> SchedulerState:
+        state = self.scheduler_state()
+        if state is None:
+            state = SchedulerState(symbol=ALLOWED_SYMBOL, paused=False)
+            self.db.add(state)
+        updates = {
+            "paused": paused,
+            "pause_reason": pause_reason,
+            "paused_at": paused_at,
+            "last_successful_run_at": last_successful_run_at,
+            "last_runtime_error_at": last_runtime_error_at,
+            "last_runtime_error": last_runtime_error,
+            "last_stale_data_at": last_stale_data_at,
+            "last_stale_data_reason": last_stale_data_reason,
+        }
+        for name, value in updates.items():
+            if value is not _UNSET:
+                setattr(state, name, value)
+        state.updated_at = utc_now()
+        self.db.commit()
+        self.db.refresh(state)
+        return state
 
     def recent_model_runs(self, limit: int = 100) -> list[ModelRun]:
         return self.db.query(ModelRun).order_by(desc(ModelRun.created_at)).limit(limit).all()

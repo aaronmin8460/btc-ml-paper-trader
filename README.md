@@ -264,6 +264,19 @@ Verify the public health endpoint:
 curl -sS "$API_URL/health"
 ```
 
+Verify database, model-registry, market-client, scheduler, and paper-only readiness:
+
+```bash
+curl -sS "$API_URL/health/deep"
+```
+
+Inspect the protected scheduler state:
+
+```bash
+curl -sS "$API_URL/scheduler/status" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
 Verify that protected config output masks Alpaca keys, the admin token, and the Discord webhook:
 
 ```bash
@@ -298,9 +311,19 @@ MAX_RUNTIME_ERRORS_BEFORE_PAUSE=10
 CIRCUIT_BREAKER_WINDOW_SECONDS=900
 ```
 
-If the same risk-block reason repeats too many times inside the window, or scheduler runtime errors repeat too often, the scheduler enters a paused state and stops calling `Trader.run_once()`. The first automatic pause sends one Discord alert titled `Auto trading paused`; repeated pause attempts do not spam Discord. Resume manually after inspecting the dashboard status and logs.
+If the same risk-block reason repeats too many times inside the window, or scheduler runtime errors repeat too often, the scheduler enters a paused state and stops calling `Trader.run_once()`. The first automatic pause sends one Discord alert titled `Auto trading paused`; repeated pause attempts do not spam Discord. Pause reason, pause timestamp, last successful run, last runtime error type, and last stale-data event are stored in the database. A restart does not clear a persisted pause.
 
-Manual controls:
+Inspect the state and resume only after reviewing logs and the cause:
+
+```bash
+curl -sS "$API_URL/scheduler/status" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+
+curl -sS -X POST "$API_URL/admin/resume" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+Manual pause and compatibility status controls remain available:
 
 ```bash
 curl -sS "$API_URL/admin/status" \
@@ -499,6 +522,7 @@ Account risk blocks only new buys. Sells needed to reduce or close BTC exposure 
 ## API
 
 - `GET /health`
+- `GET /health/deep`
 - `GET /config/safe`
 - `GET /position`
 - `GET /signals/latest`
@@ -508,6 +532,7 @@ Account risk blocks only new buys. Sells needed to reduce or close BTC exposure 
 - `POST /auto/start`
 - `POST /auto/stop`
 - `GET /admin/status`
+- `GET /scheduler/status`
 - `POST /admin/pause`
 - `POST /admin/resume`
 - `POST /alerts/discord/test`

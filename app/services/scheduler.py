@@ -13,6 +13,7 @@ SCALPING_HOURLY_LOSS_REASON = f"{SCALPING_KILL_SWITCH_PREFIX}hourly_loss_limit"
 SCALPING_IOC_CANCEL_STREAK_REASON = f"{SCALPING_KILL_SWITCH_PREFIX}ioc_cancel_streak"
 SCALPING_LOSS_STREAK_REASON = f"{SCALPING_KILL_SWITCH_PREFIX}loss_streak"
 SCALPING_RUNTIME_ERRORS_REASON = f"{SCALPING_KILL_SWITCH_PREFIX}runtime_errors"
+STALE_DATA_REASONS = {"stale_market_data", "scalping_stale_data_exit"}
 
 
 class TradingScheduler:
@@ -27,6 +28,11 @@ class TradingScheduler:
         self._paused_at: datetime | None = None
         self._risk_block_events: dict[str, list[datetime]] = {}
         self._runtime_error_events: list[datetime] = []
+        self._last_successful_run_at: datetime | None = None
+        self._last_runtime_error_at: datetime | None = None
+        self._last_runtime_error: str | None = None
+        self._last_stale_data_at: datetime | None = None
+        self._last_stale_data_reason: str | None = None
 
     @property
     def running(self) -> bool:
@@ -34,7 +40,6 @@ class TradingScheduler:
 
     @property
     def paused(self) -> bool:
-        self._resume_if_expired()
         return self._paused
 
     @property
@@ -46,11 +51,21 @@ class TradingScheduler:
         return self._paused_at
 
     def start(self) -> bool:
+        if not self.settings.auto_trade_enabled:
+            self.logger.event("scheduler_start_skipped", reason="auto_trade_disabled")
+            return False
         if self.running:
+            self.logger.event("scheduler_start_skipped", reason="already_running")
             return False
         self.restore_pause_state()
         self._stop.clear()
         self._task = asyncio.create_task(self._loop())
+        self.logger.event(
+            "scheduler_started",
+            paused=self._paused,
+            pause_reason=self._pause_reason,
+            scan_interval_seconds=self.settings.scan_interval_seconds,
+        )
         return True
 
     async def stop(self) -> bool:
@@ -58,6 +73,8 @@ class TradingScheduler:
             return False
         self._stop.set()
         await self._task
+        self._task = None
+        self.logger.event("scheduler_stopped")
         return True
 
     async def pause(self, reason: str = "manual_pause", *, send_alert: bool = False) -> bool:
@@ -66,6 +83,11 @@ class TradingScheduler:
         self._paused = True
         self._pause_reason = reason
         self._paused_at = datetime.now(UTC)
+        self._persist_scheduler_state(
+            paused=True,
+            pause_reason=reason,
+            paused_at=self._paused_at,
+        )
         self._persist_scalping_pause(reason=reason, paused_at=self._paused_at)
         self.logger.event("auto_trading_paused", reason=reason, paused_at=self._paused_at.isoformat())
         self.logger.event(
@@ -86,6 +108,7 @@ class TradingScheduler:
         self._paused_at = None
         self._risk_block_events.clear()
         self._runtime_error_events.clear()
+        self._persist_scheduler_state(paused=False, pause_reason=None, paused_at=None)
         if was_paused and _is_scalping_kill_switch_reason(previous_reason):
             self._persist_scalping_resume(reason=previous_reason or "manual_resume")
         self.logger.event("auto_trading_resumed", resumed=was_paused)
@@ -100,6 +123,13 @@ class TradingScheduler:
             "auto_trade_enabled": self.settings.auto_trade_enabled,
             "trading_enabled": self.settings.trading_enabled,
             "circuit_breaker_enabled": self.settings.circuit_breaker_enabled,
+            "runtime_error_count_window": len(self._runtime_error_events),
+            "runtime_error_window_seconds": self.settings.circuit_breaker_window_seconds,
+            "last_successful_run_at": self._last_successful_run_at,
+            "last_runtime_error_at": self._last_runtime_error_at,
+            "last_runtime_error": self._last_runtime_error,
+            "last_stale_data_at": self._last_stale_data_at,
+            "last_stale_data_reason": self._last_stale_data_reason,
         }
 
     async def run_pending_once(self) -> bool:
@@ -108,6 +138,7 @@ class TradingScheduler:
         try:
             result = await self.trader.run_once()
             await self.record_run_result(result)
+            self._record_successful_run()
             return True
         except Exception as exc:
             self.logger.event(
@@ -116,6 +147,7 @@ class TradingScheduler:
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
+            self._record_runtime_error_state(exc)
             await self._send_runtime_error_alert(exc)
             await self.record_runtime_error(exc)
             return False
@@ -125,6 +157,8 @@ class TradingScheduler:
         action = str(decision.get("action") or "").lower()
         reason = str(decision.get("reason") or "")
         scalping_reason = str((result or {}).get("scalping_kill_switch_reason") or "")
+        if reason in STALE_DATA_REASONS:
+            self._record_stale_data(reason)
         if not scalping_reason and _is_scalping_kill_switch_reason(reason):
             scalping_reason = reason
         if self._scalping_kill_switch_enabled() and _is_scalping_kill_switch_reason(scalping_reason):
@@ -186,14 +220,32 @@ class TradingScheduler:
         return [event_at for event_at in events if event_at >= cutoff]
 
     def restore_pause_state(self, *, now: datetime | None = None) -> bool:
-        if not self._scalping_kill_switch_enabled():
-            return False
         current_time = _ensure_utc(now or datetime.now(UTC))
         try:
             with SessionLocal() as db:
-                event = Repository(db).latest_scalping_kill_switch_event()
+                repo = Repository(db)
+                state = repo.scheduler_state()
+                event = repo.latest_scalping_kill_switch_event() if state is None else None
         except Exception as exc:
             self._log_persistence_failure("restore", exc)
+            return False
+        if state is not None:
+            self._hydrate_runtime_state(state)
+            if not state.paused:
+                self._paused = False
+                self._pause_reason = None
+                self._paused_at = None
+                return False
+            self._paused = True
+            self._pause_reason = state.pause_reason
+            self._paused_at = _ensure_optional_utc(state.paused_at)
+            self.logger.event(
+                "scheduler_pause_restored",
+                reason=self._pause_reason,
+                paused_at=self._paused_at.isoformat() if self._paused_at else None,
+            )
+            return True
+        if not self._scalping_kill_switch_enabled():
             return False
         if event is None or event.event_type != "scalping_kill_switch_pause":
             return False
@@ -204,19 +256,9 @@ class TradingScheduler:
         self._paused = True
         self._pause_reason = event.reason
         self._paused_at = paused_at
+        self._persist_scheduler_state(paused=True, pause_reason=event.reason, paused_at=paused_at)
         self.logger.event("scalping_kill_switch_restored", reason=event.reason, paused_at=paused_at.isoformat())
         return True
-
-    def _resume_if_expired(self) -> bool:
-        if not self._paused or not _is_scalping_kill_switch_reason(self._pause_reason) or self._paused_at is None:
-            return False
-        if datetime.now(UTC) < self._pause_expires_at(reason=self._pause_reason, paused_at=self._paused_at):
-            return False
-        reason = self._pause_reason
-        resumed = self.resume()
-        if resumed:
-            self.logger.event("scalping_kill_switch_expired", reason=reason)
-        return resumed
 
     def _pause_expires_at(self, *, reason: str, paused_at: datetime) -> datetime:
         return _ensure_utc(paused_at) + timedelta(seconds=self._pause_duration_seconds(reason))
@@ -249,6 +291,40 @@ class TradingScheduler:
                 Repository(db).add_risk_event(event_type=event_type, reason=reason, created_at=created_at)
         except Exception as exc:
             self._log_persistence_failure(event_type, exc)
+
+    def _persist_scheduler_state(self, **updates) -> None:
+        try:
+            with SessionLocal() as db:
+                Repository(db).update_scheduler_state(**updates)
+        except Exception as exc:
+            self._log_persistence_failure("scheduler_state", exc)
+
+    def _record_successful_run(self) -> None:
+        self._last_successful_run_at = datetime.now(UTC)
+        self._persist_scheduler_state(last_successful_run_at=self._last_successful_run_at)
+
+    def _record_runtime_error_state(self, error: Exception) -> None:
+        self._last_runtime_error_at = datetime.now(UTC)
+        self._last_runtime_error = type(error).__name__
+        self._persist_scheduler_state(
+            last_runtime_error_at=self._last_runtime_error_at,
+            last_runtime_error=self._last_runtime_error,
+        )
+
+    def _record_stale_data(self, reason: str) -> None:
+        self._last_stale_data_at = datetime.now(UTC)
+        self._last_stale_data_reason = reason
+        self._persist_scheduler_state(
+            last_stale_data_at=self._last_stale_data_at,
+            last_stale_data_reason=reason,
+        )
+
+    def _hydrate_runtime_state(self, state) -> None:
+        self._last_successful_run_at = _ensure_optional_utc(state.last_successful_run_at)
+        self._last_runtime_error_at = _ensure_optional_utc(state.last_runtime_error_at)
+        self._last_runtime_error = state.last_runtime_error
+        self._last_stale_data_at = _ensure_optional_utc(state.last_stale_data_at)
+        self._last_stale_data_reason = state.last_stale_data_reason
 
     def _log_persistence_failure(self, operation: str, error: Exception) -> None:
         try:
@@ -295,3 +371,7 @@ def _ensure_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _ensure_optional_utc(value: datetime | None) -> datetime | None:
+    return _ensure_utc(value) if value is not None else None
