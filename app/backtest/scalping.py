@@ -60,6 +60,28 @@ ZERO_BACKTEST_METRICS = {
     "total_fees": 0.0,
     "total_slippage": 0.0,
     "total_spread_cost": 0.0,
+    "round_trip_estimated_cost_pct": 0.0,
+    "round_trip_estimated_cost_bps": 0.0,
+    "promotion_required_return_pct": 0.0,
+    "promotion_required_return_bps": 0.0,
+    "minimum_take_profit_net_positive_pct": 0.0,
+    "minimum_take_profit_net_positive_bps": 0.0,
+    "take_profit_vs_cost_safe": False,
+    "gross_winners_became_net_losers": 0,
+    "gross_winner_count": 0,
+    "net_winner_count": 0,
+    "average_gross_winning_trade": 0.0,
+    "average_net_winning_trade": 0.0,
+    "average_fee_per_trade": 0.0,
+    "average_slippage_per_trade": 0.0,
+    "average_spread_per_trade": 0.0,
+    "average_total_execution_cost_per_trade": 0.0,
+    "average_fee_pct_per_trade": 0.0,
+    "average_slippage_pct_per_trade": 0.0,
+    "average_spread_pct_per_trade": 0.0,
+    "average_total_execution_cost_pct_per_trade": 0.0,
+    "required_gross_return_to_overcome_costs": 0.0,
+    "gross_return_distribution": {},
     "average_hold_bars": 0.0,
     "starting_equity": None,
     "ending_equity": None,
@@ -70,8 +92,55 @@ ZERO_BACKTEST_METRICS = {
 }
 
 
+def backtest_fee_bps(settings: Settings) -> float:
+    return float(settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps)
+
+
+def estimated_round_trip_execution_cost_pct(settings: Settings) -> float:
+    return (
+        2 * max(0.0, backtest_fee_bps(settings)) / 10_000
+        + 2 * max(0.0, float(settings.slippage_bps)) / 10_000
+        + max(0.0, float(settings.max_spread_bps)) / 10_000
+    )
+
+
+def minimum_take_profit_net_positive_pct(settings: Settings) -> float:
+    return estimated_round_trip_execution_cost_pct(settings)
+
+
+def promotion_required_return_pct(settings: Settings) -> float:
+    return estimated_round_trip_execution_cost_pct(settings) + max(0.0, float(settings.min_backtest_net_return_pct))
+
+
+def take_profit_covers_execution_cost(settings: Settings, *, take_profit_pct: float | None = None) -> bool:
+    target = float(settings.scalping_take_profit_pct if take_profit_pct is None else take_profit_pct)
+    return target > minimum_take_profit_net_positive_pct(settings)
+
+
+def execution_cost_breakdown(settings: Settings) -> dict[str, Any]:
+    fee_bps = backtest_fee_bps(settings)
+    round_trip_cost = estimated_round_trip_execution_cost_pct(settings)
+    required_return = promotion_required_return_pct(settings)
+    minimum_take_profit = minimum_take_profit_net_positive_pct(settings)
+    return {
+        "fee_model": "taker" if settings.backtest_use_taker_fees else "maker",
+        "fee_bps_per_side": fee_bps,
+        "taker_fee_bps": float(settings.taker_fee_bps),
+        "maker_fee_bps": float(settings.maker_fee_bps),
+        "slippage_bps_per_side": float(settings.slippage_bps),
+        "max_spread_bps": float(settings.max_spread_bps),
+        "round_trip_estimated_cost_pct": round_trip_cost,
+        "round_trip_estimated_cost_bps": round_trip_cost * 10_000,
+        "promotion_required_return_pct": required_return,
+        "promotion_required_return_bps": required_return * 10_000,
+        "minimum_take_profit_net_positive_pct": minimum_take_profit,
+        "minimum_take_profit_net_positive_bps": minimum_take_profit * 10_000,
+        "take_profit_vs_cost_safe": take_profit_covers_execution_cost(settings),
+    }
+
+
 def backtest_assumptions(settings: Settings, *, spread_available: bool = False) -> dict[str, Any]:
-    fee_bps = settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps
+    fee_bps = backtest_fee_bps(settings)
     spread_source = "unavailable"
     if spread_available:
         spread_source = "scalping_spread_pct" if settings.scalping_mode_enabled else "orderbook_spread"
@@ -100,6 +169,7 @@ def backtest_assumptions(settings: Settings, *, spread_available: bool = False) 
         "gross_return_model": (
             "net_profit_scalping_labels" if settings.scalping_mode_enabled else "triple_barrier_take_profit_or_stop_loss"
         ),
+        **execution_cost_breakdown(settings),
     }
 
 
@@ -115,6 +185,12 @@ def calculate_fee_aware_metrics(
             "valid": False,
             "reason": "no_trades",
             **ZERO_BACKTEST_METRICS,
+            **execution_cost_breakdown(settings),
+            **trade_economics_summary(
+                [],
+                notional=float(settings.order_notional_usd),
+                required_gross_return_to_overcome_costs=estimated_round_trip_execution_cost_pct(settings),
+            ),
             "evaluated_signal_count": int(len(signals)),
             **_signal_observability_metrics([], signals, {}, {}),
         }
@@ -123,13 +199,19 @@ def calculate_fee_aware_metrics(
             "valid": False,
             "reason": "missing_buy_quality_label",
             **ZERO_BACKTEST_METRICS,
+            **execution_cost_breakdown(settings),
+            **trade_economics_summary(
+                [],
+                notional=float(settings.order_notional_usd),
+                required_gross_return_to_overcome_costs=estimated_round_trip_execution_cost_pct(settings),
+            ),
             "evaluated_signal_count": int(len(signals)),
             **_signal_observability_metrics([], signals, {}, {}),
         }
 
     take_profit_pct = _take_profit_pct(settings)
     stop_loss_pct = _stop_loss_pct(settings)
-    fee_bps = settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps
+    fee_bps = backtest_fee_bps(settings)
     notional = float(settings.order_notional_usd)
     gross_returns: list[float] = []
     net_trade_returns: list[float] = []
@@ -293,10 +375,66 @@ def calculate_fee_aware_metrics(
         "starting_equity": notional,
         "ending_equity": notional * (1 + net_return),
         "trade_details": trade_details,
+        **execution_cost_breakdown(settings),
+        **trade_economics_summary(
+            trade_details,
+            notional=notional,
+            required_gross_return_to_overcome_costs=estimated_round_trip_execution_cost_pct(settings),
+        ),
         **_signal_observability_metrics(trade_details, signals, strategy_execution, regime_execution),
     }
 
     return metrics
+
+
+def trade_economics_summary(
+    trade_details: list[dict[str, Any]],
+    *,
+    notional: float | None = None,
+    required_gross_return_to_overcome_costs: float = 0.0,
+) -> dict[str, Any]:
+    gross_values = np.asarray(
+        [_safe_float(trade.get("gross_return_pct", trade.get("gross_return", 0.0))) for trade in trade_details],
+        dtype=float,
+    )
+    net_values = np.asarray(
+        [_safe_float(trade.get("net_return_pct", trade.get("net_return", 0.0))) for trade in trade_details],
+        dtype=float,
+    )
+    fees = np.asarray(
+        [_safe_float(trade.get("fee_amount", trade.get("fees", 0.0))) for trade in trade_details],
+        dtype=float,
+    )
+    slippage = np.asarray(
+        [_safe_float(trade.get("slippage_amount", trade.get("slippage", 0.0))) for trade in trade_details],
+        dtype=float,
+    )
+    spread = np.asarray([_safe_float(trade.get("spread_cost", 0.0)) for trade in trade_details], dtype=float)
+    total_costs = fees + slippage + spread
+    trade_count = len(trade_details)
+    positive_gross = gross_values > 0
+    positive_net = net_values > 0
+    denominator = float(notional or 0.0)
+
+    return {
+        "gross_winners_became_net_losers": int((positive_gross & (net_values <= 0)).sum()) if trade_count else 0,
+        "gross_winner_count": int(positive_gross.sum()) if trade_count else 0,
+        "net_winner_count": int(positive_net.sum()) if trade_count else 0,
+        "average_gross_winning_trade": _mean_or_zero(gross_values[positive_gross]),
+        "average_net_winning_trade": _mean_or_zero(net_values[positive_net]),
+        "average_fee_per_trade": _mean_or_zero(fees),
+        "average_slippage_per_trade": _mean_or_zero(slippage),
+        "average_spread_per_trade": _mean_or_zero(spread),
+        "average_total_execution_cost_per_trade": _mean_or_zero(total_costs),
+        "average_fee_pct_per_trade": (_mean_or_zero(fees) / denominator) if denominator > 0 else 0.0,
+        "average_slippage_pct_per_trade": (_mean_or_zero(slippage) / denominator) if denominator > 0 else 0.0,
+        "average_spread_pct_per_trade": (_mean_or_zero(spread) / denominator) if denominator > 0 else 0.0,
+        "average_total_execution_cost_pct_per_trade": (_mean_or_zero(total_costs) / denominator)
+        if denominator > 0
+        else 0.0,
+        "required_gross_return_to_overcome_costs": float(required_gross_return_to_overcome_costs),
+        "gross_return_distribution": _return_distribution(gross_values),
+    }
 
 
 def walk_forward_fee_aware_backtest(
@@ -699,6 +837,46 @@ def _row_float(row: pd.Series, *names: str) -> float | None:
 
 def _mean_or_zero(values: np.ndarray) -> float:
     return float(values.mean()) if len(values) else 0.0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
+def _return_distribution(values: np.ndarray) -> dict[str, Any]:
+    if len(values) == 0:
+        return {
+            "count": 0,
+            "min": 0.0,
+            "p10": 0.0,
+            "p25": 0.0,
+            "p50": 0.0,
+            "p75": 0.0,
+            "p90": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "positive_count": 0,
+            "negative_count": 0,
+            "zero_count": 0,
+        }
+    return {
+        "count": int(len(values)),
+        "min": float(values.min()),
+        "p10": float(np.percentile(values, 10)),
+        "p25": float(np.percentile(values, 25)),
+        "p50": float(np.percentile(values, 50)),
+        "p75": float(np.percentile(values, 75)),
+        "p90": float(np.percentile(values, 90)),
+        "max": float(values.max()),
+        "mean": float(values.mean()),
+        "positive_count": int((values > 0).sum()),
+        "negative_count": int((values < 0).sum()),
+        "zero_count": int((values == 0).sum()),
+    }
 
 
 def _profit_factor(returns: np.ndarray) -> float | None:

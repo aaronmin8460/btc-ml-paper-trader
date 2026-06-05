@@ -141,6 +141,28 @@ def test_scalping_backtest_uses_configured_spread_when_quote_is_missing():
     assert metrics["net_return_pct"] < metrics["gross_return_pct"]
 
 
+def test_backtest_counts_gross_winners_that_become_net_losers():
+    trades = pd.DataFrame({"close": [100.0], "buy_quality_label": [1], "buy_exit_return_pct": [0.003]})
+
+    metrics = calculate_fee_aware_metrics(
+        trades,
+        _settings(
+            order_type="market",
+            scalping_mode_enabled=True,
+            taker_fee_bps=25,
+            slippage_bps=10,
+            max_spread_bps=5,
+        ),
+    )
+
+    assert metrics["gross_return_pct"] > 0
+    assert metrics["net_return_pct"] < 0
+    assert metrics["gross_winners_became_net_losers"] == 1
+    assert metrics["average_gross_winning_trade"] == pytest.approx(0.003)
+    assert metrics["average_net_winning_trade"] == 0.0
+    assert metrics["required_gross_return_to_overcome_costs"] == pytest.approx(0.0075)
+
+
 def test_canceled_ioc_entry_is_not_counted_as_a_win():
     trades = pd.DataFrame(
         {

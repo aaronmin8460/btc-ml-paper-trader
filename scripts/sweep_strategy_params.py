@@ -9,6 +9,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,10 @@ from app.backtest.scalping import (
     _annotate_strategy_candidates,
     _walk_forward_prediction_frame,
     calculate_fee_aware_metrics,
+    estimated_round_trip_execution_cost_pct,
+    minimum_take_profit_net_positive_pct,
+    promotion_required_return_pct,
+    trade_economics_summary,
 )
 from app.config import ALLOWED_SYMBOL, Settings, get_settings
 from app.data.dataset_builder import build_training_dataset, training_feature_columns
@@ -43,18 +48,13 @@ ML_CONFIRMATION_SWEEP = {
     "SCALPING_EXIT_CONFIDENCE_GAP_REQUIRED": ("scalping_exit_confidence_gap_required", [0.03, 0.04, 0.06]),
 }
 
-EXECUTION_FILTER_SWEEP = {
-    "MAX_SPREAD_BPS": ("max_spread_bps", [4, 5, 6, 8]),
-    "MIN_QUOTE_IMBALANCE": ("min_quote_imbalance", [-0.01, -0.005, 0.0, 0.005]),
-    "MIN_SECONDS_BETWEEN_TRADES": ("min_seconds_between_trades", [5, 10, 15]),
-    "MAX_TRADES_PER_HOUR": ("max_trades_per_hour", [20, 40, 60]),
-}
-
-SCALPING_EXIT_SWEEP = {
-    "SCALPING_TAKE_PROFIT_PCT": ("scalping_take_profit_pct", [0.0012, 0.0015, 0.002, 0.003]),
-    "SCALPING_STOP_LOSS_PCT": ("scalping_stop_loss_pct", [0.0008, 0.001, 0.0015, 0.002]),
-    "SCALPING_TRAILING_STOP_PCT": ("scalping_trailing_stop_pct", [0.0008, 0.001, 0.0015]),
-    "TRAILING_STOP_ARM_PROFIT_PCT": ("trailing_stop_arm_profit_pct", [0.0015, 0.002, 0.003]),
+ECONOMIC_VIABILITY_SWEEP = {
+    "SCALPING_TAKE_PROFIT_PCT": ("scalping_take_profit_pct", [0.003, 0.005, 0.0075, 0.01]),
+    "SCALPING_STOP_LOSS_PCT": ("scalping_stop_loss_pct", [0.002, 0.003, 0.005]),
+    "LABEL_HORIZON_BARS": ("label_horizon_bars", [6, 10, 15, 30]),
+    "MAX_SPREAD_BPS": ("max_spread_bps", [2, 4, 6]),
+    "SLIPPAGE_BPS": ("slippage_bps", [2, 5, 10]),
+    "BACKTEST_USE_TAKER_FEES": ("backtest_use_taker_fees", [True, False]),
 }
 
 REGIME_FILTER_SWEEP = {
@@ -79,10 +79,7 @@ REGIME_FILTER_SWEEP = {
 }
 
 PARAMETER_GROUPS = {
-    "ml_confirmation": ML_CONFIRMATION_SWEEP,
-    "execution_filters": EXECUTION_FILTER_SWEEP,
-    "scalping_exits": SCALPING_EXIT_SWEEP,
-    "regime_filter": REGIME_FILTER_SWEEP,
+    "economic_viability": ECONOMIC_VIABILITY_SWEEP,
 }
 
 
@@ -169,31 +166,10 @@ def generate_parameter_sets(base_settings: Settings, *, max_configs: int | None 
             env_overrides=baseline_env,
         )
     ]
-    grouped_variants: dict[str, list[ParameterSet]] = {}
-    for group_name, group in PARAMETER_GROUPS.items():
-        variants: list[ParameterSet] = []
-        for env_name, (attr_name, values) in group.items():
-            for value in values:
-                overrides = {attr_name: value}
-                env_overrides = {**baseline_env, env_name: value}
-                variants.append(
-                    ParameterSet(
-                        parameter_set_id="",
-                        group=group_name,
-                        description=f"{env_name}={value}",
-                        overrides=overrides,
-                        env_overrides=env_overrides,
-                    )
-                )
-        grouped_variants[group_name] = variants
-
-    ordered_variants: list[ParameterSet] = []
-    max_group_len = max(len(group) for group in grouped_variants.values())
-    for index in range(max_group_len):
-        for group_name in PARAMETER_GROUPS:
-            group = grouped_variants[group_name]
-            if index < len(group):
-                ordered_variants.append(group[index])
+    ordered_variants = _bounded_parameter_variants(
+        _economic_viability_parameter_variants(base_settings, baseline_env),
+        slots=None if max_configs is None or max_configs <= 0 else max(0, max_configs - 1),
+    )
 
     seen = {_parameter_signature(baseline_env)}
     next_index = 1
@@ -215,6 +191,64 @@ def generate_parameter_sets(base_settings: Settings, *, max_configs: int | None 
         if max_configs is not None and max_configs > 0 and len(sets) >= max_configs:
             break
     return sets
+
+
+def _economic_viability_parameter_variants(
+    base_settings: Settings,
+    baseline_env: dict[str, Any],
+) -> list[ParameterSet]:
+    group_name = "economic_viability"
+    group = ECONOMIC_VIABILITY_SWEEP
+    env_names = list(group)
+    attr_names = [group[env_name][0] for env_name in env_names]
+    value_sets = [group[env_name][1] for env_name in env_names]
+    variants: list[ParameterSet] = []
+    for values in product(*value_sets):
+        overrides = dict(zip(attr_names, values, strict=True))
+        env_overrides = {**baseline_env, **dict(zip(env_names, values, strict=True))}
+        candidate_settings = settings_with_overrides(base_settings, overrides)
+        round_trip_cost = estimated_round_trip_execution_cost_pct(candidate_settings)
+        description = (
+            f"TP={candidate_settings.scalping_take_profit_pct} "
+            f"SL={candidate_settings.scalping_stop_loss_pct} "
+            f"horizon={candidate_settings.label_horizon_bars} "
+            f"spread_bps={candidate_settings.max_spread_bps} "
+            f"slippage_bps={candidate_settings.slippage_bps} "
+            f"taker_fees={candidate_settings.backtest_use_taker_fees} "
+            f"round_trip_cost={round_trip_cost:.6f}"
+        )
+        variants.append(
+            ParameterSet(
+                parameter_set_id="",
+                group=group_name,
+                description=description,
+                overrides=overrides,
+                env_overrides=env_overrides,
+            )
+        )
+    return variants
+
+
+def _bounded_parameter_variants(variants: list[ParameterSet], *, slots: int | None) -> list[ParameterSet]:
+    if slots is None or slots <= 0 or slots >= len(variants):
+        return variants
+    if slots == 1:
+        return variants[:1]
+    step = (len(variants) - 1) / (slots - 1)
+    indexes = [round(index * step) for index in range(slots)]
+    selected: list[ParameterSet] = []
+    seen: set[int] = set()
+    for index in indexes:
+        if index not in seen:
+            selected.append(variants[index])
+            seen.add(index)
+    next_index = 0
+    while len(selected) < slots and next_index < len(variants):
+        if next_index not in seen:
+            selected.append(variants[next_index])
+            seen.add(next_index)
+        next_index += 1
+    return selected
 
 
 def evaluate_parameter_set(
@@ -267,6 +301,14 @@ def evaluate_parameter_set(
             and signal_frame["prediction_source"].astype(str).str.lower().str.startswith("fallback").any()
         )
         trade_frequency_violated = _trade_frequency_violates(strategy_trades, settings)
+        round_trip_cost = estimated_round_trip_execution_cost_pct(settings)
+        minimum_take_profit = minimum_take_profit_net_positive_pct(settings)
+        required_return = promotion_required_return_pct(settings)
+        strategy_economics = trade_economics_summary(
+            strategy_trade_details,
+            notional=float(settings.order_notional_usd),
+            required_gross_return_to_overcome_costs=round_trip_cost,
+        )
         rejection_reasons = reject_config(
             strategy_metric,
             settings=settings,
@@ -293,6 +335,19 @@ def evaluate_parameter_set(
             "expectancy": _metric_float(strategy_metric.get("expectancy")),
             "average_trade_net_return": _metric_float(strategy_metric.get("average_net_return_pct")),
             "average_hold_bars": _metric_float(strategy_metric.get("average_hold_bars")),
+            "round_trip_estimated_cost_pct": round_trip_cost,
+            "promotion_required_return_pct": required_return,
+            "minimum_take_profit_net_positive_pct": minimum_take_profit,
+            "scalping_take_profit_covers_cost": settings.scalping_take_profit_pct > minimum_take_profit,
+            "gross_winners_became_net_losers": int(strategy_economics["gross_winners_became_net_losers"]),
+            "average_gross_winning_trade": _metric_float(strategy_economics["average_gross_winning_trade"]),
+            "average_net_winning_trade": _metric_float(strategy_economics["average_net_winning_trade"]),
+            "average_total_execution_cost_pct_per_trade": _metric_float(
+                strategy_economics["average_total_execution_cost_pct_per_trade"]
+            ),
+            "required_gross_return_to_overcome_costs": _metric_float(
+                strategy_economics["required_gross_return_to_overcome_costs"]
+            ),
             "canceled_orders": int(strategy_metric.get("canceled_orders", 0)),
             "ambiguous_candle_ratio": _metric_float(strategy_metric.get("ambiguous_candle_ratio")),
             "blocked_signal_count": int(strategy_metric.get("number_of_blocked_signals", 0)),
@@ -410,6 +465,7 @@ def build_sweep_summary(
             "long_only": True,
             "fallback_trading_allowed": settings.allow_fallback_trading,
             "auto_apply_best_config": False,
+            "diagnostic_only_parameters": ["BACKTEST_USE_TAKER_FEES"],
             "walk_forward_validation": True,
             "csv_path": str(csv_path),
             "summary_path": str(summary_path),
@@ -425,6 +481,7 @@ def build_sweep_summary(
                 "Backtests are historical simulations and do not guarantee future profitability.",
                 "No parameters are auto-applied; use scripts/apply_candidate_config.py to write .env.candidate only.",
                 "Default sweep is bounded and deterministic to reduce overfit pressure.",
+                "BACKTEST_USE_TAKER_FEES is swept only to diagnose economics; conservative promotion remains the default.",
             ],
         }
     )
@@ -542,6 +599,8 @@ def _empty_rejected_row(
     *,
     folds: int,
 ) -> dict[str, Any]:
+    round_trip_cost = estimated_round_trip_execution_cost_pct(settings)
+    minimum_take_profit = minimum_take_profit_net_positive_pct(settings)
     return {
         "parameter_set_id": parameter_set.parameter_set_id,
         "parameter_group": parameter_set.group,
@@ -550,6 +609,15 @@ def _empty_rejected_row(
         **_all_env_values(settings),
         **_zero_strategy_metric(),
         "average_trade_net_return": 0.0,
+        "round_trip_estimated_cost_pct": round_trip_cost,
+        "promotion_required_return_pct": promotion_required_return_pct(settings),
+        "minimum_take_profit_net_positive_pct": minimum_take_profit,
+        "scalping_take_profit_covers_cost": settings.scalping_take_profit_pct > minimum_take_profit,
+        "gross_winners_became_net_losers": 0,
+        "average_gross_winning_trade": 0.0,
+        "average_net_winning_trade": 0.0,
+        "average_total_execution_cost_pct_per_trade": 0.0,
+        "required_gross_return_to_overcome_costs": round_trip_cost,
         "blocked_signal_count": 0,
         "top_block_reason": reason,
         "train_period": "unavailable",
@@ -692,6 +760,15 @@ def _csv_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
         "expectancy",
         "average_trade_net_return",
         "average_hold_bars",
+        "round_trip_estimated_cost_pct",
+        "promotion_required_return_pct",
+        "minimum_take_profit_net_positive_pct",
+        "scalping_take_profit_covers_cost",
+        "gross_winners_became_net_losers",
+        "average_gross_winning_trade",
+        "average_net_winning_trade",
+        "average_total_execution_cost_pct_per_trade",
+        "required_gross_return_to_overcome_costs",
         "canceled_orders",
         "ambiguous_candle_ratio",
         "blocked_signal_count",

@@ -10,6 +10,8 @@ from app.strategy.scalping_decision_engine import ScalpingDecisionEngine
 from scripts.apply_candidate_config import write_candidate_config
 from scripts.sweep_strategy_params import (
     build_sweep_summary,
+    generate_parameter_sets,
+    parameter_space,
     reject_config,
     settings_with_overrides,
     write_sweep_outputs,
@@ -93,6 +95,8 @@ def test_parameter_sweep_writes_csv_and_json_without_modifying_env(tmp_path):
     assert summary_path.exists()
     assert "strategy_name,parameter_set_id" in csv_path.read_text(encoding="utf-8")
     assert "best_candidate_configs" in summary_path.read_text(encoding="utf-8")
+    assert summary["auto_apply_best_config"] is False
+    assert summary["diagnostic_only_parameters"] == ["BACKTEST_USE_TAKER_FEES"]
     assert env_path.read_text(encoding="utf-8") == "TRADING_ENABLED=false\n"
 
 
@@ -201,6 +205,21 @@ def test_sweep_settings_keep_btc_only_paper_only_and_no_fallback():
     assert settings.auto_trade_enabled is False
     assert settings.allow_fallback_trading is False
     assert settings.max_spread_bps == 8
+
+
+def test_economic_viability_sweep_uses_requested_space_without_auto_apply():
+    settings = _settings()
+    space = parameter_space()["economic_viability"]
+    parameter_sets = generate_parameter_sets(settings, max_configs=12)
+
+    assert space["SCALPING_TAKE_PROFIT_PCT"] == [0.003, 0.005, 0.0075, 0.01]
+    assert space["SCALPING_STOP_LOSS_PCT"] == [0.002, 0.003, 0.005]
+    assert space["LABEL_HORIZON_BARS"] == [6, 10, 15, 30]
+    assert space["MAX_SPREAD_BPS"] == [2, 4, 6]
+    assert space["SLIPPAGE_BPS"] == [2, 5, 10]
+    assert space["BACKTEST_USE_TAKER_FEES"] == [True, False]
+    assert parameter_sets[0].parameter_set_id == "ps_000_baseline"
+    assert any(parameter_set.group == "economic_viability" for parameter_set in parameter_sets[1:])
 
 
 def test_risk_controls_remain_final_authority_for_sweep_settings():
