@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
@@ -17,6 +17,28 @@ class MarketBar(Base):
     low: Mapped[float] = mapped_column(Float)
     close: Mapped[float] = mapped_column(Float)
     volume: Mapped[float] = mapped_column(Float)
+
+
+class CollectedMarketData(Base):
+    __tablename__ = "collected_market_data"
+    __table_args__ = (UniqueConstraint("symbol", "timeframe", "timestamp", name="uq_collected_market_data_bar"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    timeframe: Mapped[str] = mapped_column(String(16), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low: Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float] = mapped_column(Float)
+    bid: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ask: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bid_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ask_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spread_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quote_imbalance: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class Signal(Base):

@@ -109,7 +109,7 @@ class MarketRegimeFilter:
             if regime.regime in {"mean_reverting", "ranging"}:
                 return True, "allowed"
             return False, "regime_not_mean_reverting"
-        if strategy_name == "momentum_breakout":
+        if strategy_name in {"momentum_breakout", "trend_pullback"}:
             if regime.regime == "trending":
                 return True, "allowed"
             return False, "regime_not_trending"

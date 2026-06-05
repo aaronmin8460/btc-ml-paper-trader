@@ -918,6 +918,56 @@ MODEL_PROMOTION_REQUIRE_POSITIVE_NET_RETURN=true
 
 The model does not use account equity as a direct BTC price-prediction feature. Account/equity data is used for risk controls, model evaluation, model promotion/rejection, and dashboard analytics.
 
+## Market Data Collection And Research
+
+Collect BTC/USD paper-only market data without enabling trading:
+
+```bash
+python scripts/collect_market_data.py --timeframes 1Min 5Min 15Min --limit 1500
+```
+
+The collector writes bars and the latest available quote fields to SQLite in `collected_market_data`. It never submits orders, does not require `TRADING_ENABLED=true`, does not require `AUTO_TRADE_ENABLED=true`, and preserves the BTC/USD-only paper-trading scope.
+
+Example cron entry, not installed automatically:
+
+```cron
+*/5 * * * * cd /path/to/btc-ml-paper-trader && /path/to/python scripts/collect_market_data.py --timeframes 1Min 5Min 15Min --limit 500 >> logs/collector_cron.log 2>&1
+```
+
+Example systemd timer files, not installed or enabled automatically:
+
+```ini
+# /etc/systemd/system/btc-ml-market-data.service
+[Unit]
+Description=BTC/USD paper-only market data collection
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/btc-ml-paper-trader
+ExecStart=/path/to/python scripts/collect_market_data.py --timeframes 1Min 5Min 15Min --limit 500
+```
+
+```ini
+# /etc/systemd/system/btc-ml-market-data.timer
+[Unit]
+Description=Run BTC/USD market data collection every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Higher-timeframe research is offline analysis only:
+
+```bash
+python scripts/research_higher_timeframe.py
+```
+
+It tests 5Min and 15Min BTC/USD bars with conservative fee/slippage/spread-aware backtesting. Research output is written to `logs/higher_timeframe_research.csv` and `logs/higher_timeframe_research_summary.json`. No config is auto-applied, no model is auto-promoted, and trading remains disabled.
+
 ## Logs
 
 Structured JSONL events are written to:

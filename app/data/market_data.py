@@ -190,7 +190,7 @@ class MarketDataClient:
                 bars = fetched_bars.tail(desired_limit).reset_index(drop=True)
                 self._set_bars_cache(cache_key, bars)
                 return bars
-        bars = self.synthetic_btc_bars(limit=desired_limit)
+        bars = self.synthetic_btc_bars(limit=desired_limit, timeframe=timeframe)
         _log_bars_fetched(
             symbol=symbol,
             timeframe=timeframe,
@@ -349,9 +349,10 @@ class MarketDataClient:
             pass
 
     @staticmethod
-    def synthetic_btc_bars(limit: int = 1200) -> pd.DataFrame:
+    def synthetic_btc_bars(limit: int = 1200, timeframe: str = "15Min") -> pd.DataFrame:
         rng = np.random.default_rng(42)
-        ts = pd.date_range(end=pd.Timestamp.now(tz="UTC").floor("15min"), periods=limit, freq="15min")
+        freq = _pandas_frequency(timeframe)
+        ts = pd.date_range(end=pd.Timestamp.now(tz="UTC").floor(freq), periods=limit, freq=freq)
         returns = rng.normal(0.00015, 0.006, size=limit)
         close = 65000 * np.exp(np.cumsum(returns))
         spread = close * rng.uniform(0.0005, 0.004, size=limit)
@@ -363,6 +364,18 @@ class MarketDataClient:
         return pd.DataFrame(
             {"timestamp": ts, "open": open_, "high": high, "low": low, "close": close, "volume": volume}
         )
+
+
+def _pandas_frequency(timeframe: str) -> str:
+    duration = parse_timeframe_duration(timeframe)
+    seconds = int(duration.total_seconds())
+    if seconds % 86_400 == 0:
+        return f"{seconds // 86_400}D"
+    if seconds % 3_600 == 0:
+        return f"{seconds // 3_600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}min"
+    raise ValueError(f"Unsupported synthetic timeframe: {timeframe!r}")
 
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
