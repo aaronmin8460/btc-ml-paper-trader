@@ -76,6 +76,7 @@ class ScalpingDecisionEngine:
         if position.has_position:
             return self._decide_exit(
                 symbol=symbol,
+                prediction=prediction,
                 position=position,
                 market=market,
                 sell_probability=sell_probability,
@@ -315,6 +316,7 @@ class ScalpingDecisionEngine:
         self,
         *,
         symbol: str,
+        prediction: dict,
         position: PositionState,
         market: ScalpingMarketState,
         sell_probability: float,
@@ -352,6 +354,8 @@ class ScalpingDecisionEngine:
             sell_probability >= self.settings.scalping_sell_probability_floor
             and sell_probability - buy_probability >= self.settings.scalping_exit_confidence_gap_required
         ):
+            if _model_unavailable(prediction):
+                return Decision(symbol, "hold", "model_unavailable")
             return self._sell_decision(
                 symbol=symbol,
                 position=position,

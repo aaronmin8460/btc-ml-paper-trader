@@ -11,6 +11,10 @@ from app.ml.registry import ModelRegistry
 from app.ml.training_diagnostics import (
     build_training_dataset_with_diagnostics,
     buy_positive_label_guard_failed,
+    conservative_promotion_label_config,
+    current_production_scalping_label_config,
+    required_exit_return_pct,
+    training_scalping_label_config,
 )
 from app.ml.validation import promotion_decision, walk_forward_validate
 from app.monitoring.logger import get_logger
@@ -106,6 +110,8 @@ def train_model_from_bars(
         min_backtest_trades=settings.min_backtest_trades,
         max_ambiguous_candle_ratio=settings.max_backtest_ambiguous_candle_ratio,
         require_positive_net_return=settings.model_promotion_require_positive_net_return,
+        min_buy_positive_labels=settings.min_buy_positive_labels,
+        min_buy_positive_label_pct=settings.min_buy_positive_label_pct,
     )
     metrics["promotion_reason"] = reason
     version = datetime.now(UTC).strftime("btc_model_%Y%m%dT%H%M%SZ")
@@ -190,16 +196,52 @@ def _backtest_fee_bps(settings: Settings) -> float:
 
 def dataset_metadata(settings: Settings, *, feature_columns: list[str]) -> dict:
     scalping_mode_enabled = settings.scalping_mode_enabled
+    training_label_config = training_scalping_label_config(settings) if scalping_mode_enabled else None
+    production_label_config = current_production_scalping_label_config(settings) if scalping_mode_enabled else None
+    promotion_label_config = conservative_promotion_label_config(settings) if scalping_mode_enabled else None
     return {
         "feature_set_name": "scalping_bar_features_v1" if scalping_mode_enabled else "legacy_bar_features_v1",
         "feature_columns": list(feature_columns),
-        "horizon_bars": settings.scalping_label_horizon_bars if scalping_mode_enabled else 12,
+        "horizon_bars": settings.label_horizon_bars if scalping_mode_enabled else 12,
         "take_profit_pct": settings.scalping_label_take_profit_pct if scalping_mode_enabled else settings.take_profit_pct,
         "stop_loss_pct": settings.scalping_label_stop_loss_pct if scalping_mode_enabled else settings.stop_loss_pct,
-        "fee_bps_per_side": _backtest_fee_bps(settings),
-        "slippage_bps_per_side": settings.slippage_bps,
-        "spread_cost_pct": (settings.max_spread_bps / 10_000) if scalping_mode_enabled else 0.0,
-        "min_net_profit_pct": settings.scalping_label_min_net_profit_pct if scalping_mode_enabled else 0.0,
+        "fee_bps_per_side": settings.label_fee_bps_per_side if scalping_mode_enabled else 0.0,
+        "slippage_bps_per_side": settings.label_slippage_bps_per_side if scalping_mode_enabled else 0.0,
+        "spread_cost_pct": (settings.label_spread_bps / 10_000) if scalping_mode_enabled else 0.0,
+        "min_net_profit_pct": settings.label_min_net_profit_pct if scalping_mode_enabled else 0.0,
+        "entry_target_col": "buy_quality_label",
+        "exit_target_col": "exit_quality_label",
+        "sell_quality_label_semantics": "compatibility alias for exit_quality_label; closes existing long only",
+        "training_label_assumptions": _label_config_metadata(training_label_config),
+        "current_production_label_assumptions": _label_config_metadata(production_label_config),
+        "conservative_promotion_assumptions": _label_config_metadata(promotion_label_config),
+        "promotion_backtest_costs": {
+            "fee_bps_per_side": _backtest_fee_bps(settings),
+            "slippage_bps_per_side": settings.slippage_bps,
+            "max_spread_bps": settings.max_spread_bps,
+            "min_net_return_pct": settings.min_backtest_net_return_pct,
+            "min_profit_factor_net": settings.min_backtest_profit_factor,
+            "min_trades": settings.min_backtest_trades,
+        },
+    }
+
+
+def _label_config_metadata(config) -> dict | None:
+    if config is None:
+        return None
+    return {
+        "name": config.name,
+        "horizon_bars": config.horizon_bars,
+        "take_profit_pct": config.take_profit_pct,
+        "stop_loss_pct": config.stop_loss_pct,
+        "trailing_stop_pct": config.trailing_stop_pct,
+        "trailing_stop_arm_profit_pct": config.trailing_stop_arm_profit_pct,
+        "fee_bps_per_side": config.fee_bps_per_side,
+        "slippage_bps_per_side": config.slippage_bps_per_side,
+        "spread_bps": config.spread_cost_pct * 10_000,
+        "min_net_exit_profit_pct": config.min_net_exit_profit_pct,
+        "exit_profit_buffer_bps": config.exit_profit_buffer_bps,
+        "estimated_required_exit_return_pct": required_exit_return_pct(config),
     }
 
 

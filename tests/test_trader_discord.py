@@ -762,6 +762,22 @@ async def test_duplicate_order_lock_blocks_concurrent_attempt(trader_factory):
 
 
 @pytest.mark.anyio
+async def test_sell_signal_without_position_is_blocked_before_order(trader_factory):
+    settings = Settings(_env_file=None, trading_enabled=True)
+    trader = trader_factory(settings=settings, decision=Decision("BTC/USD", "sell", "ml_sell_signal", qty=0.01))
+
+    decision, acquired = await trader._guard_order_decision(
+        Decision("BTC/USD", "sell", "ml_sell_signal", qty=0.01),
+        PositionState(),
+        latest_bar_timestamp="2026-05-29T12:00:00+00:00",
+    )
+
+    assert acquired is False
+    assert decision.action == "hold"
+    assert decision.reason == "sell_without_position"
+
+
+@pytest.mark.anyio
 async def test_duplicate_buy_on_same_latest_bar_is_blocked(trader_factory):
     settings = Settings(_env_file=None, trading_enabled=True)
     first = Decision("BTC/USD", "buy", "scalping_dip_entry", notional=25)

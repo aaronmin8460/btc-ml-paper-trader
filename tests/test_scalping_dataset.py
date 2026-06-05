@@ -27,24 +27,23 @@ def test_scalping_dataset_horizon_is_configurable():
     one_bar_dataset = build_training_dataset(
         bars,
         scalping_mode_enabled=True,
-        scalping_label_horizon_bars=1,
+        label_horizon_bars=1,
     )
-    three_bar_dataset = build_training_dataset(
+    six_bar_dataset = build_training_dataset(
         bars,
         scalping_mode_enabled=True,
-        scalping_label_horizon_bars=3,
+        label_horizon_bars=6,
     )
 
-    assert len(one_bar_dataset) == len(three_bar_dataset) + 2
+    assert len(one_bar_dataset) == len(six_bar_dataset) + 5
 
 
-@pytest.mark.parametrize("horizon_bars", [0, 4])
-def test_scalping_dataset_rejects_non_scalping_horizons(horizon_bars):
-    with pytest.raises(ValueError, match="between 1 and 3"):
+def test_scalping_dataset_rejects_non_positive_label_horizon():
+    with pytest.raises(ValueError, match="positive"):
         build_training_dataset(
             MarketDataClient.synthetic_btc_bars(180),
             scalping_mode_enabled=True,
-            scalping_label_horizon_bars=horizon_bars,
+            label_horizon_bars=0,
         )
 
 
@@ -68,7 +67,9 @@ def test_scalping_ambiguous_candle_resolves_to_stop_loss_first():
     )
 
     assert int(labeled.loc[0, "buy_quality_label"]) == 0
+    assert int(labeled.loc[0, "exit_quality_label"]) == 1
     assert int(labeled.loc[0, "sell_quality_label"]) == 1
+    assert labeled.loc[0, "exit_quality_label"] == labeled.loc[0, "sell_quality_label"]
     assert labeled.loc[0, "buy_exit_reason"] == "ambiguous_stop_first"
 
 

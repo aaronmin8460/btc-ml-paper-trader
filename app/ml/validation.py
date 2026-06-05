@@ -5,6 +5,7 @@ import pandas as pd
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
 from app.data.feature_engineering import BAR_FEATURE_COLUMNS
+from app.ml.labels import EXIT_QUALITY_LABEL, SELL_QUALITY_LABEL
 from app.ml.model import MLSignalModel
 
 
@@ -58,7 +59,8 @@ def walk_forward_validate(
     sell_threshold: float = 0.55,
 ) -> dict:
     feature_columns = feature_columns or BAR_FEATURE_COLUMNS
-    sell_class_balance = _normalized_class_balance(df["sell_quality_label"]) if "sell_quality_label" in df else {}
+    exit_target_col = _exit_target_column(df)
+    sell_class_balance = _normalized_class_balance(df[exit_target_col]) if exit_target_col else {}
     if len(df) < min_train_rows:
         return {"valid": False, "reason": "not_enough_rows", "rows": len(df), "sell_class_balance": sell_class_balance}
     class_counts = _class_counts(df["buy_quality_label"])
@@ -97,7 +99,7 @@ def walk_forward_validate(
         validation_frames.append(frame)
         if model.supports_independent_sell_probability:
             sell_probs = model.predict_sell_proba(valid)
-            all_sell_y.extend(valid["sell_quality_label"].astype(int).tolist())
+            all_sell_y.extend(valid[_exit_target_column(valid) or exit_target_col].astype(int).tolist())
             all_sell_p.extend(sell_probs.tolist())
         else:
             skipped_sell_folds += 1
@@ -153,9 +155,15 @@ def promotion_decision(
     min_backtest_trades: int = 30,
     max_ambiguous_candle_ratio: float = 0.10,
     require_positive_net_return: bool = False,
+    min_buy_positive_labels: int = 0,
+    min_buy_positive_label_pct: float = 0.0,
 ) -> tuple[bool, str]:
     if not metrics or metrics.get("validation_rows", 0) < min(50, min_rows):
         return False, "validation_rows_too_low"
+    if int(metrics.get("buy_positive_label_count", 0)) < int(min_buy_positive_labels):
+        return False, "buy_positive_labels_too_low"
+    if float(metrics.get("buy_positive_label_pct", 0.0)) < float(min_buy_positive_label_pct):
+        return False, "buy_positive_labels_too_low"
     if metrics.get("precision", 0) < min_precision:
         return False, "precision_below_threshold"
     if metrics.get("profit_factor", 0) <= 1.05:
@@ -170,7 +178,7 @@ def promotion_decision(
         return False, "not_enough_backtest_trades"
     if trades / rows > max_trade_fraction:
         return False, "too_many_trades"
-    if metrics.get("fee_aware_backtest_valid") is False:
+    if metrics.get("fee_aware_backtest_valid") is not True:
         return False, metrics.get("fee_aware_backtest_reason") or "fee_aware_backtest_invalid"
     ambiguous_candle_ratio = _metric_float(metrics.get("ambiguous_candle_ratio", 0.0))
     if ambiguous_candle_ratio is None:
@@ -207,6 +215,14 @@ def _class_counts(values: pd.Series) -> dict[int, int]:
 def _normalized_class_balance(values: pd.Series) -> dict[int, float]:
     counts = values.astype(int).value_counts(normalize=True).sort_index()
     return {int(label): float(fraction) for label, fraction in counts.items()}
+
+
+def _exit_target_column(df: pd.DataFrame) -> str | None:
+    if EXIT_QUALITY_LABEL in df.columns:
+        return EXIT_QUALITY_LABEL
+    if SELL_QUALITY_LABEL in df.columns:
+        return SELL_QUALITY_LABEL
+    return None
 
 
 def _sell_precision(labels: list[int], probabilities: list[float], *, threshold: float) -> float | None:

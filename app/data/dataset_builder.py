@@ -2,9 +2,9 @@ import pandas as pd
 
 from app.data.feature_engineering import BAR_FEATURE_COLUMNS, add_features
 from app.data.scalping_features import SCALPING_BAR_FEATURE_COLUMNS, build_scalping_features
-from app.ml.labels import net_profit_scalping_labels, triple_barrier_labels
+from app.ml.labels import BUY_QUALITY_LABEL, EXIT_QUALITY_LABEL, net_profit_scalping_labels, triple_barrier_labels
 
-ML_TARGET_COLUMNS = ["buy_quality_label", "sell_quality_label"]
+ML_TARGET_COLUMNS = [BUY_QUALITY_LABEL, EXIT_QUALITY_LABEL]
 
 
 def build_training_dataset(
@@ -12,6 +12,7 @@ def build_training_dataset(
     *,
     horizon_bars: int = 12,
     scalping_label_horizon_bars: int = 3,
+    label_horizon_bars: int | None = None,
     take_profit_pct: float = 0.03,
     stop_loss_pct: float = 0.015,
     scalping_mode_enabled: bool = False,
@@ -24,12 +25,13 @@ def build_training_dataset(
     exit_profit_buffer_bps: float = 0.0,
 ) -> pd.DataFrame:
     if scalping_mode_enabled:
-        if not 1 <= scalping_label_horizon_bars <= 3:
-            raise ValueError("scalping_label_horizon_bars must be between 1 and 3")
+        effective_horizon_bars = label_horizon_bars if label_horizon_bars is not None else scalping_label_horizon_bars
+        if effective_horizon_bars <= 0:
+            raise ValueError("label horizon must be positive")
         featured = build_scalping_features(bars)
         labeled = net_profit_scalping_labels(
             featured,
-            horizon_bars=scalping_label_horizon_bars,
+            horizon_bars=effective_horizon_bars,
             take_profit_pct=take_profit_pct,
             stop_loss_pct=stop_loss_pct,
             trailing_stop_pct=trailing_stop_pct,

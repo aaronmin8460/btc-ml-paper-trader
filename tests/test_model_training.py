@@ -183,12 +183,12 @@ def test_training_rejects_when_trainable_rows_are_below_min_training_rows(tmp_pa
         min_buy_positive_label_pct=0.0,
         model_dir=str(tmp_path),
         scalping_mode_enabled=True,
-        taker_fee_bps=0,
-        slippage_bps=0,
-        max_spread_bps=0,
+        label_fee_bps_per_side=0,
+        label_slippage_bps_per_side=0,
+        label_spread_bps=0,
         scalping_label_take_profit_pct=0.0001,
         scalping_label_stop_loss_pct=0.01,
-        scalping_label_min_net_profit_pct=0.0,
+        label_min_net_profit_pct=0.0,
         exit_profit_buffer_bps=0,
     )
 
@@ -215,6 +215,8 @@ def _passing_metrics(**overrides):
         "profit_factor_net": 1.2,
         "fee_aware_backtest_valid": True,
         "promotion_reason": "accepted",
+        "buy_positive_label_count": 60,
+        "buy_positive_label_pct": 0.04,
     }
     metrics.update(overrides)
     return metrics
@@ -236,6 +238,44 @@ def test_model_rejected_when_precision_passes_but_net_return_is_negative():
 
     assert accepted is False
     assert reason == "model_not_profitable_after_costs"
+
+
+def test_model_rejected_when_fee_aware_backtest_does_not_pass():
+    accepted, reason = promotion_decision(
+        _passing_metrics(fee_aware_backtest_valid=False, fee_aware_backtest_reason="no_filled_trades"),
+        min_rows=100,
+        min_precision=0.52,
+        max_drawdown=0.2,
+        max_trade_fraction=0.4,
+        min_net_return_pct=0.001,
+        max_backtest_drawdown_pct=0.01,
+        min_backtest_profit_factor=1.2,
+        min_backtest_trades=30,
+        require_positive_net_return=True,
+    )
+
+    assert accepted is False
+    assert reason == "no_filled_trades"
+
+
+def test_model_rejected_when_buy_positive_label_floor_is_not_met():
+    accepted, reason = promotion_decision(
+        _passing_metrics(buy_positive_label_count=49, buy_positive_label_pct=0.04),
+        min_rows=100,
+        min_precision=0.52,
+        max_drawdown=0.2,
+        max_trade_fraction=0.4,
+        min_net_return_pct=0.001,
+        max_backtest_drawdown_pct=0.01,
+        min_backtest_profit_factor=1.2,
+        min_backtest_trades=30,
+        require_positive_net_return=True,
+        min_buy_positive_labels=50,
+        min_buy_positive_label_pct=0.03,
+    )
+
+    assert accepted is False
+    assert reason == "buy_positive_labels_too_low"
 
 
 def test_model_rejected_when_backtest_drawdown_is_too_high():
@@ -331,6 +371,45 @@ def test_scalping_labels_accept_take_profit_that_covers_costs():
     assert labeled.loc[0, "buy_exit_return_pct"] >= 0.0105
 
 
+def test_training_label_generation_can_be_less_strict_than_promotion_assumptions():
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(datetime(2026, 5, 27, tzinfo=UTC), periods=6, freq="min"),
+            "open": [100.0] * 6,
+            "high": [100.0, 100.35, 100.20, 100.10, 100.05, 100.0],
+            "low": [100.0] * 6,
+            "close": [100.0] * 6,
+            "volume": [1.0] * 6,
+        }
+    )
+
+    training_labeled = net_profit_scalping_labels(
+        bars,
+        horizon_bars=3,
+        take_profit_pct=0.0012,
+        stop_loss_pct=0.001,
+        fee_bps_per_side=15,
+        slippage_bps_per_side=0,
+        spread_cost_pct=0,
+        min_net_exit_profit_pct=0,
+        exit_profit_buffer_bps=0,
+    )
+    promotion_labeled = net_profit_scalping_labels(
+        bars,
+        horizon_bars=3,
+        take_profit_pct=0.0012,
+        stop_loss_pct=0.001,
+        fee_bps_per_side=25,
+        slippage_bps_per_side=10,
+        spread_cost_pct=0.0005,
+        min_net_exit_profit_pct=0.001,
+        exit_profit_buffer_bps=0,
+    )
+
+    assert int(training_labeled.loc[0, "buy_quality_label"]) == 1
+    assert int(promotion_labeled.loc[0, "buy_quality_label"]) == 0
+
+
 def test_scalping_dataset_does_not_train_on_runtime_quote_filters():
     bars = MarketDataClient.synthetic_btc_bars(140)
     dataset = build_training_dataset(
@@ -359,12 +438,15 @@ def test_scalping_dataset_metadata_records_short_horizon_and_costs():
     settings = Settings(
         _env_file=None,
         scalping_mode_enabled=True,
-        scalping_label_horizon_bars=2,
+        label_horizon_bars=6,
         scalping_label_take_profit_pct=0.0014,
         scalping_label_stop_loss_pct=0.0009,
-        scalping_label_min_net_profit_pct=0.0003,
-        taker_fee_bps=17,
-        slippage_bps=4,
+        label_fee_bps_per_side=7,
+        label_slippage_bps_per_side=2,
+        label_spread_bps=1,
+        label_min_net_profit_pct=0.0003,
+        taker_fee_bps=25,
+        slippage_bps=10,
         max_spread_bps=6,
     )
 
@@ -372,13 +454,18 @@ def test_scalping_dataset_metadata_records_short_horizon_and_costs():
 
     assert metadata["feature_set_name"] == "scalping_bar_features_v1"
     assert metadata["feature_columns"] == SCALPING_BAR_FEATURE_COLUMNS
-    assert metadata["horizon_bars"] == 2
+    assert metadata["horizon_bars"] == 6
     assert metadata["take_profit_pct"] == 0.0014
     assert metadata["stop_loss_pct"] == 0.0009
-    assert metadata["fee_bps_per_side"] == 17
-    assert metadata["slippage_bps_per_side"] == 4
-    assert metadata["spread_cost_pct"] == 0.0006
+    assert metadata["fee_bps_per_side"] == 7
+    assert metadata["slippage_bps_per_side"] == 2
+    assert metadata["spread_cost_pct"] == 0.0001
     assert metadata["min_net_profit_pct"] == 0.0003
+    assert metadata["entry_target_col"] == "buy_quality_label"
+    assert metadata["exit_target_col"] == "exit_quality_label"
+    assert metadata["promotion_backtest_costs"]["fee_bps_per_side"] == 25
+    assert metadata["promotion_backtest_costs"]["slippage_bps_per_side"] == 10
+    assert metadata["promotion_backtest_costs"]["max_spread_bps"] == 6
 
 
 def test_registry_records_independent_sell_probability_support(tmp_path):

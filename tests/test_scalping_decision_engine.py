@@ -183,15 +183,47 @@ def test_scalping_stale_data_reduces_open_position_conservatively():
 
 
 def test_scalping_sell_model_probability_can_close_position():
+    position = PositionState(qty=0.1, avg_entry_price=100.0, highest_price=100.0)
     decision = ScalpingDecisionEngine(_settings()).decide(
         prediction=_prediction(buy_probability=0.1, sell_probability=0.8),
         feature_row=_feature_row(),
-        position=PositionState(qty=0.1, avg_entry_price=100.0, highest_price=100.0),
+        position=position,
         now=NOW,
     )
 
     assert decision.action == "sell"
     assert decision.reason == "scalping_model_sell_signal"
+    assert decision.qty == position.qty
+
+
+def test_scalping_sell_signal_without_position_holds_instead_of_shorting():
+    decision = ScalpingDecisionEngine(_settings()).decide(
+        prediction=_prediction(buy_probability=0.1, sell_probability=0.9),
+        feature_row=_feature_row(),
+        position=PositionState(),
+        trading_enabled=True,
+        now=NOW,
+    )
+
+    assert decision.action == "hold"
+    assert decision.qty is None
+
+
+def test_fallback_sell_probability_cannot_trigger_soft_auto_exit():
+    decision = ScalpingDecisionEngine(_settings()).decide(
+        prediction=_prediction(
+            buy_probability=0.1,
+            sell_probability=0.9,
+            model_available=False,
+            prediction_source="fallback",
+        ),
+        feature_row=_feature_row(),
+        position=PositionState(qty=0.1, avg_entry_price=100.0, highest_price=100.0),
+        now=NOW,
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "model_unavailable"
 
 
 def test_scalping_unfavorable_quote_can_close_position():
@@ -239,6 +271,44 @@ def test_scalping_profit_guard_does_not_block_emergency_stop_loss():
 
     assert decision.action == "sell"
     assert decision.reason == "scalping_emergency_stop_loss"
+
+
+def test_scalping_profit_guard_blocks_soft_model_exit_at_loss():
+    decision = ScalpingDecisionEngine(
+        _settings(
+            scalping_profit_guard_enabled=True,
+            profit_only_exit_enabled=True,
+            scalping_take_profit_pct=0.01,
+        )
+    ).decide(
+        prediction=_prediction(buy_probability=0.1, sell_probability=0.9),
+        feature_row=_feature_row(close=99.9),
+        position=PositionState(qty=0.1, avg_entry_price=100.0, highest_price=100.0),
+        now=NOW,
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "profit_guard_holding_until_profitable"
+
+
+def test_scalping_hard_stop_loss_bypasses_profit_guard():
+    decision = ScalpingDecisionEngine(
+        _settings(
+            scalping_profit_guard_enabled=True,
+            profit_only_exit_enabled=True,
+            scalping_stop_loss_pct=0.002,
+            emergency_stop_loss_pct=0.01,
+            scalping_take_profit_pct=0.01,
+        )
+    ).decide(
+        prediction=_prediction(),
+        feature_row=_feature_row(close=99.7),
+        position=PositionState(qty=0.1, avg_entry_price=100.0, highest_price=100.0),
+        now=NOW,
+    )
+
+    assert decision.action == "sell"
+    assert decision.reason == "scalping_stop_loss"
 
 
 def test_trader_selects_scalping_engine_only_when_scalping_mode_is_enabled():

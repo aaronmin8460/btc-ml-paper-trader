@@ -15,7 +15,10 @@ from app.ml.validation import walk_forward_validate
 
 async def run_backtest() -> dict:
     settings = get_settings()
-    bars = await MarketDataClient(settings).fetch_bars(settings.symbol, limit=max(1500, settings.min_training_rows + 500))
+    bars = await MarketDataClient(settings).fetch_bars(
+        settings.symbol,
+        limit=max(settings.lookback_bars, 1500, settings.min_training_rows + 500),
+    )
     take_profit_pct = settings.scalping_label_take_profit_pct if settings.scalping_mode_enabled else settings.take_profit_pct
     stop_loss_pct = settings.scalping_label_stop_loss_pct if settings.scalping_mode_enabled else settings.stop_loss_pct
     threshold = settings.scalping_buy_probability_floor if settings.scalping_mode_enabled else settings.min_buy_probability
@@ -23,16 +26,17 @@ async def run_backtest() -> dict:
     dataset = build_training_dataset(
         bars,
         scalping_label_horizon_bars=settings.scalping_label_horizon_bars,
+        label_horizon_bars=settings.label_horizon_bars if settings.scalping_mode_enabled else None,
         take_profit_pct=take_profit_pct,
         stop_loss_pct=stop_loss_pct,
         scalping_mode_enabled=settings.scalping_mode_enabled,
         trailing_stop_pct=settings.scalping_trailing_stop_pct if settings.scalping_mode_enabled else settings.trailing_stop_pct,
         trailing_stop_arm_profit_pct=settings.trailing_stop_arm_profit_pct,
-        fee_bps_per_side=settings.taker_fee_bps if settings.backtest_use_taker_fees else settings.maker_fee_bps,
-        slippage_bps_per_side=settings.slippage_bps,
-        spread_cost_pct=(settings.max_spread_bps / 10_000) if settings.scalping_mode_enabled else 0.0,
-        min_net_exit_profit_pct=settings.scalping_label_min_net_profit_pct if settings.scalping_mode_enabled else 0.0,
-        exit_profit_buffer_bps=settings.exit_profit_buffer_bps if settings.scalping_mode_enabled else 0.0,
+        fee_bps_per_side=settings.label_fee_bps_per_side if settings.scalping_mode_enabled else 0.0,
+        slippage_bps_per_side=settings.label_slippage_bps_per_side if settings.scalping_mode_enabled else 0.0,
+        spread_cost_pct=(settings.label_spread_bps / 10_000) if settings.scalping_mode_enabled else 0.0,
+        min_net_exit_profit_pct=settings.label_min_net_profit_pct if settings.scalping_mode_enabled else 0.0,
+        exit_profit_buffer_bps=0.0,
     )
     metrics = walk_forward_validate(
         dataset,

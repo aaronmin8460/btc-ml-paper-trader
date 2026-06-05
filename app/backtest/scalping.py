@@ -667,7 +667,7 @@ def _hold_bars(row: pd.Series, settings: Settings) -> float:
     value = _row_positive_float(row, "buy_hold_bars", "hold_bars")
     if value is not None:
         return value
-    return float(settings.scalping_label_horizon_bars if settings.scalping_mode_enabled else 12)
+    return float(settings.label_horizon_bars if settings.scalping_mode_enabled else 12)
 
 
 def _row_positive_float(row: pd.Series, *names: str) -> float | None:

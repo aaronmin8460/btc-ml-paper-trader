@@ -11,6 +11,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from app.ml.labels import BUY_QUALITY_LABEL, EXIT_QUALITY_LABEL, SELL_QUALITY_LABEL
+
 
 @dataclass
 class MLSignalModel:
@@ -23,8 +25,8 @@ class MLSignalModel:
     def train(
         self,
         df: pd.DataFrame,
-        target_col: str = "buy_quality_label",
-        sell_target_col: str = "sell_quality_label",
+        target_col: str = BUY_QUALITY_LABEL,
+        sell_target_col: str = EXIT_QUALITY_LABEL,
         tuned_params: dict[str, dict] | None = None,
         model_version: str | None = None,
     ) -> "MLSignalModel":
@@ -33,10 +35,11 @@ class MLSignalModel:
         tuned_params = tuned_params or {}
         self.models = _fit_ensemble(x, buy_y, tuned_params=tuned_params)
         self.sell_models = {}
+        exit_target_col = _resolve_exit_target_col(df, sell_target_col)
         target_class_balances = {target_col: _class_balance(buy_y)}
-        if sell_target_col in df.columns:
-            sell_y = df[sell_target_col].astype(int)
-            target_class_balances[sell_target_col] = _class_balance(sell_y)
+        if exit_target_col is not None:
+            sell_y = df[exit_target_col].astype(int)
+            target_class_balances[exit_target_col] = _class_balance(sell_y)
             if sell_y.nunique() >= 2:
                 self.sell_models = _fit_ensemble(x, sell_y, tuned_params=tuned_params)
         self.metadata.update(
@@ -44,7 +47,10 @@ class MLSignalModel:
                 "trained_at": datetime.now(UTC).isoformat(),
                 "rows": int(len(df)),
                 "target_col": target_col,
-                "sell_target_col": sell_target_col,
+                "entry_target_col": target_col,
+                "exit_target_col": exit_target_col,
+                "sell_target_col": exit_target_col,
+                "sell_label_semantics": "exit_existing_long_position",
                 "class_balance": target_class_balances[target_col],
                 "target_class_balances": target_class_balances,
                 "feature_columns": list(self.feature_columns),
@@ -131,7 +137,17 @@ def _class_balance(values: pd.Series) -> dict[int, float]:
     return {int(label): float(fraction) for label, fraction in values.value_counts(normalize=True).sort_index().items()}
 
 
-def tune_tree_params(df: pd.DataFrame, feature_columns: list[str], target_col: str = "buy_quality_label", n_trials: int = 15) -> dict[str, dict]:
+def _resolve_exit_target_col(df: pd.DataFrame, preferred: str) -> str | None:
+    if preferred in df.columns:
+        return preferred
+    if EXIT_QUALITY_LABEL in df.columns:
+        return EXIT_QUALITY_LABEL
+    if SELL_QUALITY_LABEL in df.columns:
+        return SELL_QUALITY_LABEL
+    return None
+
+
+def tune_tree_params(df: pd.DataFrame, feature_columns: list[str], target_col: str = BUY_QUALITY_LABEL, n_trials: int = 15) -> dict[str, dict]:
     try:
         import optuna
         from sklearn.metrics import roc_auc_score

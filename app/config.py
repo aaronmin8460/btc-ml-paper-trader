@@ -96,6 +96,11 @@ class Settings(BaseSettings):
     scalping_label_take_profit_pct: float = 0.0012
     scalping_label_stop_loss_pct: float = 0.0008
     scalping_label_min_net_profit_pct: float = 0.0002
+    label_fee_bps_per_side: float = 15
+    label_slippage_bps_per_side: float = 0
+    label_spread_bps: float = 0
+    label_min_net_profit_pct: float = 0.0
+    label_horizon_bars: int = 6
     scalping_min_momentum_pct: float = -0.0005
     scalping_max_position_seconds: int = 900
     scalping_max_data_age_seconds: int = 120
@@ -225,7 +230,16 @@ class Settings(BaseSettings):
             raise ValueError("PAPER_EXECUTION_MODE must be alpaca_paper or local_simulated.")
         return normalized
 
-    @field_validator("taker_fee_bps", "maker_fee_bps", "slippage_bps", "paper_fee_bps", "paper_slippage_bps")
+    @field_validator(
+        "taker_fee_bps",
+        "maker_fee_bps",
+        "slippage_bps",
+        "paper_fee_bps",
+        "paper_slippage_bps",
+        "label_fee_bps_per_side",
+        "label_slippage_bps_per_side",
+        "label_spread_bps",
+    )
     @classmethod
     def cost_bps_must_be_non_negative(cls, value: float) -> float:
         if value < 0:
@@ -286,6 +300,7 @@ class Settings(BaseSettings):
         "scalping_label_take_profit_pct",
         "scalping_label_stop_loss_pct",
         "scalping_label_min_net_profit_pct",
+        "label_min_net_profit_pct",
         "regime_no_trade_volatility_threshold",
         "regime_no_trade_short_return_threshold",
         "regime_trend_strength_threshold",
@@ -306,11 +321,11 @@ class Settings(BaseSettings):
             raise ValueError("MAX_BACKTEST_AMBIGUOUS_CANDLE_RATIO must not exceed 1.")
         return value
 
-    @field_validator("min_buy_positive_label_pct")
+    @field_validator("min_buy_positive_label_pct", "label_min_net_profit_pct")
     @classmethod
     def min_buy_positive_label_pct_must_not_exceed_one(cls, value: float) -> float:
         if value > 1:
-            raise ValueError("MIN_BUY_POSITIVE_LABEL_PCT must not exceed 1.")
+            raise ValueError("Percentage settings must not exceed 1.")
         return value
 
     @field_validator("scalping_label_horizon_bars")
@@ -318,6 +333,13 @@ class Settings(BaseSettings):
     def scalping_label_horizon_must_be_ultra_short(cls, value: int) -> int:
         if not 1 <= value <= 3:
             raise ValueError("SCALPING_LABEL_HORIZON_BARS must be between 1 and 3.")
+        return value
+
+    @field_validator("label_horizon_bars")
+    @classmethod
+    def label_horizon_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("LABEL_HORIZON_BARS must be positive.")
         return value
 
     @field_validator("alpaca_max_calls_per_minute")

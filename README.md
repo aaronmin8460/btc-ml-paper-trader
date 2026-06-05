@@ -348,6 +348,30 @@ AUTO_TRADE_ENABLED=true
 
 Keep `PAPER_TRADING_ONLY=true`, `SYMBOL=BTC/USD`, and the Alpaca paper API URL unchanged. The scheduler runs every `SCAN_INTERVAL_SECONDS` and calls `Trader.run_once()`.
 
+## Generated File Audit And Cleanup
+
+Audit generated files before deleting anything:
+
+```bash
+python3 scripts/audit_generated_files.py
+```
+
+Run cleanup in dry-run mode. This is the default and deletes nothing:
+
+```bash
+python3 scripts/cleanup_generated_files.py
+```
+
+Apply cleanup only after reviewing the dry-run output:
+
+```bash
+python3 scripts/cleanup_generated_files.py --apply
+```
+
+Cleanup is intentionally narrow. It only removes `.pytest_cache/`, `__pycache__/`, `*.pyc`, `train_*.log`, `train_now.log`, and `app.log`, and it writes `logs/cleanup_report.json`. Never delete `.env`, `data/trading.db`, `data/`, `models/*.joblib`, `models/registry.json`, registry backups, source under `app/`, `scripts/`, or `tests/`, deployment docs, `requirements.txt`, `pyproject.toml`, or this README.
+
+Model files and `models/registry.json` are preserved because they define what model, if any, the paper-trading runtime is allowed to consider active. Deleting or editing them by cleanup script could hide validation failures, break auditability, or make the runtime fall back to invalid/no model behavior.
+
 ## Runtime circuit breaker
 
 The runtime circuit breaker is enabled by default for automatic paper trading:
@@ -419,7 +443,9 @@ python scripts/verify_btc_only.py
 python scripts/train_model.py
 ```
 
-The trainer builds leakage-safe OHLCV features, applies triple-barrier labels, runs walk-forward validation, saves a model under `models/`, and promotes it to `models/registry.json` only if validation metrics pass. It does not fabricate profitability or hardcode a winning backtest.
+The trainer builds leakage-safe OHLCV features, applies entry and long-exit labels, runs walk-forward validation, saves a model under `models/`, and promotes it to `models/registry.json` only if validation metrics pass. Training label assumptions use `LABEL_FEE_BPS_PER_SIDE`, `LABEL_SLIPPAGE_BPS_PER_SIDE`, `LABEL_SPREAD_BPS`, `LABEL_MIN_NET_PROFIT_PCT`, and `LABEL_HORIZON_BARS`; promotion backtests still use conservative execution assumptions from `TAKER_FEE_BPS`, `SLIPPAGE_BPS`, and `MAX_SPREAD_BPS`.
+
+`buy_quality_label` is the long-entry training label. `exit_quality_label` is the long-exit training label. `sell_quality_label` remains as a compatibility alias for `exit_quality_label`; in this long-only bot it means closing an existing BTC/USD long position, never opening a short. Model promotion still requires enough positive buy labels, a passing fee-aware backtest, positive net return above threshold, sufficient net profit factor, and enough trades. It does not fabricate profitability or hardcode a winning backtest.
 
 ## ML Model
 

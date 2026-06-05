@@ -214,6 +214,32 @@ class ModelRegistry:
                 model_version,
                 True,
             ), model
+        if _buy_label_floor_failed(snapshot_metrics, self.settings):
+            return ActiveModelStatus(
+                active_path_str,
+                "rejected",
+                False,
+                "buy_positive_labels_too_low",
+                promotion_reason,
+                net_return,
+                profit_factor_net,
+                number_of_trades,
+                model_version,
+                True,
+            ), model
+        if _metric_bool(snapshot_metrics.get("fee_aware_backtest_valid")) is not True:
+            return ActiveModelStatus(
+                active_path_str,
+                "rejected",
+                False,
+                str(snapshot_metrics.get("fee_aware_backtest_reason") or "fee_aware_backtest_invalid"),
+                promotion_reason,
+                net_return,
+                profit_factor_net,
+                number_of_trades,
+                model_version,
+                True,
+            ), model
         if net_return is None:
             return ActiveModelStatus(
                 active_path_str,
@@ -233,6 +259,19 @@ class ModelRegistry:
                 "rejected",
                 False,
                 "model_not_profitable_after_costs",
+                promotion_reason,
+                net_return,
+                profit_factor_net,
+                number_of_trades,
+                model_version,
+                True,
+            ), model
+        if net_return < self.settings.min_backtest_net_return_pct:
+            return ActiveModelStatus(
+                active_path_str,
+                "rejected",
+                False,
+                "net_return_below_threshold",
                 promotion_reason,
                 net_return,
                 profit_factor_net,
@@ -355,6 +394,30 @@ def _ambiguous_candle_ratio(metrics: Any) -> float | None:
     if not isinstance(metrics, dict):
         return None
     return _metric_float(metrics.get("ambiguous_candle_ratio", 0.0))
+
+
+def _buy_label_floor_failed(metrics: Any, settings: Settings) -> bool:
+    if not isinstance(metrics, dict):
+        return True
+    count = _metric_int(metrics.get("buy_positive_label_count"))
+    pct = _metric_float(metrics.get("buy_positive_label_pct"))
+    if count is None or count < settings.min_buy_positive_labels:
+        return True
+    if pct is None or pct < settings.min_buy_positive_label_pct:
+        return True
+    return False
+
+
+def _metric_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    return None
 
 
 def _metric_float(value: object, *, allow_infinite: bool = False) -> float | None:

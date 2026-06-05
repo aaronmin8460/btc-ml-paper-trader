@@ -90,6 +90,11 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.scalping_label_take_profit_pct == 0.0012
     assert settings.scalping_label_stop_loss_pct == 0.0008
     assert settings.scalping_label_min_net_profit_pct == 0.0002
+    assert settings.label_fee_bps_per_side == 15
+    assert settings.label_slippage_bps_per_side == 0
+    assert settings.label_spread_bps == 0
+    assert settings.label_min_net_profit_pct == 0.0
+    assert settings.label_horizon_bars == 6
     assert settings.scalping_min_momentum_pct == -0.0005
     assert settings.scalping_max_position_seconds == 900
     assert settings.scalping_max_data_age_seconds == 120
@@ -319,6 +324,15 @@ def test_config_still_rejects_unsafe_symbol_and_non_paper_mode():
 
     with pytest.raises(ValueError):
         Settings(_env_file=None, scalping_label_horizon_bars=4)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, label_horizon_bars=0)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, label_fee_bps_per_side=-1)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, label_min_net_profit_pct=1.01)
 
     with pytest.raises(ValueError):
         Settings(_env_file=None, max_backtest_ambiguous_candle_ratio=1.01)

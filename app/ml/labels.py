@@ -2,6 +2,12 @@ import numpy as np
 import pandas as pd
 
 
+ENTRY_QUALITY_LABEL = "entry_quality_label"
+BUY_QUALITY_LABEL = "buy_quality_label"
+EXIT_QUALITY_LABEL = "exit_quality_label"
+SELL_QUALITY_LABEL = "sell_quality_label"
+
+
 def triple_barrier_labels(
     df: pd.DataFrame,
     *,
@@ -10,39 +16,38 @@ def triple_barrier_labels(
     stop_loss_pct: float = 0.015,
 ) -> pd.DataFrame:
     out = df.copy().reset_index(drop=True)
-    labels: list[int | float] = []
-    sell_labels: list[int | float] = []
+    entry_labels: list[int | float] = []
+    exit_labels: list[int | float] = []
     for i in range(len(out)):
         if i + horizon_bars >= len(out):
-            labels.append(np.nan)
-            sell_labels.append(np.nan)
+            entry_labels.append(np.nan)
+            exit_labels.append(np.nan)
             continue
         entry = out.loc[i, "close"]
         tp = entry * (1 + take_profit_pct)
         sl = entry * (1 - stop_loss_pct)
-        label = 0
-        sell_label = 0
+        entry_label = 0
+        exit_label = 0
         future = out.iloc[i + 1 : i + horizon_bars + 1]
         for _, row in future.iterrows():
             hit_tp = row["high"] >= tp
             hit_sl = row["low"] <= sl
             if hit_tp and hit_sl:
-                label = 0
-                sell_label = 1
+                entry_label = 0
+                exit_label = 1
                 break
             if hit_tp:
-                label = 1
-                sell_label = 0
+                entry_label = 1
+                exit_label = 0
                 break
             if hit_sl:
-                label = 0
-                sell_label = 1
+                entry_label = 0
+                exit_label = 1
                 break
-        labels.append(label)
-        sell_labels.append(sell_label)
-    out["buy_quality_label"] = labels
-    out["sell_quality_label"] = sell_labels
-    return out.dropna(subset=["buy_quality_label", "sell_quality_label"]).reset_index(drop=True)
+        entry_labels.append(entry_label)
+        exit_labels.append(exit_label)
+    _assign_entry_exit_label_aliases(out, entry_labels=entry_labels, exit_labels=exit_labels)
+    return out.dropna(subset=[BUY_QUALITY_LABEL, EXIT_QUALITY_LABEL]).reset_index(drop=True)
 
 
 def net_profit_scalping_labels(
@@ -63,25 +68,28 @@ def net_profit_scalping_labels(
         raise ValueError("horizon_bars must be positive")
 
     out = df.copy().reset_index(drop=True)
-    labels: list[int | float] = []
-    sell_labels: list[int | float] = []
+    entry_labels: list[int | float] = []
+    exit_labels: list[int | float] = []
     exit_returns: list[float] = []
     exit_reasons: list[str | None] = []
+    hold_bars: list[int | float] = []
 
     for i in range(len(out)):
         if i + horizon_bars >= len(out):
-            labels.append(np.nan)
-            sell_labels.append(np.nan)
+            entry_labels.append(np.nan)
+            exit_labels.append(np.nan)
             exit_returns.append(np.nan)
             exit_reasons.append(None)
+            hold_bars.append(np.nan)
             continue
 
         entry = float(out.loc[i, "close"])
         if not np.isfinite(entry) or entry <= 0:
-            labels.append(0)
-            sell_labels.append(0)
+            entry_labels.append(0)
+            exit_labels.append(0)
             exit_returns.append(-abs(stop_loss_pct))
             exit_reasons.append("invalid_entry")
+            hold_bars.append(0)
             continue
 
         required_exit_return = _required_net_scalping_exit_return(
@@ -96,13 +104,14 @@ def net_profit_scalping_labels(
         stop_loss_price = entry * (1 - abs(float(stop_loss_pct)))
         take_profit_price = entry * (1 + take_profit_return)
         highest = entry
-        label = 0
-        sell_label = 0
+        entry_label = 0
+        exit_label = 0
         exit_return = -abs(float(stop_loss_pct))
         exit_reason = "no_profitable_exit"
+        bars_to_exit = horizon_bars
 
         future = out.iloc[i + 1 : i + horizon_bars + 1]
-        for _, row in future.iterrows():
+        for offset, (_, row) in enumerate(future.iterrows(), start=1):
             high = float(row["high"])
             low = float(row["low"])
             if not np.isfinite(high) or not np.isfinite(low):
@@ -123,34 +132,52 @@ def net_profit_scalping_labels(
             )
 
             if hit_stop_loss and (hit_take_profit or hit_trailing_exit):
-                sell_label = 1
+                exit_label = 1
                 exit_reason = "ambiguous_stop_first"
+                bars_to_exit = offset
                 break
             if hit_take_profit:
-                label = 1
+                entry_label = 1
                 exit_return = take_profit_return
                 exit_reason = "scalping_take_profit"
+                bars_to_exit = offset
                 break
             if hit_trailing_exit and trailing_exit_return is not None:
-                label = 1
+                entry_label = 1
                 exit_return = trailing_exit_return
                 exit_reason = "scalping_trailing_stop"
+                bars_to_exit = offset
                 break
             if hit_stop_loss:
-                sell_label = 1
+                exit_label = 1
                 exit_reason = "scalping_stop_loss"
+                bars_to_exit = offset
                 break
 
-        labels.append(label)
-        sell_labels.append(sell_label)
+        entry_labels.append(entry_label)
+        exit_labels.append(exit_label)
         exit_returns.append(exit_return)
         exit_reasons.append(exit_reason)
+        hold_bars.append(bars_to_exit)
 
-    out["buy_quality_label"] = labels
-    out["sell_quality_label"] = sell_labels
+    _assign_entry_exit_label_aliases(out, entry_labels=entry_labels, exit_labels=exit_labels)
     out["buy_exit_return_pct"] = exit_returns
     out["buy_exit_reason"] = exit_reasons
-    return out.dropna(subset=["buy_quality_label", "sell_quality_label"]).reset_index(drop=True)
+    out["buy_hold_bars"] = hold_bars
+    return out.dropna(subset=[BUY_QUALITY_LABEL, EXIT_QUALITY_LABEL]).reset_index(drop=True)
+
+
+def _assign_entry_exit_label_aliases(
+    out: pd.DataFrame,
+    *,
+    entry_labels: list[int | float],
+    exit_labels: list[int | float],
+) -> None:
+    out[ENTRY_QUALITY_LABEL] = entry_labels
+    out[BUY_QUALITY_LABEL] = entry_labels
+    out[EXIT_QUALITY_LABEL] = exit_labels
+    # Compatibility alias: in this long-only bot, "sell" means exit an existing long.
+    out[SELL_QUALITY_LABEL] = exit_labels
 
 
 def _required_net_scalping_exit_return(
