@@ -598,7 +598,20 @@ async def test_discord_failure_does_not_interrupt_trading(trader_factory):
 async def test_structured_signal_log_contains_required_observability_fields(trader_factory):
     trader = trader_factory(
         settings=Settings(_env_file=None),
-        decision=Decision("BTC/USD", "hold", "dashboard_test"),
+        decision=Decision(
+            "BTC/USD",
+            "hold",
+            "dashboard_test",
+            blocked_by="ml_filter",
+            block_reason="ml_buy_probability_below_threshold",
+            strategy_name="mean_reversion_scalping",
+            strategy_score=0.62,
+            strategy_confidence=0.74,
+            regime="mean_reverting",
+            ml_confirmation={"passed": False},
+            strategy_candidates=[{"strategy_name": "mean_reversion_scalping", "score": 0.62}],
+            metadata={"entry_reason": "mean_reversion_buy_candidate"},
+        ),
     )
 
     await trader.run_once()
@@ -614,8 +627,22 @@ async def test_structured_signal_log_contains_required_observability_fields(trad
         "quote_age_seconds",
         "buy_probability",
         "sell_probability",
+        "ml_buy_probability",
+        "ml_sell_probability",
         "prediction_source",
         "model_version",
+        "strategy_name",
+        "quant_score",
+        "quant_confidence",
+        "regime",
+        "blocked_by",
+        "block_reason",
+        "candidate_strategy_count",
+        "strategy_candidates",
+        "selected_strategy_signal",
+        "selected_strategy_reason",
+        "ml_confirmation_result",
+        "final_decision",
         "spread_bps",
         "quote_imbalance",
         "momentum",
@@ -626,6 +653,18 @@ async def test_structured_signal_log_contains_required_observability_fields(trad
         "risk_block_reason",
         "api_budget_status",
     }.issubset(signal)
+    assert signal["strategy_name"] == "mean_reversion_scalping"
+    assert signal["quant_score"] == 0.62
+    assert signal["quant_confidence"] == 0.74
+    assert signal["regime"] == "mean_reverting"
+    assert signal["blocked_by"] == "ml_filter"
+    assert signal["block_reason"] == "ml_buy_probability_below_threshold"
+    assert signal["candidate_strategy_count"] == 1
+    assert signal["strategy_candidates"] == [{"strategy_name": "mean_reversion_scalping", "score": 0.62}]
+    assert signal["selected_strategy_signal"]["strategy_name"] == "mean_reversion_scalping"
+    assert signal["selected_strategy_reason"] == "mean_reversion_buy_candidate"
+    assert signal["ml_confirmation_result"] == {"passed": False}
+    assert signal["final_decision"] == "hold"
 
 
 @pytest.mark.anyio

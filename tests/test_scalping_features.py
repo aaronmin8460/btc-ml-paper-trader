@@ -33,6 +33,17 @@ def test_scalping_features_never_contain_infinite_values():
     assert not np.isinf(numeric).any()
 
 
+def test_scalping_volume_acceleration_is_finite_after_zero_previous_volume():
+    bars = MarketDataClient.synthetic_btc_bars(40)
+    bars.loc[10, "volume"] = 0
+    bars.loc[11, "volume"] = 12
+
+    features = build_scalping_features(bars)
+
+    assert not np.isnan(features.loc[11, "scalping_volume_acceleration"])
+    assert features.loc[11, "scalping_volume_acceleration"] == pytest.approx(np.log1p(12))
+
+
 def test_scalping_quote_features_use_latest_valid_quote():
     bars = MarketDataClient.synthetic_btc_bars(40)
     latest_close = float(bars.iloc[-1]["close"])

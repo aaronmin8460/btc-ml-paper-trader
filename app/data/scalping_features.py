@@ -97,7 +97,7 @@ def build_scalping_features(bars: pd.DataFrame, quote: dict | None = None) -> pd
     volume_std_10 = volume.rolling(10).std()
     data["scalping_volume_ratio_5"] = _safe_divide(volume, volume_mean_5)
     data["scalping_volume_zscore_10"] = _safe_divide(volume - volume_mean_10, volume_std_10)
-    data["scalping_volume_acceleration"] = _safe_divide(volume - volume.shift(1), volume.shift(1))
+    data["scalping_volume_acceleration"] = np.log1p(volume.clip(lower=0)).diff().fillna(0.0)
 
     prior_high_5 = high.shift(1).rolling(5).max()
     prior_low_5 = low.shift(1).rolling(5).min()

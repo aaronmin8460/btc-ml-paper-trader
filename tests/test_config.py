@@ -102,6 +102,12 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.scalping_quote_imbalance_exit == -0.10
     assert settings.scalping_profit_guard_enabled is False
     assert settings.min_hold_seconds_before_weak_quote_exit == 30
+    assert settings.regime_no_trade_volatility_threshold == 0.020
+    assert settings.regime_no_trade_short_return_threshold == 0.015
+    assert settings.regime_trend_strength_threshold == 0.800
+    assert settings.regime_breakout_threshold == 0.001
+    assert settings.regime_mean_reversion_short_return_threshold == 0.003
+    assert settings.regime_mean_reversion_low_breakout_threshold == 0.006
     assert settings.rule_rsi_min == 40
     assert settings.rule_rsi_max == 60
     assert settings.rule_min_normalized_volume == 1.1
@@ -123,6 +129,8 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.max_holding_sell_requires_profit is True
     assert settings.allow_fallback_trading is False
     assert settings.auto_train_enabled is False
+    assert settings.min_buy_positive_labels == 50
+    assert settings.min_buy_positive_label_pct == 0.03
     assert settings.auto_train_interval_seconds == 21600
     assert settings.auto_train_startup_delay_seconds == 300
     assert settings.auto_train_min_bars == 3000
@@ -314,6 +322,9 @@ def test_config_still_rejects_unsafe_symbol_and_non_paper_mode():
 
     with pytest.raises(ValueError):
         Settings(_env_file=None, max_backtest_ambiguous_candle_ratio=1.01)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, min_buy_positive_label_pct=1.01)
 
 
 def test_safe_dict_masks_discord_webhook_url():

@@ -24,6 +24,16 @@ class Decision:
     reason: str
     notional: float | None = None
     qty: float | None = None
+    blocked_by: str | None = None
+    block_reason: str | None = None
+    strategy_name: str | None = None
+    strategy_score: float | None = None
+    strategy_confidence: float | None = None
+    regime: str | None = None
+    regime_confidence: float | None = None
+    ml_confirmation: dict | None = None
+    strategy_candidates: list[dict] | None = None
+    metadata: dict | None = None
 
 
 class DecisionEngine:

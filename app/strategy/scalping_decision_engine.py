@@ -8,6 +8,14 @@ from app.risk.position_sizer import fixed_notional
 from app.risk.risk_manager import AccountState, PositionState, RiskManager, TradeFrequencyState
 from app.strategy.decision_engine import Decision
 from app.strategy.scalping_rules import ScalpingMarketState, ScalpingRules
+from app.strategy.strategies import (
+    MarketContext,
+    MarketRegime,
+    MarketRegimeFilter,
+    MeanReversionScalpingStrategy,
+    MomentumBreakoutStrategy,
+    StrategySignal,
+)
 from app.utils.time import utc_now
 
 
@@ -31,6 +39,11 @@ class ScalpingDecisionEngine:
         self.settings = settings or get_settings()
         self.risk = RiskManager(self.settings)
         self.rules = ScalpingRules(self.settings)
+        self.regime_filter = MarketRegimeFilter(self.settings)
+        self.strategies = [
+            MeanReversionScalpingStrategy(self.settings),
+            MomentumBreakoutStrategy(self.settings),
+        ]
 
     def decide(
         self,
@@ -76,6 +89,7 @@ class ScalpingDecisionEngine:
             position=position,
             market=market,
             feature_row=feature_row,
+            quote=quote,
             buy_probability=buy_probability,
             sell_probability=sell_probability,
             trading_enabled=trading_enabled,
@@ -96,6 +110,7 @@ class ScalpingDecisionEngine:
         position: PositionState,
         market: ScalpingMarketState,
         feature_row: pd.Series,
+        quote: dict | None,
         buy_probability: float,
         sell_probability: float,
         trading_enabled: bool | None,
@@ -108,26 +123,112 @@ class ScalpingDecisionEngine:
         now: datetime,
     ) -> Decision:
         if _api_hard_budget_exhausted(api_budget):
-            return Decision(symbol, "hold", "api_budget_exhausted")
-        if _model_unavailable(prediction):
-            return Decision(symbol, "hold", "model_unavailable")
+            return _blocked_decision(symbol, "api_budget_exhausted", "api_budget")
         allowed, reason = self.rules.allow_entry_market(market)
         if not allowed:
-            return Decision(symbol, "hold", reason)
+            return _blocked_decision(symbol, reason, _blocked_by_for_reason(reason))
+
+        regime = self.regime_filter.detect(feature_row, quote=quote)
+        if regime.regime in {"too_volatile", "not_tradeable"}:
+            return _blocked_decision(
+                symbol,
+                regime.reason,
+                "regime_filter",
+                regime=regime,
+                metadata={"regime": regime.to_dict()},
+            )
+
+        candidates = self._strategy_candidates(
+            feature_row=feature_row,
+            prediction=prediction,
+            position=position,
+            quote=quote,
+            regime=regime,
+        )
+        selected_strategy = self._select_strategy_candidate(candidates, regime=regime)
+        candidate_payload = [candidate.to_dict() for candidate in candidates]
+        if selected_strategy is None:
+            return _blocked_decision(
+                symbol,
+                _quant_strategy_block_reason(candidates),
+                "quant_strategy",
+                regime=regime,
+                strategy_candidates=candidate_payload,
+                metadata={"regime": regime.to_dict()},
+            )
+
+        ml_confirmation = _ml_confirmation(
+            prediction,
+            buy_probability=buy_probability,
+            sell_probability=sell_probability,
+            buy_floor=self.settings.scalping_buy_probability_floor,
+            confidence_gap_required=self.settings.scalping_confidence_gap_required,
+        )
+        if _active_model_invalid(prediction):
+            return _blocked_decision(
+                symbol,
+                "active_model_invalid",
+                "active_model_invalid",
+                regime=regime,
+                selected_strategy=selected_strategy,
+                strategy_candidates=candidate_payload,
+                ml_confirmation=ml_confirmation,
+                metadata={"active_model_reason": prediction.get("active_model_reason")},
+            )
+        if _model_unavailable(prediction):
+            return _blocked_decision(
+                symbol,
+                "model_unavailable",
+                "ml_filter",
+                regime=regime,
+                selected_strategy=selected_strategy,
+                strategy_candidates=candidate_payload,
+                ml_confirmation=ml_confirmation,
+            )
         if buy_probability < self.settings.scalping_buy_probability_floor:
-            return Decision(symbol, "hold", "scalping_buy_probability_below_floor")
+            return _blocked_decision(
+                symbol,
+                "scalping_buy_probability_below_floor",
+                "ml_filter",
+                regime=regime,
+                selected_strategy=selected_strategy,
+                strategy_candidates=candidate_payload,
+                ml_confirmation=ml_confirmation,
+            )
         if buy_probability - sell_probability < self.settings.scalping_confidence_gap_required:
-            return Decision(symbol, "hold", "scalping_confidence_gap_too_small")
-        if not self.rules.entry_confirmed(feature_row):
-            return Decision(symbol, "hold", "scalping_entry_not_confirmed")
+            return _blocked_decision(
+                symbol,
+                "scalping_confidence_gap_too_small",
+                "ml_filter",
+                regime=regime,
+                selected_strategy=selected_strategy,
+                strategy_candidates=candidate_payload,
+                ml_confirmation=ml_confirmation,
+            )
         if recent_ioc_canceled_buys >= self.settings.max_recent_ioc_cancels:
-            return Decision(symbol, "hold", "recent_ioc_cancels_too_high")
+            return _blocked_decision(
+                symbol,
+                "recent_ioc_cancels_too_high",
+                "ioc_cancel_guard",
+                regime=regime,
+                selected_strategy=selected_strategy,
+                strategy_candidates=candidate_payload,
+                ml_confirmation=ml_confirmation,
+            )
         if _timestamp_within_seconds(
             latest_ioc_canceled_buy_at,
             now=now,
             seconds=self.settings.ioc_cancel_cooldown_seconds,
         ):
-            return Decision(symbol, "hold", "ioc_cancel_cooldown_active")
+            return _blocked_decision(
+                symbol,
+                "ioc_cancel_cooldown_active",
+                "ioc_cancel_guard",
+                regime=regime,
+                selected_strategy=selected_strategy,
+                strategy_candidates=candidate_payload,
+                ml_confirmation=ml_confirmation,
+            )
         notional = fixed_notional(self.settings)
         approved, risk_reason = self.risk.approve_buy(
             notional=notional,
@@ -139,10 +240,76 @@ class ScalpingDecisionEngine:
             now=now,
         )
         if not approved:
-            return Decision(symbol, "hold", risk_reason)
+            return _blocked_decision(
+                symbol,
+                risk_reason,
+                _blocked_by_for_reason(risk_reason),
+                regime=regime,
+                selected_strategy=selected_strategy,
+                strategy_candidates=candidate_payload,
+                ml_confirmation=ml_confirmation,
+            )
         if trading_enabled is False:
-            return Decision(symbol, "hold", "trading_disabled")
-        return Decision(symbol, "buy", "scalping_entry_approved", notional=notional)
+            return _blocked_decision(
+                symbol,
+                "trading_disabled",
+                "risk_manager",
+                regime=regime,
+                selected_strategy=selected_strategy,
+                strategy_candidates=candidate_payload,
+                ml_confirmation=ml_confirmation,
+            )
+        return Decision(
+            symbol,
+            "buy",
+            "scalping_entry_approved",
+            notional=notional,
+            strategy_name=selected_strategy.strategy_name,
+            strategy_score=selected_strategy.score,
+            strategy_confidence=selected_strategy.confidence,
+            regime=regime.regime,
+            regime_confidence=regime.confidence,
+            ml_confirmation=ml_confirmation,
+            strategy_candidates=candidate_payload,
+            metadata={
+                "entry_reason": selected_strategy.reason,
+                "regime": regime.to_dict(),
+                "strategy": selected_strategy.to_dict(),
+            },
+        )
+
+    def _strategy_candidates(
+        self,
+        *,
+        feature_row: pd.Series,
+        prediction: dict,
+        position: PositionState,
+        quote: dict | None,
+        regime: MarketRegime,
+    ) -> list[StrategySignal]:
+        context = MarketContext(regime=regime, risk_permits_evaluation=True)
+        return [
+            strategy.generate_signal(
+                feature_row=feature_row,
+                prediction=prediction,
+                position=position,
+                quote=quote,
+                market_context=context,
+            )
+            for strategy in self.strategies
+        ]
+
+    def _select_strategy_candidate(self, candidates: list[StrategySignal], *, regime: MarketRegime) -> StrategySignal | None:
+        allowed: list[StrategySignal] = []
+        for candidate in candidates:
+            if candidate.action != "buy":
+                continue
+            regime_allowed, _ = self.regime_filter.allows(regime, candidate.strategy_name)
+            if regime_allowed:
+                allowed.append(candidate)
+        if not allowed:
+            return None
+        return max(allowed, key=lambda signal: (signal.score, signal.confidence, signal.strategy_name))
 
     def _decide_exit(
         self,
@@ -233,6 +400,96 @@ def _model_unavailable(prediction: dict) -> bool:
         return True
     source = str(prediction.get("prediction_source") or prediction.get("source") or "").lower()
     return source.startswith("fallback")
+
+
+def _active_model_invalid(prediction: dict) -> bool:
+    if prediction.get("active_model_valid") is not False:
+        return False
+    if prediction.get("active_model_path") or prediction.get("model_path"):
+        return True
+    return str(prediction.get("prediction_source") or "").lower() == "fallback_invalid_model"
+
+
+def _ml_confirmation(
+    prediction: dict,
+    *,
+    buy_probability: float,
+    sell_probability: float,
+    buy_floor: float,
+    confidence_gap_required: float,
+) -> dict:
+    confidence_gap = buy_probability - sell_probability
+    return {
+        "buy_probability": buy_probability,
+        "sell_probability": sell_probability,
+        "confidence_gap": confidence_gap,
+        "buy_floor": buy_floor,
+        "confidence_gap_required": confidence_gap_required,
+        "model_available": bool(prediction.get("model_available")),
+        "prediction_source": prediction.get("prediction_source") or prediction.get("source"),
+        "passed": (
+            not _model_unavailable(prediction)
+            and buy_probability >= buy_floor
+            and confidence_gap >= confidence_gap_required
+        ),
+    }
+
+
+def _blocked_decision(
+    symbol: str,
+    reason: str,
+    blocked_by: str,
+    *,
+    regime: MarketRegime | None = None,
+    selected_strategy: StrategySignal | None = None,
+    strategy_candidates: list[dict] | None = None,
+    ml_confirmation: dict | None = None,
+    metadata: dict | None = None,
+) -> Decision:
+    return Decision(
+        symbol,
+        "hold",
+        reason,
+        blocked_by=blocked_by,
+        block_reason=reason,
+        strategy_name=selected_strategy.strategy_name if selected_strategy else None,
+        strategy_score=selected_strategy.score if selected_strategy else None,
+        strategy_confidence=selected_strategy.confidence if selected_strategy else None,
+        regime=regime.regime if regime else None,
+        regime_confidence=regime.confidence if regime else None,
+        ml_confirmation=ml_confirmation,
+        strategy_candidates=strategy_candidates,
+        metadata=metadata or ({"regime": regime.to_dict()} if regime else None),
+    )
+
+
+def _quant_strategy_block_reason(candidates: list[StrategySignal]) -> str:
+    buy_candidates = [candidate for candidate in candidates if candidate.action == "buy"]
+    if buy_candidates:
+        return "strategy_candidate_blocked_by_regime"
+    if candidates:
+        return candidates[0].reason
+    return "no_quant_strategy_candidate"
+
+
+def _blocked_by_for_reason(reason: str) -> str:
+    if reason in {"stale_market_data", "scalping_stale_data_exit"}:
+        return "stale_market_data"
+    if reason in {"spread_too_wide", "spread_unavailable"}:
+        return "spread"
+    if reason in {"quote_imbalance_too_weak", "quote_imbalance_unavailable"}:
+        return "quote_imbalance"
+    if reason == "api_budget_exhausted":
+        return "api_budget"
+    if reason in {"recent_ioc_cancels_too_high", "ioc_cancel_cooldown_active"}:
+        return "ioc_cancel_guard"
+    if reason in {"trade_cooldown_active", "cooldown_after_loss"}:
+        return "cooldown"
+    if reason == "active_model_invalid":
+        return "active_model_invalid"
+    if reason.startswith("scalping_buy_probability") or reason.startswith("scalping_confidence"):
+        return "ml_filter"
+    return "risk_manager"
 
 
 def _sell_probability(prediction: dict, *, buy_probability: float) -> float:

@@ -70,4 +70,4 @@ async def run_backtest() -> dict:
 
 
 if __name__ == "__main__":
-    print(asyncio.run(run_backtest()))
+    print(json.dumps(asyncio.run(run_backtest()), indent=2, default=str))

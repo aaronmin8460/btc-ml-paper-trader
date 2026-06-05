@@ -111,6 +111,54 @@ TRADING_ENABLED=false AUTO_TRADE_ENABLED=false python scripts/run_once.py
 
 With `TRADING_ENABLED=false`, the bot fetches or synthesizes BTC/USD data, produces a signal, and does not submit a paper order.
 
+## Quant strategy backtests and reports
+
+Run the BTC/USD paper scalping backtest:
+
+```bash
+source .venv/bin/activate
+python scripts/backtest.py
+```
+
+The script prints a JSON report and writes `logs/backtest_report.json`. The report keeps walk-forward validation, fee, slippage, spread, IOC cancellation, partial fill, and ambiguous candle handling. It is an evaluation artifact only; it does not enable live trading and does not prove future profitability.
+
+Strategy-level metrics are under `metrics.strategy_level_metrics`. Use `number_of_signals` to see how often a strategy produced or was considered for a signal, `number_of_entries` and `number_of_trades` to see how many actually became simulated paper entries/trades, and `net_return_pct`, `profit_factor_net`, `win_rate_net`, `expectancy`, `max_drawdown_pct`, `canceled_orders`, `partial_fills`, and `ambiguous_candle_ratio` to compare cost-aware outcomes. These are fractions of traded notional, not account-level promises.
+
+Regime-level metrics are under `metrics.regime_level_metrics`. They show how many signals were allowed or blocked in regimes such as `trending`, `mean_reverting`, `ranging`, `too_volatile`, and `not_tradeable`. A strong strategy should not only show favorable trade metrics; it should also avoid forcing entries in regimes where the filter says conditions are unsafe.
+
+Blocked-signal counts are under `metrics.blocked_signal_metrics`. `blocked_by` names the gate that stopped a candidate signal, and `block_reason` gives the specific reason. Common gates include `regime_filter`, `quant_strategy`, `ml_filter`, `risk_manager`, `spread`, `quote_imbalance`, `api_budget`, `cooldown`, `ioc_cancel_guard`, `stale_market_data`, `active_model_invalid`, and `fallback_prediction_not_allowed`.
+
+To compare `MeanReversionScalpingStrategy` and `MomentumBreakoutStrategy`, look at both the strategy-level section and the regime-level section. Mean reversion should mostly appear in `mean_reverting` or `ranging` regimes; momentum breakout should mostly appear in `trending` regimes. A strategy with few signals, few trades, high cancellation, high drawdown, or poor net returns after fees and spread is not strong evidence for paper auto-trading.
+
+Backtests are historical simulations with simplifying assumptions and limited data. They can reveal broken labels, excessive costs, over-filtering, or unsafe trade selection, but they do not guarantee future results. Keep `TRADING_ENABLED=false` and `AUTO_TRADE_ENABLED=false` unless you are intentionally running paper-only automation with all safety guards intact.
+
+## Parameter sweeps and paper-forward checks
+
+Run the bounded strategy parameter sweep:
+
+```bash
+source .venv/bin/activate
+python scripts/sweep_strategy_params.py
+```
+
+The sweep writes `logs/strategy_param_sweep.csv` and `logs/strategy_param_sweep_summary.json`. It evaluates BTC/USD paper-only, long-only strategy settings with walk-forward validation and cost-aware backtesting. It does not modify `.env`, does not enable fallback trading, does not auto-apply a best config, and does not claim guaranteed profitability.
+
+To write a candidate file for manual review:
+
+```bash
+python scripts/apply_candidate_config.py --parameter-set-id ps_001_ml_confirmation
+```
+
+This writes `.env.candidate`, never `.env`, and prints a manual diff-style summary. Review the file yourself before using it. Candidate files force `PAPER_TRADING_ONLY=true`, `SYMBOL=BTC/USD`, `TRADING_ENABLED=false`, `AUTO_TRADE_ENABLED=false`, and `ALLOW_FALLBACK_TRADING=false`.
+
+Paper-forward evaluation checklist:
+
+1. Run the candidate in paper mode only.
+2. Test in stages: 1 hour, then 6 hours, then 24 hours.
+3. Monitor `strategy_name`, `blocked_by`, spread, quote imbalance, net PnL, drawdown, order cancels, API budget, and active model availability.
+4. Stop immediately if `active_model_valid=false`, prediction source is fallback, max drawdown is breached, IOC cancels repeat, spread blocks become excessive, runtime errors appear, or market data is stale.
+5. Treat every passing backtest as a hypothesis, not proof. A config is only worth paper-forward testing when it has enough trades, positive net expectancy after costs, tolerable drawdown, low ambiguous candle ratio, and stable walk-forward splits.
+
 ## Local API run
 
 Start the FastAPI server locally:

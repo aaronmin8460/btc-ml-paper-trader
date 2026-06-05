@@ -108,6 +108,12 @@ class Settings(BaseSettings):
     scalping_quote_imbalance_exit: float = -0.10
     scalping_profit_guard_enabled: bool = False
     min_hold_seconds_before_weak_quote_exit: int = 30
+    regime_no_trade_volatility_threshold: float = 0.020
+    regime_no_trade_short_return_threshold: float = 0.015
+    regime_trend_strength_threshold: float = 0.800
+    regime_breakout_threshold: float = 0.001
+    regime_mean_reversion_short_return_threshold: float = 0.003
+    regime_mean_reversion_low_breakout_threshold: float = 0.006
 
     rule_rsi_min: float = 40
     rule_rsi_max: float = 60
@@ -162,6 +168,8 @@ class Settings(BaseSettings):
     model_retrain_enabled: bool = True
     retrain_every_hours: int = 24
     min_training_rows: int = 1000
+    min_buy_positive_labels: int = 50
+    min_buy_positive_label_pct: float = 0.03
     optuna_enabled: bool = False
     auto_train_enabled: bool = False
     auto_train_interval_seconds: int = 21600
@@ -268,6 +276,9 @@ class Settings(BaseSettings):
         "auto_train_interval_seconds",
         "auto_train_startup_delay_seconds",
         "auto_train_min_bars",
+        "min_training_rows",
+        "min_buy_positive_labels",
+        "min_buy_positive_label_pct",
         "min_net_exit_profit_pct",
         "exit_profit_buffer_bps",
         "emergency_stop_loss_pct",
@@ -275,6 +286,12 @@ class Settings(BaseSettings):
         "scalping_label_take_profit_pct",
         "scalping_label_stop_loss_pct",
         "scalping_label_min_net_profit_pct",
+        "regime_no_trade_volatility_threshold",
+        "regime_no_trade_short_return_threshold",
+        "regime_trend_strength_threshold",
+        "regime_breakout_threshold",
+        "regime_mean_reversion_short_return_threshold",
+        "regime_mean_reversion_low_breakout_threshold",
     )
     @classmethod
     def runtime_timing_values_must_be_non_negative(cls, value: float) -> float:
@@ -287,6 +304,13 @@ class Settings(BaseSettings):
     def ambiguous_candle_ratio_must_not_exceed_one(cls, value: float) -> float:
         if value > 1:
             raise ValueError("MAX_BACKTEST_AMBIGUOUS_CANDLE_RATIO must not exceed 1.")
+        return value
+
+    @field_validator("min_buy_positive_label_pct")
+    @classmethod
+    def min_buy_positive_label_pct_must_not_exceed_one(cls, value: float) -> float:
+        if value > 1:
+            raise ValueError("MIN_BUY_POSITIVE_LABEL_PCT must not exceed 1.")
         return value
 
     @field_validator("scalping_label_horizon_bars")

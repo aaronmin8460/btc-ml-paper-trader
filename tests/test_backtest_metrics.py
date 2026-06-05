@@ -75,6 +75,11 @@ def test_backtest_report_metrics_include_gross_and_net_fields():
         "average_hold_bars",
         "win_rate_net",
         "ambiguous_candle_count",
+        "expectancy",
+        "trade_details",
+        "strategy_level_metrics",
+        "regime_level_metrics",
+        "blocked_signal_metrics",
     ]:
         assert key in metrics
     assert metrics["gross_return"] != metrics["net_return"]
@@ -173,3 +178,77 @@ def test_backtest_tracks_partial_entry_and_exit_fills():
     assert metrics["valid"] is True
     assert metrics["number_of_trades"] == 1
     assert metrics["partial_fill_count"] == 2
+
+
+def test_backtest_reports_strategy_level_net_metrics():
+    trades = pd.DataFrame(
+        {
+            "close": [100.0, 100.0],
+            "buy_quality_label": [1, 0],
+            "buy_exit_return_pct": [0.01, -0.002],
+            "strategy_name": ["mean_reversion_scalping", "momentum_breakout"],
+            "entry_reason": ["mean_reversion_buy_candidate", "momentum_breakout_buy_candidate"],
+        }
+    )
+
+    metrics = calculate_fee_aware_metrics(trades, _settings(order_type="market"))
+
+    assert metrics["trade_details"][0]["strategy_name"] == "mean_reversion_scalping"
+    assert metrics["trade_details"][0]["entry_reason"] == "mean_reversion_buy_candidate"
+    assert metrics["trade_details"][0]["gross_return_pct"] == metrics["trade_details"][0]["gross_return"]
+    assert metrics["trade_details"][0]["net_return_pct"] == metrics["trade_details"][0]["net_return"]
+    assert "fee_amount" in metrics["trade_details"][0]
+    assert "hold_bars" in metrics["trade_details"][0]
+    assert "mean_reversion_scalping" in metrics["strategy_level_metrics"]
+    assert "momentum_breakout" in metrics["strategy_level_metrics"]
+    assert "net_return" in metrics["strategy_level_metrics"]["mean_reversion_scalping"]
+    assert "profit_factor" in metrics["strategy_level_metrics"]["momentum_breakout"]
+    assert "profit_factor_net" in metrics["strategy_level_metrics"]["momentum_breakout"]
+
+
+def test_backtest_reports_strategy_regime_and_blocked_signal_metrics():
+    signals = pd.DataFrame(
+        {
+            "close": [100.0, 100.0, 100.0],
+            "buy_quality_label": [1, 0, 1],
+            "buy_exit_return_pct": [0.01, -0.002, 0.01],
+            "_probability": [0.8, 0.7, 0.3],
+            "ml_buy_probability": [0.8, 0.7, 0.3],
+            "ml_sell_probability": [0.2, 0.3, 0.7],
+            "strategy_name": ["mean_reversion_scalping", "momentum_breakout", "mean_reversion_scalping"],
+            "regime": ["mean_reverting", "too_volatile", "mean_reverting"],
+            "entry_reason": [
+                "mean_reversion_buy_candidate",
+                "volatility_too_high",
+                "mean_reversion_buy_candidate",
+            ],
+            "blocked_by": [None, "regime_filter", "ml_filter"],
+            "block_reason": [None, "volatility_too_high", "ml_buy_probability_below_threshold"],
+            "strategy_score": [0.7, 0.0, 0.6],
+            "strategy_confidence": [0.8, 0.0, 0.7],
+            "entry_allowed": [True, False, False],
+        }
+    )
+
+    metrics = calculate_fee_aware_metrics(
+        signals.loc[signals["entry_allowed"]].copy(),
+        _settings(order_type="market"),
+        signal_frame=signals,
+    )
+
+    assert metrics["trade_details"][0]["strategy_name"] == "mean_reversion_scalping"
+    assert metrics["trade_details"][0]["regime"] == "mean_reverting"
+    assert metrics["trade_details"][0]["ml_buy_probability"] == 0.8
+    assert metrics["trade_details"][0]["ml_sell_probability"] == 0.2
+    assert metrics["trade_details"][0]["quant_score"] == 0.7
+    assert metrics["trade_details"][0]["quant_confidence"] == 0.8
+    assert metrics["blocked_signal_metrics"]["regime_filter"] == 1
+    assert metrics["blocked_signal_metrics"]["ml_filter"] == 1
+    assert metrics["strategy_level_metrics"]["mean_reversion_scalping"]["number_of_signals"] == 2
+    assert metrics["strategy_level_metrics"]["mean_reversion_scalping"]["number_of_entries"] == 1
+    assert metrics["strategy_level_metrics"]["mean_reversion_scalping"]["number_of_trades"] == 1
+    assert metrics["strategy_level_metrics"]["momentum_breakout"]["number_of_signals"] == 1
+    assert metrics["strategy_level_metrics"]["momentum_breakout"]["number_of_trades"] == 0
+    assert metrics["regime_level_metrics"]["too_volatile"]["number_of_blocked_signals"] == 1
+    assert metrics["regime_level_metrics"]["mean_reverting"]["number_of_allowed_signals"] == 1
+    assert "profitable" not in str(metrics["strategy_level_metrics"]).lower()

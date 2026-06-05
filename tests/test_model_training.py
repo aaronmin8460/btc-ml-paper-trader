@@ -124,6 +124,28 @@ def test_predictor_uses_legacy_sell_probability_fallback_for_old_model(monkeypat
 
 
 def test_training_rejects_single_class_dataset_without_crashing(tmp_path):
+    bars = MarketDataClient.synthetic_btc_bars(160)
+    settings = Settings(
+        _env_file=None,
+        min_training_rows=50,
+        model_dir=str(tmp_path),
+        scalping_mode_enabled=True,
+        min_buy_positive_labels=0,
+        min_buy_positive_label_pct=0.0,
+        scalping_label_take_profit_pct=1.0,
+        scalping_label_stop_loss_pct=1.0,
+        scalping_trailing_stop_pct=0.0,
+    )
+
+    result = train_model_from_bars(bars, settings)
+
+    assert result["accepted"] is False
+    assert result["reason"] == "target_class_diversity_too_low"
+    assert result["model_path"] is None
+    assert list(tmp_path.glob("*.joblib")) == []
+
+
+def test_training_rejects_when_buy_positive_labels_are_too_low(tmp_path):
     timestamps = pd.date_range(datetime(2026, 5, 27, tzinfo=UTC), periods=160, freq="min")
     bars = pd.DataFrame(
         {
@@ -145,7 +167,38 @@ def test_training_rejects_single_class_dataset_without_crashing(tmp_path):
     result = train_model_from_bars(bars, settings)
 
     assert result["accepted"] is False
-    assert result["reason"] == "target_class_diversity_too_low"
+    assert result["reason"] == "buy_positive_labels_too_low"
+    assert result["metrics"]["buy_positive_label_count"] == 0
+    assert result["metrics"]["fee_aware_backtest_reason"] == "not_run_buy_positive_labels_too_low"
+    assert result["model_path"] is None
+    assert list(tmp_path.glob("*.joblib")) == []
+
+
+def test_training_rejects_when_trainable_rows_are_below_min_training_rows(tmp_path):
+    bars = MarketDataClient.synthetic_btc_bars(180)
+    settings = Settings(
+        _env_file=None,
+        min_training_rows=500,
+        min_buy_positive_labels=1,
+        min_buy_positive_label_pct=0.0,
+        model_dir=str(tmp_path),
+        scalping_mode_enabled=True,
+        taker_fee_bps=0,
+        slippage_bps=0,
+        max_spread_bps=0,
+        scalping_label_take_profit_pct=0.0001,
+        scalping_label_stop_loss_pct=0.01,
+        scalping_label_min_net_profit_pct=0.0,
+        exit_profit_buffer_bps=0,
+    )
+
+    result = train_model_from_bars(bars, settings)
+
+    assert result["accepted"] is False
+    assert result["reason"] == "not_enough_rows"
+    assert result["metrics"]["trainable_rows"] < settings.min_training_rows
+    assert result["metrics"]["buy_positive_label_count"] >= settings.min_buy_positive_labels
+    assert result["metrics"]["fee_aware_backtest_reason"] == "not_run_not_enough_rows"
     assert result["model_path"] is None
     assert list(tmp_path.glob("*.joblib")) == []
 

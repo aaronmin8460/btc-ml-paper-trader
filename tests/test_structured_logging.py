@@ -10,6 +10,9 @@ def test_signal_payload_normalization_adds_required_fields():
 
     assert set(SIGNAL_LOG_FIELDS).issubset(payload)
     assert payload["timestamp"] is not None
+    assert payload["blocked_by"] is None
+    assert payload["quant_score"] is None
+    assert payload["candidate_strategy_count"] is None
 
 
 def test_order_and_risk_payload_normalization_add_required_fields():

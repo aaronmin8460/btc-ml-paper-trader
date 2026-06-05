@@ -5,9 +5,13 @@ import pandas as pd
 
 from app.config import Settings, get_settings
 from app.backtest.scalping import walk_forward_fee_aware_backtest
-from app.data.dataset_builder import build_training_dataset, training_feature_columns
+from app.data.dataset_builder import training_feature_columns
 from app.ml.model import MLSignalModel, tune_tree_params
 from app.ml.registry import ModelRegistry
+from app.ml.training_diagnostics import (
+    build_training_dataset_with_diagnostics,
+    buy_positive_label_guard_failed,
+)
 from app.ml.validation import promotion_decision, walk_forward_validate
 from app.monitoring.logger import get_logger
 
@@ -25,30 +29,47 @@ def train_model_from_bars(
     stop_loss_pct = settings.scalping_label_stop_loss_pct if settings.scalping_mode_enabled else settings.stop_loss_pct
     threshold = settings.scalping_buy_probability_floor if settings.scalping_mode_enabled else settings.min_buy_probability
     feature_columns = training_feature_columns(settings.scalping_mode_enabled)
-    dataset = build_training_dataset(
-        bars,
-        scalping_label_horizon_bars=settings.scalping_label_horizon_bars,
-        take_profit_pct=take_profit_pct,
-        stop_loss_pct=stop_loss_pct,
-        scalping_mode_enabled=settings.scalping_mode_enabled,
-        trailing_stop_pct=settings.scalping_trailing_stop_pct if settings.scalping_mode_enabled else settings.trailing_stop_pct,
-        trailing_stop_arm_profit_pct=settings.trailing_stop_arm_profit_pct,
-        fee_bps_per_side=_backtest_fee_bps(settings),
-        slippage_bps_per_side=settings.slippage_bps,
-        spread_cost_pct=(settings.max_spread_bps / 10_000) if settings.scalping_mode_enabled else 0.0,
-        min_net_exit_profit_pct=settings.scalping_label_min_net_profit_pct if settings.scalping_mode_enabled else 0.0,
-        exit_profit_buffer_bps=settings.exit_profit_buffer_bps if settings.scalping_mode_enabled else 0.0,
-    )
+    dataset, data_diagnostics = build_training_dataset_with_diagnostics(bars, settings)
     class_counts = {
         int(label): int(count)
         for label, count in dataset["buy_quality_label"].astype(int).value_counts().sort_index().items()
     }
+    data_metrics = _training_data_metrics(data_diagnostics, class_counts=class_counts)
+    if buy_positive_label_guard_failed(data_diagnostics, settings):
+        metrics = {
+            **data_metrics,
+            "valid": False,
+            "reason": "buy_positive_labels_too_low",
+            "promotion_reason": "buy_positive_labels_too_low",
+            "fee_aware_backtest_valid": False,
+            "fee_aware_backtest_reason": "not_run_buy_positive_labels_too_low",
+        }
+        logger.event("model_rejection", model_path=None, metrics=metrics, reason=metrics["reason"])
+        _record_model_run("none", "rejected", metrics)
+        return {"model_path": None, "accepted": False, "reason": metrics["reason"], "metrics": metrics, "registry": None}
+
+    if len(dataset) < settings.min_training_rows:
+        metrics = {
+            **data_metrics,
+            "valid": False,
+            "reason": "not_enough_rows",
+            "promotion_reason": "not_enough_rows",
+            "min_training_rows": int(settings.min_training_rows),
+            "fee_aware_backtest_valid": False,
+            "fee_aware_backtest_reason": "not_run_not_enough_rows",
+        }
+        logger.event("model_rejection", model_path=None, metrics=metrics, reason=metrics["reason"])
+        _record_model_run("none", "rejected", metrics)
+        return {"model_path": None, "accepted": False, "reason": metrics["reason"], "metrics": metrics, "registry": None}
+
     if len(class_counts) < 2:
         metrics = {
+            **data_metrics,
             "valid": False,
             "reason": "target_class_diversity_too_low",
-            "rows": len(dataset),
-            "class_counts": class_counts,
+            "promotion_reason": "target_class_diversity_too_low",
+            "fee_aware_backtest_valid": False,
+            "fee_aware_backtest_reason": "not_run_target_class_diversity_too_low",
         }
         logger.event("model_rejection", model_path=None, metrics=metrics, reason=metrics["reason"])
         _record_model_run("none", "rejected", metrics)
@@ -63,6 +84,7 @@ def train_model_from_bars(
         feature_columns=feature_columns,
         sell_threshold=settings.min_sell_probability,
     )
+    metrics.update(data_metrics)
     fee_metrics = walk_forward_fee_aware_backtest(
         dataset,
         settings,
@@ -71,6 +93,7 @@ def train_model_from_bars(
         feature_columns=feature_columns,
     )
     metrics.update(_promotion_performance_metrics(fee_metrics, starting_equity=starting_equity))
+    metrics.update(data_metrics)
     accepted, reason = promotion_decision(
         metrics,
         min_rows=settings.min_training_rows,
@@ -178,6 +201,13 @@ def dataset_metadata(settings: Settings, *, feature_columns: list[str]) -> dict:
         "spread_cost_pct": (settings.max_spread_bps / 10_000) if scalping_mode_enabled else 0.0,
         "min_net_profit_pct": settings.scalping_label_min_net_profit_pct if scalping_mode_enabled else 0.0,
     }
+
+
+def _training_data_metrics(data_diagnostics: dict, *, class_counts: dict[int, int]) -> dict:
+    metrics = dict(data_diagnostics)
+    metrics["rows"] = int(data_diagnostics.get("trainable_rows", 0))
+    metrics["class_counts"] = class_counts
+    return metrics
 
 
 def _record_model_run(model_version: str, status: str, metrics: dict) -> None:

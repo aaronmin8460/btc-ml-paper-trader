@@ -1,4 +1,6 @@
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -79,7 +81,25 @@ class FakeTrader:
                 "sell_probability": 0.49,
                 "features": {"close": 101.5},
             },
-            "decision": {"action": "hold", "reason": "dashboard_test"},
+            "decision": {
+                "action": "hold",
+                "reason": "dashboard_test",
+                "strategy_name": "mean_reversion_scalping",
+                "strategy_score": 0.62,
+                "strategy_confidence": 0.74,
+                "regime": "mean_reverting",
+                "blocked_by": "ml_filter",
+                "block_reason": "ml_buy_probability_below_threshold",
+                "strategy_candidates": [{"strategy_name": "mean_reversion_scalping", "score": 0.62}],
+            },
+            "latest_strategy_signal": {
+                "strategy_name": "mean_reversion_scalping",
+                "strategy_score": 0.62,
+                "strategy_confidence": 0.74,
+                "strategy_candidates": [{"strategy_name": "mean_reversion_scalping", "score": 0.62}],
+            },
+            "regime": {"regime": "mean_reverting", "confidence": 0.7},
+            "ml_confirmation": {"passed": False, "reason": "ml_buy_probability_below_threshold"},
             "order": None,
         }
 
@@ -148,6 +168,7 @@ def dashboard_client(monkeypatch, tmp_path):
         lookback_bars=2,
         timeframe="1Min",
         model_dir=str(tmp_path / "models"),
+        log_dir=str(tmp_path / "logs"),
     )
     monkeypatch.setattr(main, "settings", settings)
     monkeypatch.setattr(main.app.state, "settings", settings, raising=False)
@@ -246,7 +267,18 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["active_model_number_of_trades"] is None
     assert body["registry_metadata_matches_joblib"] is False
     assert body["active_model_registry_mismatched"] is False
+    assert body["fallback_trading_allowed"] is False
+    assert body["strategy_level_performance_summary"] == {}
+    assert body["regime_level_performance_summary"] == {}
+    assert body["blocked_signal_summary"] == {}
     assert body["latest_signal"] is None
+    assert body["latest_strategy_name"] is None
+    assert body["latest_regime"] is None
+    assert body["selected_strategy_signal"] is None
+    assert body["ml_confirmation_result"] is None
+    assert body["final_decision"] is None
+    assert body["blocked_by"] is None
+    assert body["block_reason"] is None
     assert body["latest_order"] is None
     assert body["last_order"] is None
     assert body["last_trade"] is None
@@ -256,6 +288,97 @@ def test_dashboard_summary_returns_expected_structure_and_nulls(dashboard_client
     assert body["data_freshness"]["latest_timestamp"] == "2026-05-27T16:01:00+00:00"
     assert "quote_timestamp" in body["data_freshness"]
     assert "quote_age_seconds" in body["data_freshness"]
+
+
+def test_dashboard_summary_exposes_backtest_observability_rollups(dashboard_client):
+    client, _ = dashboard_client
+    report_path = Path(client.app.state.settings.log_dir) / "backtest_report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "strategy_level_metrics": {
+                        "mean_reversion_scalping": {
+                            "number_of_trades": 1,
+                            "net_return_pct": -0.001,
+                            "profit_factor_net": float("inf"),
+                        }
+                    },
+                    "regime_level_metrics": {
+                        "mean_reverting": {
+                            "number_of_signals": 3,
+                            "number_of_trades": 1,
+                            "net_return_pct": -0.001,
+                        }
+                    },
+                    "blocked_signal_metrics": {"ml_filter": 2, "regime_filter": 1},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/dashboard/summary", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    strategy_metrics = body["strategy_level_performance_summary"]["mean_reversion_scalping"]
+    assert strategy_metrics["number_of_trades"] == 1
+    assert strategy_metrics["net_return_pct"] == -0.001
+    assert strategy_metrics["profit_factor_net"] is None
+    assert body["regime_level_performance_summary"]["mean_reverting"]["number_of_signals"] == 3
+    assert body["blocked_signal_summary"]["ml_filter"] == 2
+
+
+def test_dashboard_summary_reads_latest_strategy_signal_from_event_log(dashboard_client):
+    client, _ = dashboard_client
+    events_path = Path(client.app.state.settings.log_dir) / "events.jsonl"
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    events_path.write_text(
+        json.dumps({"event_type": "startup", "symbol": "BTC/USD"}) + "\n"
+        + json.dumps(
+            {
+                "event_type": "signal",
+                "timestamp": "2026-06-01T00:00:00+00:00",
+                "symbol": "BTC/USD",
+                "action": "hold",
+                "reason": "ml_buy_probability_below_threshold",
+                "strategy_name": "mean_reversion_scalping",
+                "regime": "mean_reverting",
+                "strategy_candidates": [{"strategy_name": "mean_reversion_scalping", "score": 0.62}],
+                "selected_strategy_signal": {
+                    "strategy_name": "mean_reversion_scalping",
+                    "score": 0.62,
+                    "confidence": 0.74,
+                },
+                "ml_confirmation_result": {"passed": False},
+                "final_decision": "hold",
+                "blocked_by": "ml_filter",
+                "block_reason": "ml_buy_probability_below_threshold",
+                "quant_score": 0.62,
+                "quant_confidence": 0.74,
+                "ml_buy_probability": 0.51,
+                "ml_sell_probability": 0.49,
+                "candidate_strategy_count": 1,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    response = client.get("/dashboard/summary", headers={"X-Admin-Token": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["latest_strategy_name"] == "mean_reversion_scalping"
+    assert body["latest_regime"] == "mean_reverting"
+    assert body["latest_strategy_candidates"][0]["strategy_name"] == "mean_reversion_scalping"
+    assert body["selected_strategy_signal"]["confidence"] == 0.74
+    assert body["ml_confirmation_result"]["passed"] is False
+    assert body["final_decision"] == "hold"
+    assert body["blocked_by"] == "ml_filter"
+    assert body["block_reason"] == "ml_buy_probability_below_threshold"
 
 
 def test_dashboard_trading_status_returns_disabled_empty_state(dashboard_client):
@@ -525,6 +648,9 @@ def test_dashboard_signals_surface_scalping_observability_fields(dashboard_clien
     assert signal["spread_bps"] == 7.5
     assert signal["quote_imbalance"] == -0.2
     assert signal["model_version"] == "btc_model_test"
+    assert signal["blocked_by"] == "spread"
+    assert signal["block_reason"] == "spread_too_wide"
+    assert signal["final_decision"] == "hold"
 
 
 def test_dashboard_trades_surface_closed_trade_execution_fields(dashboard_client):
@@ -838,3 +964,17 @@ def test_dashboard_run_once_includes_dashboard_summary(dashboard_client):
         "order_status": None,
         "latest_price": 101.5,
     }
+    strategy_summary = response.json()["strategy_summary"]
+    assert strategy_summary["latest_strategy_name"] == "mean_reversion_scalping"
+    assert strategy_summary["latest_regime"] == "mean_reverting"
+    assert strategy_summary["strategy_name"] == "mean_reversion_scalping"
+    assert strategy_summary["regime"] == "mean_reverting"
+    assert strategy_summary["selected_strategy_signal"]["strategy_name"] == "mean_reversion_scalping"
+    assert strategy_summary["ml_confirmation_result"]["passed"] is False
+    assert strategy_summary["final_decision"] == "hold"
+    assert strategy_summary["blocked_by"] == "ml_filter"
+    assert strategy_summary["block_reason"] == "ml_buy_probability_below_threshold"
+    assert strategy_summary["candidate_strategy_count"] == 1
+    assert strategy_summary["active_model_valid"] is False
+    assert strategy_summary["active_model_invalid_reason"] == "no_active_model"
+    assert strategy_summary["fallback_trading_allowed"] is False

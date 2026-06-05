@@ -2,6 +2,7 @@ import json
 import math
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -91,6 +92,10 @@ async def dashboard_summary(request: Request) -> dict:
     api_budget = get_alpaca_rate_limiter(settings).snapshot()
     latest_model = _latest_model_summary(latest_model_run[0] if latest_model_run else None)
     active_model = ModelRegistry(settings).validate_active_model().to_dict()
+    latest_signal_payload = _serialize_signal(latest_signal) if latest_signal else None
+    backtest_observability = _backtest_observability_summary(settings)
+    latest_signal_event = _latest_signal_event(settings)
+    latest_strategy_payload = _latest_strategy_payload(latest_signal_payload, latest_signal_event)
 
     return {
         "app_status": "ok",
@@ -106,7 +111,16 @@ async def dashboard_summary(request: Request) -> dict:
         "scheduler_pause_reason": pause_status.get("pause_reason"),
         "scheduler_paused_at": pause_status.get("paused_at"),
         "latest_btc_price": market_summary.get("latest_close"),
-        "latest_signal": _serialize_signal(latest_signal) if latest_signal else None,
+        "latest_signal": latest_signal_payload,
+        "latest_strategy_signal": latest_strategy_payload,
+        "latest_strategy_name": latest_strategy_payload.get("strategy_name") if latest_strategy_payload else None,
+        "latest_regime": latest_strategy_payload.get("regime") if latest_strategy_payload else None,
+        "latest_strategy_candidates": latest_strategy_payload.get("strategy_candidates") if latest_strategy_payload else None,
+        "selected_strategy_signal": latest_strategy_payload.get("selected_strategy_signal") if latest_strategy_payload else None,
+        "ml_confirmation_result": latest_strategy_payload.get("ml_confirmation_result") if latest_strategy_payload else None,
+        "final_decision": latest_strategy_payload.get("final_decision") if latest_strategy_payload else None,
+        "blocked_by": latest_strategy_payload.get("blocked_by") if latest_strategy_payload else None,
+        "block_reason": latest_strategy_payload.get("block_reason") if latest_strategy_payload else None,
         "current_position": _serialize_position(position),
         "current_unrealized_pnl": trade_metrics.get("unrealized_pnl"),
         "realized_pnl_today": today_trade_summary["realized_pnl"],
@@ -131,6 +145,10 @@ async def dashboard_summary(request: Request) -> dict:
         "latest_model_accepted": latest_model.get("latest_model_accepted"),
         "latest_model_rejected_reason": latest_model.get("latest_model_rejected_reason"),
         **active_model,
+        "fallback_trading_allowed": settings.allow_fallback_trading,
+        "strategy_level_performance_summary": backtest_observability["strategy_level_metrics"],
+        "regime_level_performance_summary": backtest_observability["regime_level_metrics"],
+        "blocked_signal_summary": backtest_observability["blocked_signal_metrics"],
         **order_summary,
         "total_trades": len(trades),
         **trade_metrics,
@@ -283,12 +301,14 @@ async def dashboard_market(request: Request) -> dict:
 
 @router.post("/run-once")
 async def dashboard_run_once(request: Request) -> dict:
+    settings = _settings_from_request(request)
     trader = _trader_from_request(request)
     result = await trader.run_once()
     prediction = result.get("prediction") or {}
     decision = result.get("decision") or {}
     order = result.get("order") or {}
     features = prediction.get("features") or {}
+    active_model = ModelRegistry(settings).validate_active_model().to_dict()
     return {
         **result,
         "summary": {
@@ -298,6 +318,23 @@ async def dashboard_run_once(request: Request) -> dict:
             "sell_probability": _safe_float(prediction.get("sell_probability")),
             "order_status": order.get("status") if order else None,
             "latest_price": _safe_float(features.get("close")),
+        },
+        "strategy_summary": {
+            "latest_strategy_name": decision.get("strategy_name"),
+            "latest_regime": decision.get("regime"),
+            "strategy_name": decision.get("strategy_name"),
+            "regime": decision.get("regime"),
+            "selected_strategy_signal": result.get("latest_strategy_signal"),
+            "blocked_by": decision.get("blocked_by"),
+            "block_reason": decision.get("block_reason"),
+            "ml_confirmation": result.get("ml_confirmation"),
+            "ml_confirmation_result": result.get("ml_confirmation"),
+            "final_decision": decision.get("action"),
+            "strategy_candidates": decision.get("strategy_candidates"),
+            "candidate_strategy_count": len(decision.get("strategy_candidates") or []),
+            "active_model_valid": active_model.get("active_model_valid"),
+            "active_model_invalid_reason": active_model.get("active_model_invalid_reason"),
+            "fallback_trading_allowed": settings.allow_fallback_trading,
         },
     }
 
@@ -617,10 +654,41 @@ def _serialize_signal(signal: Signal) -> dict:
         "buy_probability": _safe_float(signal.buy_probability),
         "sell_probability": _safe_float(signal.sell_probability),
         "reason": signal.reason,
+        "blocked_by": _blocked_by_for_reason(signal.reason),
+        "block_reason": signal.reason if signal.action == "hold" else None,
+        "strategy_name": None,
+        "strategy_candidate_scores": None,
+        "regime": None,
+        "ml_confirmation_result": None,
+        "final_decision": signal.action,
         "spread_bps": _safe_float(signal.spread_bps),
         "quote_imbalance": _safe_float(signal.quote_imbalance),
         "model_version": signal.model_version,
     }
+
+
+def _blocked_by_for_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    if reason in {"stale_market_data", "scalping_stale_data_exit"}:
+        return "stale_market_data"
+    if reason in {"spread_too_wide", "spread_unavailable"}:
+        return "spread"
+    if reason in {"quote_imbalance_too_weak", "quote_imbalance_unavailable"}:
+        return "quote_imbalance"
+    if reason == "api_budget_exhausted":
+        return "api_budget"
+    if reason in {"recent_ioc_cancels_too_high", "ioc_cancel_cooldown_active"}:
+        return "ioc_cancel_guard"
+    if reason in {"trade_cooldown_active", "cooldown_after_loss"}:
+        return "cooldown"
+    if reason in {"active_model_invalid", "model_not_profitable_after_costs"}:
+        return "active_model_invalid"
+    if reason == "model_unavailable" or reason.startswith("scalping_buy_probability") or reason.startswith("scalping_confidence"):
+        return "ml_filter"
+    if reason in RISK_BLOCK_REASONS:
+        return "risk_manager"
+    return None
 
 
 def _serialize_order(order: Order) -> dict:
@@ -757,6 +825,89 @@ def _latest_model_summary(model_run: Any | None) -> dict:
         "latest_model_accepted": status == "accepted" if status is not None else None,
         "latest_model_rejected_reason": None if status == "accepted" else metrics.get("promotion_reason") or metrics.get("reason"),
     }
+
+
+def _backtest_observability_summary(settings: Settings) -> dict[str, dict]:
+    empty = {
+        "strategy_level_metrics": {},
+        "regime_level_metrics": {},
+        "blocked_signal_metrics": {},
+    }
+    path = Path(settings.log_dir) / "backtest_report.json"
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return empty
+    metrics = report.get("metrics") if isinstance(report, dict) else None
+    if not isinstance(metrics, dict):
+        return empty
+    return {
+        "strategy_level_metrics": _safe_report_value(metrics.get("strategy_level_metrics", {})),
+        "regime_level_metrics": _safe_report_value(metrics.get("regime_level_metrics", {})),
+        "blocked_signal_metrics": _safe_report_value(metrics.get("blocked_signal_metrics", {})),
+    }
+
+
+def _latest_signal_event(settings: Settings) -> dict[str, Any] | None:
+    path = Path(settings.log_dir) / "events.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines[-500:]):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event_type") == "signal":
+            return _safe_report_value(event)
+    return None
+
+
+def _latest_strategy_payload(latest_signal: dict | None, latest_event: dict[str, Any] | None) -> dict | None:
+    if latest_event is not None:
+        return {
+            "timestamp": latest_event.get("timestamp") or latest_event.get("ts"),
+            "symbol": latest_event.get("symbol"),
+            "action": latest_event.get("action"),
+            "reason": latest_event.get("reason"),
+            "strategy_name": latest_event.get("strategy_name"),
+            "regime": latest_event.get("regime"),
+            "strategy_candidates": latest_event.get("strategy_candidates"),
+            "selected_strategy_signal": latest_event.get("selected_strategy_signal"),
+            "ml_confirmation_result": latest_event.get("ml_confirmation_result"),
+            "final_decision": latest_event.get("final_decision") or latest_event.get("action"),
+            "blocked_by": latest_event.get("blocked_by"),
+            "block_reason": latest_event.get("block_reason"),
+            "quant_score": _first_present(latest_event.get("quant_score"), latest_event.get("strategy_score")),
+            "quant_confidence": _first_present(
+                latest_event.get("quant_confidence"),
+                latest_event.get("strategy_confidence"),
+            ),
+            "ml_buy_probability": _first_present(latest_event.get("ml_buy_probability"), latest_event.get("buy_probability")),
+            "ml_sell_probability": _first_present(latest_event.get("ml_sell_probability"), latest_event.get("sell_probability")),
+            "candidate_strategy_count": latest_event.get("candidate_strategy_count"),
+        }
+    if latest_signal is not None:
+        return latest_signal
+    return None
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _safe_report_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _safe_report_value(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_safe_report_value(child) for child in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return _redact_secrets(value)
 
 
 def _dashboard_model_payload(settings: Settings) -> dict:

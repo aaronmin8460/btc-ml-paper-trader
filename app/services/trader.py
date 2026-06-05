@@ -199,9 +199,33 @@ class Trader:
                     quote_age_seconds=market_context.get("quote_age_seconds"),
                     buy_probability=prediction["buy_probability"],
                     sell_probability=prediction["sell_probability"],
+                    ml_buy_probability=prediction["buy_probability"],
+                    ml_sell_probability=prediction["sell_probability"],
                     sell_probability_source=prediction.get("sell_probability_source", "unspecified"),
                     prediction_source=prediction.get("prediction_source"),
                     model_version=_prediction_model_version(prediction),
+                    strategy_name=decision.strategy_name,
+                    strategy_score=decision.strategy_score,
+                    strategy_confidence=decision.strategy_confidence,
+                    quant_score=decision.strategy_score,
+                    quant_confidence=decision.strategy_confidence,
+                    regime=decision.regime,
+                    regime_confidence=decision.regime_confidence,
+                    blocked_by=decision.blocked_by,
+                    block_reason=decision.block_reason,
+                    candidate_strategy_count=len(decision.strategy_candidates or []),
+                    strategy_candidates=decision.strategy_candidates,
+                    selected_strategy_signal={
+                        "strategy_name": decision.strategy_name,
+                        "score": decision.strategy_score,
+                        "confidence": decision.strategy_confidence,
+                        "reason": (decision.metadata or {}).get("entry_reason") if decision.metadata else None,
+                    }
+                    if decision.strategy_name
+                    else None,
+                    selected_strategy_reason=(decision.metadata or {}).get("entry_reason") if decision.metadata else None,
+                    ml_confirmation_result=decision.ml_confirmation,
+                    final_decision=decision.action,
                     spread_bps=market_context.get("spread_bps"),
                     quote_imbalance=market_context.get("quote_imbalance"),
                     momentum=market_context.get("momentum"),
@@ -286,6 +310,19 @@ class Trader:
             return {
                 "prediction": prediction,
                 "decision": decision.__dict__,
+                "latest_strategy_signal": {
+                    "strategy_name": decision.strategy_name,
+                    "strategy_score": decision.strategy_score,
+                    "strategy_confidence": decision.strategy_confidence,
+                    "strategy_candidates": decision.strategy_candidates,
+                    "selected_strategy_reason": (decision.metadata or {}).get("entry_reason") if decision.metadata else None,
+                },
+                "regime": {
+                    "regime": decision.regime,
+                    "confidence": decision.regime_confidence,
+                    "metadata": (decision.metadata or {}).get("regime") if decision.metadata else None,
+                },
+                "ml_confirmation": decision.ml_confirmation,
                 "order": order_response,
                 "scalping_kill_switch_reason": scalping_kill_switch_reason,
             }
@@ -434,9 +471,9 @@ class Trader:
         scalping_kill_switch_reason: str | None = None,
     ) -> tuple[Decision, bool]:
         if decision.action == "buy" and position.has_position:
-            return Decision(decision.symbol, "hold", "already_holding_btc"), False
+            return _blocked_runtime_decision(decision, "already_holding_btc", "risk_manager"), False
         if decision.action == "sell" and not position.has_position:
-            return Decision(decision.symbol, "hold", "sell_without_position"), False
+            return _blocked_runtime_decision(decision, "sell_without_position", "risk_manager"), False
         if decision.action == "buy" and scalping_kill_switch_reason:
             self.logger.event(
                 "order_blocked",
@@ -444,7 +481,7 @@ class Trader:
                 side=decision.action,
                 reason=scalping_kill_switch_reason,
             )
-            return Decision(decision.symbol, "hold", scalping_kill_switch_reason), False
+            return _blocked_runtime_decision(decision, scalping_kill_switch_reason, "risk_manager"), False
         if decision.action not in {"buy", "sell"}:
             return decision, False
         if self._is_duplicate_bar_order_attempt(decision, latest_bar_timestamp):
@@ -455,7 +492,7 @@ class Trader:
                 reason="duplicate_order_bar",
                 latest_bar_timestamp=latest_bar_timestamp,
             )
-            return Decision(decision.symbol, "hold", "duplicate_order_bar"), False
+            return _blocked_runtime_decision(decision, "duplicate_order_bar", "cooldown"), False
         if self._order_lock.locked():
             age_seconds = self._order_lock_age_seconds()
             self.logger.event(
@@ -466,7 +503,7 @@ class Trader:
                 lock_age_seconds=age_seconds,
                 timeout_seconds=self.settings.order_in_flight_timeout_seconds,
             )
-            return Decision(decision.symbol, "hold", "order_in_flight"), False
+            return _blocked_runtime_decision(decision, "order_in_flight", "risk_manager"), False
         try:
             await asyncio.wait_for(self._order_lock.acquire(), timeout=0.001)
         except asyncio.TimeoutError:
@@ -479,7 +516,7 @@ class Trader:
                 lock_age_seconds=age_seconds,
                 timeout_seconds=self.settings.order_in_flight_timeout_seconds,
             )
-            return Decision(decision.symbol, "hold", "order_in_flight"), False
+            return _blocked_runtime_decision(decision, "order_in_flight", "risk_manager"), False
         self._order_lock_started_at = datetime.now(UTC)
         return decision, True
 
@@ -865,6 +902,24 @@ def _risk_block_details(
             _ensure_utc(latest_ioc_canceled_buy_at) + timedelta(seconds=settings.ioc_cancel_cooldown_seconds)
         ).isoformat()
     return details
+
+
+def _blocked_runtime_decision(decision: Decision, reason: str, blocked_by: str) -> Decision:
+    return Decision(
+        decision.symbol,
+        "hold",
+        reason,
+        blocked_by=blocked_by,
+        block_reason=reason,
+        strategy_name=decision.strategy_name,
+        strategy_score=decision.strategy_score,
+        strategy_confidence=decision.strategy_confidence,
+        regime=decision.regime,
+        regime_confidence=decision.regime_confidence,
+        ml_confirmation=decision.ml_confirmation,
+        strategy_candidates=decision.strategy_candidates,
+        metadata=decision.metadata,
+    )
 
 
 def _cancel_reason(
