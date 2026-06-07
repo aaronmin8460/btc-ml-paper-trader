@@ -21,7 +21,14 @@ import pandas as pd
 from app.backtest.scalping import backtest_assumptions, calculate_fee_aware_metrics
 from app.config import ALLOWED_SYMBOL, Settings, get_settings
 from app.data.feature_engineering import add_features
-from app.data.market_data import MarketDataClient
+from app.data.market_data import (
+    MarketDataClient,
+    StaleMarketDataError,
+    normalize_ohlcv,
+    stale_threshold_for_timeframe,
+)
+from app.db.database import SessionLocal, init_db
+from app.db.models import CollectedMarketData
 from app.ml.registry import ModelRegistry
 from app.risk.risk_manager import PositionState
 from app.strategy.strategies import MarketContext, MarketRegimeFilter, TrendPullbackStrategy
@@ -45,10 +52,38 @@ class ResearchConfig:
     max_hold_bars: int
 
 
+@dataclass(frozen=True)
+class ResearchDataReport:
+    timeframe: str
+    source_used: str
+    latest_timestamp: str | None
+    data_age_minutes: float | None
+    row_count: int
+    synthetic_data_used: bool
+    research_result_valid: bool
+    rejection_reason: str | None = None
+    rejected_sources: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class ResearchBarsResult:
+    bars: pd.DataFrame
+    report: ResearchDataReport
+
+    def __iter__(self):
+        yield self.bars
+        yield self.report.source_used
+
+
 async def main() -> None:
     settings = research_settings(get_settings())
     bar_limit = int(os.getenv("RESEARCH_BAR_LIMIT", str(max(1500, settings.min_training_rows + 500))))
-    report = await run_higher_timeframe_research(settings, bar_limit=bar_limit, output_dir=Path(settings.log_dir))
+    report = await run_higher_timeframe_research(
+        settings,
+        bar_limit=bar_limit,
+        output_dir=Path(settings.log_dir),
+        allow_synthetic_fallback=_synthetic_research_mode_enabled(),
+    )
     print(json.dumps(report, indent=2, default=str))
 
 
@@ -58,21 +93,34 @@ async def run_higher_timeframe_research(
     bar_limit: int = 1500,
     client: MarketDataClient | None = None,
     output_dir: Path | None = None,
+    session_factory: Any | None = None,
+    allow_synthetic_fallback: bool = False,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     settings = research_settings(base_settings)
     client = client or MarketDataClient(settings)
     active_model = ModelRegistry(settings).validate_active_model()
     bars_by_timeframe: dict[str, pd.DataFrame] = {}
-    data_sources: dict[str, str] = {}
+    data_source_reports: dict[str, ResearchDataReport] = {}
+    current_time = _utc_timestamp(now or datetime.now(UTC))
     for timeframe in RESEARCH_TIMEFRAMES:
-        bars, source = await _fetch_research_bars(client, settings, timeframe=timeframe, limit=bar_limit)
-        bars_by_timeframe[timeframe] = bars
-        data_sources[timeframe] = source
+        result = await _fetch_research_bars(
+            client,
+            settings,
+            timeframe=timeframe,
+            limit=bar_limit,
+            session_factory=session_factory,
+            allow_synthetic_fallback=allow_synthetic_fallback,
+            now=current_time,
+        )
+        bars_by_timeframe[timeframe] = result.bars
+        data_source_reports[timeframe] = result.report
     rows = evaluate_research_configs(
         bars_by_timeframe,
         settings,
         active_model_valid=active_model.valid,
         active_model_status=active_model.to_dict(),
+        data_source_reports=data_source_reports,
     )
     output_path = output_dir or Path(settings.log_dir)
     csv_path = output_path / "higher_timeframe_research.csv"
@@ -80,7 +128,7 @@ async def run_higher_timeframe_research(
     summary = build_research_summary(
         rows,
         settings,
-        data_sources=data_sources,
+        data_source_reports=data_source_reports,
         csv_path=csv_path,
         summary_path=summary_path,
         active_model_status=active_model.to_dict(),
@@ -110,8 +158,13 @@ def evaluate_research_configs(
     *,
     active_model_valid: bool,
     active_model_status: dict[str, Any] | None = None,
+    data_source_reports: dict[str, ResearchDataReport | dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    source_reports = {
+        timeframe: _coerce_data_report(timeframe, report)
+        for timeframe, report in (data_source_reports or {}).items()
+    }
     for config in generate_research_configs():
         candidate_settings = research_settings(
             Settings(
@@ -125,16 +178,20 @@ def evaluate_research_configs(
             )
         )
         bars = bars_by_timeframe.get(config.timeframe, pd.DataFrame())
-        if bars.empty:
-            metrics = _empty_research_metrics("no_bars")
+        source_report = source_reports.get(config.timeframe)
+        source_valid = source_report.research_result_valid if source_report is not None else True
+        synthetic_data_used = source_report.synthetic_data_used if source_report is not None else False
+        if bars.empty or not source_valid:
+            metrics = _empty_research_metrics("invalid_research_data_source" if not source_valid else "no_bars")
         else:
             trades, signal_frame = build_research_trades(bars, candidate_settings, config)
             metrics = calculate_fee_aware_metrics(trades, candidate_settings, signal_frame=signal_frame)
         readiness = paper_forward_readiness_gate(
             metrics,
             candidate_settings,
-            fallback_prediction_used=False,
+            fallback_prediction_used=synthetic_data_used,
             active_model_valid=active_model_valid,
+            research_result_valid=source_valid,
         )
         rows.append(
             {
@@ -157,7 +214,15 @@ def evaluate_research_configs(
                 "single_trade_return_concentration": single_trade_return_concentration(
                     metrics.get("trade_details", [])
                 ),
-                "fallback_prediction_used": False,
+                "source_used": source_report.source_used if source_report is not None else "unknown",
+                "latest_timestamp": source_report.latest_timestamp if source_report is not None else None,
+                "data_age_minutes": source_report.data_age_minutes if source_report is not None else None,
+                "row_count": source_report.row_count if source_report is not None else int(len(bars)),
+                "synthetic_data_used": synthetic_data_used,
+                "research_result_valid": source_valid,
+                "data_rejection_reason": source_report.rejection_reason if source_report is not None else None,
+                "rejected_sources": list(source_report.rejected_sources) if source_report is not None else [],
+                "fallback_prediction_used": synthetic_data_used,
                 "active_model_valid": bool(active_model_valid),
                 "active_model_status": (active_model_status or {}).get("active_model_status"),
                 "economically_viable": readiness["economically_viable"],
@@ -277,8 +342,11 @@ def paper_forward_readiness_gate(
     *,
     fallback_prediction_used: bool,
     active_model_valid: bool,
+    research_result_valid: bool = True,
 ) -> dict[str, Any]:
     reasons: list[str] = []
+    if not research_result_valid:
+        reasons.append("research_data_source_invalid")
     if _metric_float(metrics.get("net_return_pct")) <= 0:
         reasons.append("net_return_not_positive")
     if _profit_factor_value(metrics.get("profit_factor_net")) < MIN_RESEARCH_PROFIT_FACTOR_NET:
@@ -305,14 +373,40 @@ def build_research_summary(
     rows: list[dict[str, Any]],
     settings: Settings,
     *,
-    data_sources: dict[str, str],
+    data_sources: dict[str, str] | None = None,
+    data_source_reports: dict[str, ResearchDataReport | dict[str, Any]] | None = None,
     csv_path: Path,
     summary_path: Path,
     active_model_status: dict[str, Any],
 ) -> dict[str, Any]:
     ranked = sorted(rows, key=lambda row: float(row.get("rank_score", -1_000_000.0)), reverse=True)
-    economically_viable = [row for row in ranked if row.get("economically_viable")]
-    eligible = [row for row in ranked if row.get("paper_forward_eligible")]
+    raw_economically_viable = [row for row in ranked if row.get("economically_viable")]
+    source_reports = _summary_source_reports(data_source_reports=data_source_reports, data_sources=data_sources)
+    source_report_payload = {timeframe: _data_report_to_dict(report) for timeframe, report in source_reports.items()}
+    data_source_names = {timeframe: report.source_used for timeframe, report in source_reports.items()}
+    synthetic_data_used = any(report.synthetic_data_used for report in source_reports.values()) or any(
+        bool(row.get("synthetic_data_used")) for row in ranked
+    )
+    research_result_valid = (
+        bool(source_reports)
+        and all(report.research_result_valid for report in source_reports.values())
+        and not synthetic_data_used
+    )
+    economically_viable = [] if synthetic_data_used or not research_result_valid else raw_economically_viable
+    eligible = [] if synthetic_data_used or not research_result_valid else [
+        row for row in ranked if row.get("paper_forward_eligible")
+    ]
+    notes = [
+        "Higher-timeframe research is offline analysis only and never enables trading.",
+        "No configuration is auto-applied or promoted from this report.",
+        "Paper-forward eligibility also requires the existing active model registry to validate.",
+        "Research validity requires fresh non-synthetic data for every timeframe.",
+    ]
+    if synthetic_data_used:
+        notes.append(
+            "Synthetic bars were used only because explicit test/demo mode allowed it; "
+            "this report is invalid for trading decisions."
+        )
     return _json_safe(
         {
             "generated_at": datetime.now(UTC).isoformat(),
@@ -326,9 +420,22 @@ def build_research_summary(
             "auto_apply_best_config": False,
             "paper_forward_eligible_config_count": len(eligible),
             "economically_viable_config_count": len(economically_viable),
+            "source_used": data_source_names,
+            "latest_timestamp": {
+                timeframe: report.latest_timestamp for timeframe, report in source_reports.items()
+            },
+            "data_age_minutes": {
+                timeframe: report.data_age_minutes for timeframe, report in source_reports.items()
+            },
+            "row_count": {
+                timeframe: report.row_count for timeframe, report in source_reports.items()
+            },
+            "synthetic_data_used": synthetic_data_used,
+            "research_result_valid": research_result_valid,
             "csv_path": str(csv_path),
             "summary_path": str(summary_path),
-            "data_sources": data_sources,
+            "data_sources": data_source_names,
+            "timeframe_data": source_report_payload,
             "parameter_space": {
                 "timeframes": list(RESEARCH_TIMEFRAMES),
                 "take_profit_pct": list(TAKE_PROFIT_VALUES),
@@ -341,11 +448,7 @@ def build_research_summary(
             "paper_forward_eligible_configs": eligible[:10],
             "rejected_configs": [row for row in ranked if not row.get("paper_forward_eligible")][:50],
             "all_results": ranked,
-            "notes": [
-                "Higher-timeframe research is offline analysis only and never enables trading.",
-                "No configuration is auto-applied or promoted from this report.",
-                "Paper-forward eligibility also requires the existing active model registry to validate.",
-            ],
+            "notes": notes,
         }
     )
 
@@ -368,19 +471,319 @@ def write_research_outputs(
 
 
 async def _fetch_research_bars(
-    client: MarketDataClient,
+    client: Any,
     settings: Settings,
     *,
     timeframe: str,
     limit: int,
-) -> tuple[pd.DataFrame, str]:
+    session_factory: Any | None = None,
+    allow_synthetic_fallback: bool = False,
+    now: datetime | None = None,
+) -> ResearchBarsResult:
+    current_time = _utc_timestamp(now or datetime.now(UTC))
+    min_rows = _minimum_research_rows(settings, limit)
+    rejected_sources: list[dict[str, Any]] = []
+
+    sqlite_bars = _load_collected_market_data(
+        settings,
+        timeframe=timeframe,
+        limit=limit,
+        session_factory=session_factory,
+    )
+    sqlite_report = _assess_research_bars(
+        sqlite_bars,
+        source_used="collected_market_data",
+        timeframe=timeframe,
+        min_rows=min_rows,
+        now=current_time,
+        synthetic_data_used=False,
+    )
+    if sqlite_report.research_result_valid:
+        return ResearchBarsResult(sqlite_bars, sqlite_report)
+    rejected_sources.append(_data_report_to_rejected_source(sqlite_report))
+
     if isinstance(client, MarketDataClient) and not (settings.alpaca_api_key and settings.alpaca_secret_key):
-        return MarketDataClient.synthetic_btc_bars(limit=limit, timeframe=timeframe), "synthetic_no_alpaca_credentials"
-    try:
-        bars = await client.fetch_bars(settings.symbol, timeframe=timeframe, limit=limit, force_refresh=True)
-        return bars, "market_data_client"
-    except Exception:
-        return MarketDataClient.synthetic_btc_bars(limit=limit, timeframe=timeframe), "synthetic_fallback_after_fetch_error"
+        rejected_sources.append(
+            {
+                "source": "market_data_client",
+                "status": "unavailable",
+                "reason": "alpaca_credentials_missing",
+                "latest_timestamp": None,
+                "data_age_minutes": None,
+                "row_count": 0,
+            }
+        )
+    else:
+        try:
+            client_bars = await client.fetch_bars(settings.symbol, timeframe=timeframe, limit=limit, force_refresh=True)
+            client_report = _assess_research_bars(
+                client_bars,
+                source_used="market_data_client",
+                timeframe=timeframe,
+                min_rows=min_rows,
+                now=current_time,
+                synthetic_data_used=False,
+            )
+            if client_report.research_result_valid:
+                return ResearchBarsResult(client_bars, client_report)
+            rejected_sources.append(_data_report_to_rejected_source(client_report))
+        except Exception as exc:
+            latest_timestamp = _latest_timestamp_from_error(exc)
+            rejected_sources.append(
+                {
+                    "source": "market_data_client",
+                    "status": "stale" if isinstance(exc, StaleMarketDataError) else "fetch_error",
+                    "reason": "stale_latest_timestamp" if isinstance(exc, StaleMarketDataError) else type(exc).__name__,
+                    "latest_timestamp": latest_timestamp,
+                    "data_age_minutes": _data_age_minutes_from_iso(latest_timestamp, current_time),
+                    "row_count": 0,
+                }
+            )
+
+    if allow_synthetic_fallback:
+        synthetic_bars = MarketDataClient.synthetic_btc_bars(limit=limit, timeframe=timeframe)
+        synthetic_report = _assess_research_bars(
+            synthetic_bars,
+            source_used="synthetic_explicit_test_demo_mode",
+            timeframe=timeframe,
+            min_rows=min_rows,
+            now=current_time,
+            synthetic_data_used=True,
+            force_invalid_reason="synthetic_data_not_valid_for_research_decisions",
+        )
+        return ResearchBarsResult(
+            synthetic_bars,
+            _with_rejected_sources(synthetic_report, rejected_sources),
+        )
+
+    report = ResearchDataReport(
+        timeframe=timeframe,
+        source_used="no_valid_real_data_source",
+        latest_timestamp=None,
+        data_age_minutes=None,
+        row_count=0,
+        synthetic_data_used=False,
+        research_result_valid=False,
+        rejection_reason="no_fresh_real_bars_available",
+        rejected_sources=tuple(rejected_sources),
+    )
+    return ResearchBarsResult(pd.DataFrame(), report)
+
+
+def _load_collected_market_data(
+    settings: Settings,
+    *,
+    timeframe: str,
+    limit: int,
+    session_factory: Any | None,
+) -> pd.DataFrame:
+    if session_factory is None:
+        init_db()
+        session_factory = SessionLocal
+    with session_factory() as db:
+        rows = (
+            db.query(CollectedMarketData)
+            .filter(
+                CollectedMarketData.symbol == settings.symbol,
+                CollectedMarketData.timeframe == timeframe,
+            )
+            .order_by(CollectedMarketData.timestamp.desc())
+            .limit(limit)
+            .all()
+        )
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    records = [
+        {
+            "timestamp": row.timestamp,
+            "open": row.open,
+            "high": row.high,
+            "low": row.low,
+            "close": row.close,
+            "volume": row.volume,
+        }
+        for row in reversed(rows)
+    ]
+    return normalize_ohlcv(pd.DataFrame(records))
+
+
+def _assess_research_bars(
+    bars: pd.DataFrame,
+    *,
+    source_used: str,
+    timeframe: str,
+    min_rows: int,
+    now: datetime,
+    synthetic_data_used: bool,
+    force_invalid_reason: str | None = None,
+) -> ResearchDataReport:
+    normalized = normalize_ohlcv(bars) if not bars.empty else bars
+    latest = _latest_timestamp(normalized)
+    age_minutes = _data_age_minutes(latest, now)
+    rejection_reasons: list[str] = []
+    if len(normalized) < min_rows:
+        rejection_reasons.append(f"row_count_below_required_{min_rows}")
+    if latest is None:
+        rejection_reasons.append("latest_timestamp_missing")
+    elif age_minutes is not None:
+        max_age_minutes = stale_threshold_for_timeframe(timeframe).total_seconds() / 60
+        if age_minutes > max_age_minutes:
+            rejection_reasons.append(f"stale_latest_timestamp_age_minutes_gt_{max_age_minutes:g}")
+    if synthetic_data_used:
+        rejection_reasons.append(force_invalid_reason or "synthetic_data_not_valid_for_research_decisions")
+    elif force_invalid_reason:
+        rejection_reasons.append(force_invalid_reason)
+    return ResearchDataReport(
+        timeframe=timeframe,
+        source_used=source_used,
+        latest_timestamp=latest.isoformat() if latest is not None else None,
+        data_age_minutes=age_minutes,
+        row_count=int(len(normalized)),
+        synthetic_data_used=synthetic_data_used,
+        research_result_valid=not rejection_reasons,
+        rejection_reason=";".join(rejection_reasons) if rejection_reasons else None,
+    )
+
+
+def _minimum_research_rows(settings: Settings, limit: int) -> int:
+    return max(1, min(int(limit), max(MIN_RESEARCH_TRADES * 10, int(settings.min_training_rows))))
+
+
+def _latest_timestamp(bars: pd.DataFrame) -> pd.Timestamp | None:
+    if bars.empty or "timestamp" not in bars:
+        return None
+    latest = pd.Timestamp(bars["timestamp"].iloc[-1])
+    if latest.tzinfo is None:
+        latest = latest.tz_localize("UTC")
+    else:
+        latest = latest.tz_convert("UTC")
+    return latest
+
+
+def _data_age_minutes(latest: pd.Timestamp | None, now: datetime) -> float | None:
+    if latest is None:
+        return None
+    current_time = _utc_timestamp(now)
+    return max(0.0, (pd.Timestamp(current_time) - latest).total_seconds() / 60)
+
+
+def _utc_timestamp(value: Any) -> datetime:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return timestamp.to_pydatetime()
+
+
+def _data_report_to_rejected_source(report: ResearchDataReport) -> dict[str, Any]:
+    return {
+        "source": report.source_used,
+        "status": "stale" if _report_is_stale(report) else "rejected",
+        "reason": report.rejection_reason,
+        "latest_timestamp": report.latest_timestamp,
+        "data_age_minutes": report.data_age_minutes,
+        "row_count": report.row_count,
+    }
+
+
+def _report_is_stale(report: ResearchDataReport) -> bool:
+    return "stale_latest_timestamp" in (report.rejection_reason or "")
+
+
+def _with_rejected_sources(
+    report: ResearchDataReport,
+    rejected_sources: list[dict[str, Any]],
+) -> ResearchDataReport:
+    return ResearchDataReport(
+        timeframe=report.timeframe,
+        source_used=report.source_used,
+        latest_timestamp=report.latest_timestamp,
+        data_age_minutes=report.data_age_minutes,
+        row_count=report.row_count,
+        synthetic_data_used=report.synthetic_data_used,
+        research_result_valid=report.research_result_valid,
+        rejection_reason=report.rejection_reason,
+        rejected_sources=tuple(rejected_sources),
+    )
+
+
+def _coerce_data_report(timeframe: str, value: ResearchDataReport | dict[str, Any]) -> ResearchDataReport:
+    if isinstance(value, ResearchDataReport):
+        return value
+    source_used = str(value.get("source_used", value.get("source", "unknown")))
+    synthetic_data_used = bool(value.get("synthetic_data_used", source_used.startswith("synthetic")))
+    return ResearchDataReport(
+        timeframe=timeframe,
+        source_used=source_used,
+        latest_timestamp=value.get("latest_timestamp"),
+        data_age_minutes=value.get("data_age_minutes"),
+        row_count=int(value.get("row_count", 0) or 0),
+        synthetic_data_used=synthetic_data_used,
+        research_result_valid=bool(value.get("research_result_valid", not synthetic_data_used)),
+        rejection_reason=value.get("rejection_reason"),
+        rejected_sources=tuple(value.get("rejected_sources", ())),
+    )
+
+
+def _summary_source_reports(
+    *,
+    data_source_reports: dict[str, ResearchDataReport | dict[str, Any]] | None,
+    data_sources: dict[str, str] | None,
+) -> dict[str, ResearchDataReport]:
+    if data_source_reports:
+        return {
+            timeframe: _coerce_data_report(timeframe, report)
+            for timeframe, report in data_source_reports.items()
+        }
+    return {
+        timeframe: ResearchDataReport(
+            timeframe=timeframe,
+            source_used=source,
+            latest_timestamp=None,
+            data_age_minutes=None,
+            row_count=0,
+            synthetic_data_used=source.startswith("synthetic"),
+            research_result_valid=not source.startswith("synthetic"),
+        )
+        for timeframe, source in (data_sources or {}).items()
+    }
+
+
+def _data_report_to_dict(report: ResearchDataReport) -> dict[str, Any]:
+    return {
+        "source_used": report.source_used,
+        "latest_timestamp": report.latest_timestamp,
+        "data_age_minutes": report.data_age_minutes,
+        "row_count": report.row_count,
+        "synthetic_data_used": report.synthetic_data_used,
+        "research_result_valid": report.research_result_valid,
+        "rejection_reason": report.rejection_reason,
+        "rejected_sources": list(report.rejected_sources),
+    }
+
+
+def _latest_timestamp_from_error(exc: Exception) -> str | None:
+    marker = "latest_timestamp="
+    message = str(exc)
+    if marker not in message:
+        return None
+    value = message.split(marker, 1)[1].split(" ", 1)[0]
+    return value or None
+
+
+def _data_age_minutes_from_iso(value: str | None, now: datetime) -> float | None:
+    if value is None:
+        return None
+    return _data_age_minutes(pd.Timestamp(value), now)
+
+
+def _synthetic_research_mode_enabled() -> bool:
+    return _env_flag("RESEARCH_ALLOW_SYNTHETIC_FALLBACK") or _env_flag("RESEARCH_DEMO_MODE")
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _signal_row(
