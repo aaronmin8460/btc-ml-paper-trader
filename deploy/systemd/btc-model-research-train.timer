@@ -1,0 +1,11 @@
+[Unit]
+Description=Run BTC/USD safe model research/train pipeline every 6 hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=btc-model-research-train.service
+
+[Install]
+WantedBy=timers.target

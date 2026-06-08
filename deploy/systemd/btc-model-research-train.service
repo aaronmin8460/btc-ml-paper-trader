@@ -1,0 +1,14 @@
+[Unit]
+Description=BTC/USD safe model research/train pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/btc-ml-paper-trader
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/btc-ml-paper-trader/.venv/bin/python scripts/auto_research_train.py --run --json
+NoNewPrivileges=true
+PrivateTmp=true
