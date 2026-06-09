@@ -127,6 +127,19 @@ def _write_bars(
                 "low": float(row["low"]),
                 "close": float(row["close"]),
                 "volume": float(row["volume"]),
+                "source": "alpaca" if settings.alpaca_api_key and settings.alpaca_secret_key else "synthetic_fallback",
+                "source_used": "market_data_client",
+                "backfilled": False,
+                "provider_metadata": json.dumps(
+                    {
+                        "collection_path": "collect_market_data",
+                        "timeframe": timeframe,
+                        "real_provider_credentials_present": bool(
+                            settings.alpaca_api_key and settings.alpaca_secret_key
+                        ),
+                    },
+                    sort_keys=True,
+                ),
                 "collected_at": datetime.now(UTC),
                 **quote_fields,
             }

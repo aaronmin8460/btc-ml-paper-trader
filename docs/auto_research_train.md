@@ -34,6 +34,8 @@ Auto trading evaluates live signals and may submit paper orders when enabled. Th
 
 ## Manual Commands
 
+Historical backfill can be used before these commands to speed up readiness checks without enabling trading. See `docs/historical_backfill.md`.
+
 Dry-run inspection:
 
 ```bash
