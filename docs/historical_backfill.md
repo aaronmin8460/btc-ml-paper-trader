@@ -71,7 +71,7 @@ Only run this after the dry-run report shows real provider data and safe flags:
   --json
 ```
 
-For rare 5Min/15Min dip-and-rebound research, start with 30 days, then consider deeper real-data backfills after the safety report is clean. Do not run these from the research script automatically:
+For higher-timeframe research, start with 30 days, then consider deeper real-data backfills after the safety report is clean. Do not run these from the research script automatically:
 
 ```bash
 .venv/bin/python scripts/backfill_market_data.py \
@@ -123,14 +123,17 @@ SYMBOL=BTC/USD
 
 ## Run Auto Research/Train After Backfill
 
-Run the higher-timeframe buy-the-dip research with a larger chronological window:
+Buy-the-Dip v2 has been rejected on real roughly 180-day BTC/USD data. It generated enough trades, but zero configs survived conservative fee, slippage, and spread assumptions. Do not train on it or connect it to paper-forward.
+
+Run v3 higher-timeframe research with a larger chronological window:
 
 ```bash
 .venv/bin/python scripts/research_higher_timeframe.py \
-  --strategy buy_the_dip_mean_reversion \
-  --max-rows-5min 8000 \
-  --max-rows-15min 2880 \
-  --max-buy-dip-configs 2000 \
+  --strategy all \
+  --max-rows-15min 17274 \
+  --max-rows-1h 5000 \
+  --max-v3-configs 5000 \
+  --walk-forward-splits 4 \
   --json
 ```
 

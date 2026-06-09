@@ -118,11 +118,13 @@ SYMBOL=BTC/USD
 
 The 15Min research path needs enough real collected bars to cover indicator warmup, label horizons, trade simulation, and validation without leaning on stale market-data-client output or synthetic fallback. Around 1000 collected rows gives the research script enough sample depth to reject weak configs honestly instead of overreading a tiny window.
 
-## Buy-The-Dip V2 Research
+## Buy-The-Dip V2 Rejected
 
-`buy_the_dip_mean_reversion` is an offline 5Min/15Min research strategy. It looks for BTC/USD pullbacks that are stretched below short-term fair value, show stabilization, and have targets larger than conservative round-trip costs. It is long-only and research-only.
+`buy_the_dip_mean_reversion` v2 is now a historical rejected strategy. It was evaluated on real roughly 180-day BTC/USD `collected_market_data`, generated enough trades, and still failed after conservative fee, slippage, and spread assumptions.
 
-For this strategy, rare oversold bounce events usually need a longer historical window than the default timer run. After a safe 30-day backfill, consider 180-day or 365-day real-data backfills, then run:
+Gross return could look positive in some configs, but net return did not survive costs. It must not be connected to training, promotion, paper-forward, or trading.
+
+The old command remains available only for historical reproduction:
 
 ```bash
 .venv/bin/python scripts/research_higher_timeframe.py \
@@ -133,9 +135,25 @@ For this strategy, rare oversold bounce events usually need a longer historical 
   --json
 ```
 
-The v2 report penalizes one-trade luck. Configs below 20 trades are marked `statistically_weak`, configs with one dominant winner are ranked lower, and the report separates best configs with any trades from best configs with 20+ and 50+ trades.
+The v2 report penalizes one-trade luck. Configs below 20 trades are marked `statistically_weak`, configs with one dominant winner are ranked lower, and the report separates best configs with any trades from best configs with 20+ and 50+ trades. The verified real-data outcome had zero economically viable configs.
 
-Future buy-the-dip labels are scaffolded separately from the current 1Min scalping training path. They must not be wired into training until a manually reviewed economically viable config exists, data is real and fresh, take-profit exceeds the conservative cost requirement, and chronological validation remains intact.
+Do not train on Buy-the-Dip v2.
+
+## Strategy Research V3
+
+Use v3 for new research:
+
+```bash
+.venv/bin/python scripts/research_higher_timeframe.py \
+  --strategy all \
+  --max-rows-15min 17274 \
+  --max-rows-1h 5000 \
+  --max-v3-configs 5000 \
+  --walk-forward-splits 4 \
+  --json
+```
+
+V3 supports `uptrend_pullback` and `volatility_breakout` on `15Min` and `1H`. If raw `1H` bars are unavailable, complete hourly bars are derived chronologically from real `15Min` `collected_market_data`.
 
 ## Paper-Forward Is Not Trading Permission
 

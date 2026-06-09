@@ -308,7 +308,21 @@ def test_auto_research_train_reports_buy_the_dip_v2_trainability_fields():
             "buy_the_dip_20_plus_trade_configs": 5,
             "buy_the_dip_profitable_20_plus_trade_configs": 1,
             "buy_the_dip_economically_viable_count": 0,
+            "buy_the_dip_rejected": True,
             "buy_the_dip_best_config_20_plus_trades": {"parameter_set_id": "btd_20_plus"},
+            "strategy_breakdown": {
+                "uptrend_pullback": {"configs_tested": 120, "research_promising_count": 0},
+                "volatility_breakout": {"configs_tested": 80, "research_promising_count": 0},
+            },
+            "all_results": [
+                {
+                    "parameter_set_id": "utp_best",
+                    "strategy_name": "uptrend_pullback",
+                    "adjusted_rank_score": -100.0,
+                    "net_return_pct": -0.01,
+                    "number_of_trades": 24,
+                }
+            ],
         },
     }
 
@@ -319,7 +333,45 @@ def test_auto_research_train_reports_buy_the_dip_v2_trainability_fields():
     assert summary["buy_the_dip_configs_tested"] == 2000
     assert summary["buy_the_dip_20_plus_trade_configs"] == 5
     assert summary["buy_the_dip_profitable_20_plus_trade_configs"] == 1
+    assert summary["buy_the_dip_rejected"] is True
+    assert summary["uptrend_pullback_research_available"] is True
+    assert summary["volatility_breakout_research_available"] is True
+    assert summary["uptrend_pullback_promising_count"] == 0
+    assert summary["volatility_breakout_promising_count"] == 0
+    assert summary["best_v3_strategy"] == "uptrend_pullback"
+    assert summary["best_v3_config"]["parameter_set_id"] == "utp_best"
     assert summary["training_skipped_no_trainable_strategy_exists_yet"] is True
+    assert summary["training_skipped_because_no_viable_trainable_strategy_exists"] is True
+
+
+def test_auto_research_train_blocks_training_without_promising_v3_strategy(tmp_path):
+    settings = _settings(tmp_path, timeframe="15Min")
+    safety = art.evaluate_environment_safety(
+        art.load_effective_env(env=_safe_env(tmp_path), env_path=Path("/missing")),
+        inspection_only_dry_run=False,
+    )
+    gates = art.evaluate_training_gates(
+        mode="run",
+        settings=settings,
+        safety=safety,
+        data_readiness_by_timeframe={"15Min": {"ready_for_training": True}},
+        diagnostics_summary={
+            "current_target_safe_vs_cost": True,
+            "label_diagnostics": {"enough_buy_labels": True},
+        },
+        research_summary={
+            "synthetic_data_used": False,
+            "economically_viable_config_count": 1,
+            "buy_the_dip_economically_viable_count": 1,
+            "uptrend_pullback_promising_count": 0,
+            "volatility_breakout_promising_count": 0,
+            "all_results": [],
+        },
+    )
+
+    assert gates["all_gates_passed"] is False
+    assert "no_viable_trainable_strategy_exists" in gates["blocked_reasons"]
+    assert gates["gates"]["v3_trainable_strategy_exists"]["passed"] is False
 
 
 def test_systemd_service_does_not_start_paper_trader_service():
@@ -363,6 +415,7 @@ def test_reports_always_include_orders_placed_zero(monkeypatch, tmp_path):
         get_settings.cache_clear()
 
     assert report["orders_placed"] == 0
+    assert report["synthetic_data_used"] is False
     latest_report = tmp_path / "logs" / art.LATEST_REPORT_NAME
     assert latest_report.exists()
     assert '"orders_placed": 0' in latest_report.read_text(encoding="utf-8")

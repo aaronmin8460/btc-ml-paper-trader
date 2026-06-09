@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -14,20 +15,30 @@ from app.strategy.strategies import MarketContext, MarketRegime, TrendPullbackSt
 from scripts.research_higher_timeframe import (
     BUY_THE_DIP_SIGNAL_PROFILES,
     BUY_THE_DIP_STRATEGY,
+    UPTREND_PULLBACK_STRATEGY,
+    VOLATILITY_BREAKOUT_STRATEGY,
     ResearchDataReport,
     ResearchConfig,
+    build_uptrend_pullback_research_trades,
     build_buy_the_dip_research_trades,
+    build_volatility_breakout_research_trades,
     build_research_summary,
+    chronological_walk_forward_splits,
+    derive_1h_bars_from_15min,
+    evaluate_research_configs,
     _fetch_research_bars,
     generate_buy_the_dip_configs,
     generate_buy_the_dip_signal_profiles,
     generate_research_configs,
     generate_trend_pullback_configs,
+    generate_uptrend_pullback_configs,
+    generate_volatility_breakout_configs,
     paper_forward_readiness_gate,
     prepare_buy_the_dip_features,
     research_rank_details,
     research_settings,
     run_higher_timeframe_research,
+    summarize_walk_forward_metrics,
 )
 
 
@@ -120,6 +131,15 @@ def test_higher_timeframe_research_settings_do_not_enable_trading():
     assert settings.allow_fallback_trading is False
 
 
+def test_buy_the_dip_v2_rejected_strategy_documentation_exists():
+    note = (Path("docs/strategy_research_v3.md")).read_text(encoding="utf-8").lower()
+
+    assert "buy-the-dip mean reversion v2 rejected" in note
+    assert "roughly 180 days" in note
+    assert "do not train on it" in note
+    assert "zero" in note
+
+
 def test_research_config_space_matches_requested_values():
     configs = generate_trend_pullback_configs()
 
@@ -129,9 +149,18 @@ def test_research_config_space_matches_requested_values():
     assert {config.max_hold_bars for config in configs} == {6, 12, 24, 48}
     all_configs = generate_research_configs()
     buy_the_dip_configs = generate_buy_the_dip_configs()
-    assert len(all_configs) == len(configs) + len(buy_the_dip_configs)
+    uptrend_configs = generate_uptrend_pullback_configs()
+    breakout_configs = generate_volatility_breakout_configs()
+    assert len(all_configs) == 48 + len(buy_the_dip_configs) + len(uptrend_configs) + len(breakout_configs)
     assert {config.strategy_name for config in configs} == {"trend_pullback"}
     assert {config.strategy_name for config in buy_the_dip_configs} == {BUY_THE_DIP_STRATEGY}
+    assert {config.strategy_name for config in uptrend_configs} == {UPTREND_PULLBACK_STRATEGY}
+    assert {config.strategy_name for config in breakout_configs} == {VOLATILITY_BREAKOUT_STRATEGY}
+    assert {config.timeframe for config in uptrend_configs} == {"15Min", "1H"}
+    assert {config.take_profit_pct for config in uptrend_configs} == {0.015, 0.02, 0.03, 0.04}
+    assert {config.stop_loss_pct for config in uptrend_configs} == {0.008, 0.012, 0.015, 0.02}
+    assert {config.take_profit_pct for config in breakout_configs} == {0.02, 0.03, 0.04, 0.05}
+    assert {config.stop_loss_pct for config in breakout_configs} == {0.01, 0.015, 0.02}
     assert {config.take_profit_pct for config in buy_the_dip_configs} == {0.0086, 0.01, 0.0125, 0.015, 0.02, 0.025}
     assert len(generate_buy_the_dip_signal_profiles()) > len(BUY_THE_DIP_SIGNAL_PROFILES)
     assert any(config.timeframe == "15Min" for config in generate_buy_the_dip_configs(max_configs=120))
@@ -366,6 +395,179 @@ def test_buy_the_dip_mean_reversion_is_deterministic_on_fixture_data():
         first_trades[columns].reset_index(drop=True),
         second_trades[columns].reset_index(drop=True),
     )
+
+
+def _uptrend_pullback_config(**overrides) -> ResearchConfig:
+    values = {
+        "parameter_set_id": "utp_test",
+        "strategy_name": UPTREND_PULLBACK_STRATEGY,
+        "timeframe": "15Min",
+        "take_profit_pct": 0.02,
+        "stop_loss_pct": 0.012,
+        "max_hold_bars": 12,
+        "support": "ema20",
+        "support_distance_pct": 0.01,
+        "pullback_min_pct": 0.01,
+        "pullback_max_pct": 0.08,
+        "rsi_min": 35.0,
+        "rsi_max": 55.0,
+        "confirmation": "bullish_close",
+        "min_lower_wick_ratio": 0.20,
+        "min_volume_recovery": -0.75,
+        "max_atr_expansion": 2.5,
+    }
+    values.update(overrides)
+    return ResearchConfig(**values)
+
+
+def _volatility_breakout_config(**overrides) -> ResearchConfig:
+    values = {
+        "parameter_set_id": "vbo_test",
+        "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+        "timeframe": "15Min",
+        "take_profit_pct": 0.03,
+        "stop_loss_pct": 0.015,
+        "max_hold_bars": 12,
+        "min_volume_zscore": 0.5,
+        "breakout_lookback": 20,
+        "consolidation_lookback": 12,
+        "min_body_vs_avg": 1.0,
+        "min_recent_return_pct": 0.002,
+        "min_trend_strength": 0.0,
+        "max_atr_expansion": 2.5,
+    }
+    values.update(overrides)
+    return ResearchConfig(**values)
+
+
+def _v3_feature_rows(*, strategy: str) -> pd.DataFrame:
+    start = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+    rows = []
+    for index in range(48):
+        close = 100.0 + index * 0.02
+        if strategy == VOLATILITY_BREAKOUT_STRATEGY:
+            close = 105.0 + index * 0.03
+        rows.append(
+            {
+                "timestamp": start + timedelta(minutes=15 * index),
+                "open": close * 0.998,
+                "high": close * 1.001,
+                "low": close * 0.997,
+                "close": close,
+                "volume": 10.0 + index,
+                "ema_20": close * 0.99,
+                "ema_50": close * 0.985,
+                "ema_20_slope_5": 0.001,
+                "ema_50_slope_5": 0.001,
+                "ema_50_above_200": True,
+                "close_above_ema_200": True,
+                "pullback_from_high_50": 0.03,
+                "support_distance_ema20_abs": 0.004,
+                "support_distance_ema50_abs": 0.008,
+                "support_distance_vwap_abs": 0.005,
+                "rsi_14": 45.0,
+                "bullish_close": True,
+                "recovers_prior_high": False,
+                "lower_wick_ratio": 0.35,
+                "close_position_in_candle": 0.65,
+                "volume_zscore_20": 1.1,
+                "atr_expansion_20": 1.1,
+                "atr_downside_explosion": False,
+                "extreme_crash_candle": False,
+                "log_return_3": 0.004,
+                "log_return_5": 0.006,
+                "body_vs_avg_20": 1.4,
+                "trend_strength_20": 0.5,
+                "prior_rolling_high_20": close * 0.995,
+                "range_width_12": 0.03,
+            }
+        )
+    frame = pd.DataFrame(rows)
+    frame.loc[14:16, "high"] = frame.loc[14:16, "close"] * 1.05
+    return frame
+
+
+def test_uptrend_pullback_produces_expected_long_only_entries_on_fixture_data():
+    trades, signals = build_uptrend_pullback_research_trades(
+        _v3_feature_rows(strategy=UPTREND_PULLBACK_STRATEGY),
+        _settings(),
+        _uptrend_pullback_config(),
+    )
+
+    assert not trades.empty
+    assert not signals.empty
+    assert set(trades["strategy_name"]) == {UPTREND_PULLBACK_STRATEGY}
+    assert set(trades["entry_reason"]) == {"uptrend_pullback_support_reclaim_candidate"}
+    assert set(trades["ml_sell_probability"]) == {0.0}
+    assert "side" not in trades.columns
+
+
+def test_volatility_breakout_produces_expected_long_only_entries_on_fixture_data():
+    trades, signals = build_volatility_breakout_research_trades(
+        _v3_feature_rows(strategy=VOLATILITY_BREAKOUT_STRATEGY),
+        _settings(),
+        _volatility_breakout_config(),
+    )
+
+    assert not trades.empty
+    assert not signals.empty
+    assert set(trades["strategy_name"]) == {VOLATILITY_BREAKOUT_STRATEGY}
+    assert set(trades["entry_reason"]) == {"volatility_breakout_momentum_continuation_candidate"}
+    assert set(trades["ml_sell_probability"]) == {0.0}
+    assert "short" not in set(str(reason).lower() for reason in trades["entry_reason"])
+
+
+def test_1h_bars_are_derived_chronologically_from_15min_data_without_partial_future_hour():
+    start = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+    rows = []
+    for index in [5, 0, 1, 2, 3, 4, 6, 7, 8]:
+        timestamp = start + timedelta(minutes=15 * index)
+        price = 100.0 + index
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "open": price,
+                "high": price + 0.5,
+                "low": price - 0.5,
+                "close": price + 0.25,
+                "volume": 1.0,
+            }
+        )
+
+    derived = derive_1h_bars_from_15min(pd.DataFrame(rows))
+
+    assert list(derived["timestamp"]) == [pd.Timestamp(start), pd.Timestamp(start + timedelta(hours=1))]
+    assert derived.iloc[0]["open"] == 100.0
+    assert derived.iloc[0]["close"] == 103.25
+    assert derived.iloc[1]["open"] == 104.0
+    assert derived.iloc[1]["close"] == 107.25
+    assert len(derived) == 2
+
+
+def test_walk_forward_splits_are_chronological_and_not_random():
+    bars = _bars(latest=datetime(2026, 6, 1, 10, 0, tzinfo=UTC), count=24, step_minutes=15)
+
+    folds = chronological_walk_forward_splits(bars.iloc[::-1], splits=4)
+
+    assert len(folds) == 4
+    for left, right in zip(folds, folds[1:]):
+        assert left["timestamp"].max() < right["timestamp"].min()
+
+
+def test_one_fold_only_success_does_not_pass_walk_forward():
+    summary = summarize_walk_forward_metrics(
+        [
+            {"net_return_pct": 0.03, "profit_factor_net": 2.0, "number_of_trades": 8, "max_drawdown_pct": 0.001},
+            {"net_return_pct": -0.01, "profit_factor_net": 0.8, "number_of_trades": 8, "max_drawdown_pct": 0.005},
+            {"net_return_pct": -0.01, "profit_factor_net": 0.8, "number_of_trades": 8, "max_drawdown_pct": 0.005},
+            {"net_return_pct": -0.01, "profit_factor_net": 0.8, "number_of_trades": 8, "max_drawdown_pct": 0.005},
+        ],
+        min_trades_per_split=3,
+    )
+
+    assert summary["fold_count"] == 4
+    assert summary["folds_profitable_count"] == 1
+    assert summary["walk_forward_passed"] is False
 
 
 def test_buy_the_dip_reports_take_profit_cost_safety_in_summary(tmp_path):
@@ -649,6 +851,8 @@ def test_run_higher_timeframe_research_does_not_enable_trading(tmp_path):
                 output_dir=tmp_path,
                 session_factory=Session,
                 now=now,
+                strategy=BUY_THE_DIP_STRATEGY,
+                max_buy_dip_configs=8,
             )
         )
     finally:

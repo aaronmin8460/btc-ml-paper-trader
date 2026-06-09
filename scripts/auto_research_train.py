@@ -702,6 +702,7 @@ def evaluate_training_gates(
     fallback_prediction_used = research_synthetic or _research_used_fallback_predictions(research_summary)
     strict_promotion_logic_available = True
     economic_count = int(research_summary.get("economically_viable_config_count", 0) or 0)
+    v3_promising_count = _v3_promising_count(research_summary)
 
     gates = {
         "run_mode": {
@@ -752,6 +753,11 @@ def evaluate_training_gates(
             else "no_economically_viable_research_config_train_model_strict_promotion_guard_required",
             "economically_viable_config_count": economic_count,
             "strict_promotion_logic_available": strict_promotion_logic_available,
+        },
+        "v3_trainable_strategy_exists": {
+            "passed": v3_promising_count > 0,
+            "reason": None if v3_promising_count > 0 else "no_viable_trainable_strategy_exists",
+            "v3_promising_count": v3_promising_count,
         },
         "fallback_prediction_not_used": {
             "passed": not fallback_prediction_used,
@@ -863,6 +869,8 @@ def _finish_report(report: dict[str, Any]) -> None:
     )
     report["trading_remained_disabled"] = trading_remained_disabled
     report["orders_placed"] = 0
+    report["synthetic_data_used"] = bool(research_summary.get("synthetic_data_used"))
+    report["research_result_valid"] = bool(research_summary.get("research_result_valid"))
     strategy_training_summary = build_strategy_training_summary(report)
     report["strategy_training_summary"] = strategy_training_summary
     report.update(strategy_training_summary)
@@ -906,24 +914,46 @@ def build_strategy_training_summary(report: dict[str, Any]) -> dict[str, Any]:
         "buy_the_dip_economically_viable_count",
         trade_summary.get("economically_viable_count", 0),
     )
+    strategy_breakdown = research_summary.get("strategy_breakdown") or {}
+    uptrend_summary = strategy_breakdown.get("uptrend_pullback") or {}
+    breakout_summary = strategy_breakdown.get("volatility_breakout") or {}
+    uptrend_promising = _summary_int(
+        research_summary,
+        "uptrend_pullback_promising_count",
+        uptrend_summary.get("research_promising_count", 0),
+    )
+    breakout_promising = _summary_int(
+        research_summary,
+        "volatility_breakout_promising_count",
+        breakout_summary.get("research_promising_count", 0),
+    )
+    best_v3 = _best_v3_config(research_summary)
     best_20_plus = (
         research_summary.get("buy_the_dip_best_config_20_plus_trades")
         or trade_summary.get("best_config_20_plus_trades")
     )
     no_trainable_strategy = (
         report.get("training_was_run") is False
-        and current_scalping_blocked
-        and economic_count == 0
+        and (uptrend_promising + breakout_promising) == 0
     )
     return {
         "current_scalping_training_blocked_by_target_vs_cost": current_scalping_blocked,
         "buy_the_dip_research_available": bool(configs_tested and research_summary.get("research_result_valid")),
+        "buy_the_dip_rejected": bool(research_summary.get("buy_the_dip_rejected"))
+        or bool((research_summary.get("concise_summary") or {}).get("buy_the_dip_rejected")),
         "buy_the_dip_configs_tested": configs_tested,
         "buy_the_dip_20_plus_trade_configs": twenty_plus,
         "buy_the_dip_profitable_20_plus_trade_configs": profitable_twenty_plus,
         "buy_the_dip_economically_viable_count": economic_count,
         "buy_the_dip_best_config_20_plus_trades": best_20_plus,
+        "uptrend_pullback_research_available": bool(uptrend_summary.get("configs_tested") and research_summary.get("research_result_valid")),
+        "volatility_breakout_research_available": bool(breakout_summary.get("configs_tested") and research_summary.get("research_result_valid")),
+        "uptrend_pullback_promising_count": uptrend_promising,
+        "volatility_breakout_promising_count": breakout_promising,
+        "best_v3_strategy": best_v3.get("strategy_name") if best_v3 else None,
+        "best_v3_config": best_v3,
         "training_skipped_no_trainable_strategy_exists_yet": no_trainable_strategy,
+        "training_skipped_because_no_viable_trainable_strategy_exists": no_trainable_strategy,
     }
 
 
@@ -1001,6 +1031,13 @@ def _empty_research_summary(reason: str) -> dict[str, Any]:
         "buy_the_dip_profitable_20_plus_trade_configs": 0,
         "buy_the_dip_economically_viable_count": 0,
         "buy_the_dip_best_config_20_plus_trades": None,
+        "buy_the_dip_rejected": True,
+        "uptrend_pullback_research_available": False,
+        "volatility_breakout_research_available": False,
+        "uptrend_pullback_promising_count": 0,
+        "volatility_breakout_promising_count": 0,
+        "best_v3_strategy": None,
+        "best_v3_config": None,
         "research_result_valid": False,
         "synthetic_data_used": False,
         "invalid_for_trading_decisions": True,
@@ -1087,6 +1124,51 @@ def _summary_int(summary: dict[str, Any], key: str, default: Any = 0) -> int:
         return int(summary.get(key, default) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _v3_promising_count(research_summary: dict[str, Any]) -> int:
+    strategy_breakdown = research_summary.get("strategy_breakdown") or {}
+    return _summary_int(
+        research_summary,
+        "uptrend_pullback_promising_count",
+        (strategy_breakdown.get("uptrend_pullback") or {}).get("research_promising_count", 0),
+    ) + _summary_int(
+        research_summary,
+        "volatility_breakout_promising_count",
+        (strategy_breakdown.get("volatility_breakout") or {}).get("research_promising_count", 0),
+    )
+
+
+def _best_v3_config(research_summary: dict[str, Any]) -> dict[str, Any] | None:
+    candidates = [
+        row
+        for row in (research_summary.get("all_results") or [])
+        if isinstance(row, dict) and row.get("strategy_name") in {"uptrend_pullback", "volatility_breakout"}
+    ]
+    if not candidates:
+        best_by_strategy = research_summary.get("best_configs_by_strategy") or {}
+        for strategy in ("uptrend_pullback", "volatility_breakout"):
+            rows = best_by_strategy.get(strategy) or []
+            candidates.extend(row for row in rows if isinstance(row, dict))
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda row: (
+            bool(row.get("research_promising")),
+            _safe_float(row.get("adjusted_rank_score", row.get("rank_score", 0.0))),
+            _safe_float(row.get("net_return_pct")),
+            int(row.get("number_of_trades", 0) or 0),
+        ),
+    )
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
 
 
 def _research_used_fallback_predictions(research_summary: dict[str, Any]) -> bool:

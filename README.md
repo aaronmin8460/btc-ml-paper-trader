@@ -963,10 +963,18 @@ WantedBy=timers.target
 Higher-timeframe research is offline analysis only:
 
 ```bash
-python scripts/research_higher_timeframe.py
+python scripts/research_higher_timeframe.py \
+  --strategy all \
+  --max-rows-15min 17274 \
+  --max-rows-1h 5000 \
+  --max-v3-configs 5000 \
+  --walk-forward-splits 4 \
+  --json
 ```
 
-It tests 5Min and 15Min BTC/USD bars with conservative fee/slippage/spread-aware backtesting. Research output is written to `logs/higher_timeframe_research.csv` and `logs/higher_timeframe_research_summary.json`. No config is auto-applied, no model is auto-promoted, and trading remains disabled.
+It tests BTC/USD higher-timeframe candidates with conservative fee/slippage/spread-aware backtesting. V3 supports `uptrend_pullback` and `volatility_breakout` on `15Min` and `1H`; if raw `1H` bars are unavailable, complete hourly bars are derived chronologically from real `15Min` `collected_market_data`. Research output is written to `logs/higher_timeframe_research.csv` and `logs/higher_timeframe_research_summary.json`. No config is auto-applied, no model is auto-promoted, and trading remains disabled.
+
+Buy-the-Dip v2 is retained only as a historical rejected strategy. It was evaluated on real roughly 180-day BTC/USD data, generated enough trades, and failed after conservative execution costs. Do not train on it or connect it to paper-forward.
 
 ## Logs
 
