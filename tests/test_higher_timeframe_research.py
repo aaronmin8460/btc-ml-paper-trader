@@ -12,6 +12,7 @@ from app.db.models import CollectedMarketData
 from app.risk.risk_manager import PositionState
 from app.strategy.strategies import MarketContext, MarketRegime, TrendPullbackStrategy
 from scripts.research_higher_timeframe import (
+    BUY_THE_DIP_SIGNAL_PROFILES,
     BUY_THE_DIP_STRATEGY,
     ResearchDataReport,
     ResearchConfig,
@@ -19,10 +20,12 @@ from scripts.research_higher_timeframe import (
     build_research_summary,
     _fetch_research_bars,
     generate_buy_the_dip_configs,
+    generate_buy_the_dip_signal_profiles,
     generate_research_configs,
     generate_trend_pullback_configs,
     paper_forward_readiness_gate,
     prepare_buy_the_dip_features,
+    research_rank_details,
     research_settings,
     run_higher_timeframe_research,
 )
@@ -130,6 +133,8 @@ def test_research_config_space_matches_requested_values():
     assert {config.strategy_name for config in configs} == {"trend_pullback"}
     assert {config.strategy_name for config in buy_the_dip_configs} == {BUY_THE_DIP_STRATEGY}
     assert {config.take_profit_pct for config in buy_the_dip_configs} == {0.0086, 0.01, 0.0125, 0.015, 0.02, 0.025}
+    assert len(generate_buy_the_dip_signal_profiles()) > len(BUY_THE_DIP_SIGNAL_PROFILES)
+    assert any(config.timeframe == "15Min" for config in generate_buy_the_dip_configs(max_configs=120))
 
 
 def test_paper_forward_readiness_blocks_fallback_and_invalid_model():
@@ -204,6 +209,31 @@ def test_paper_forward_readiness_requires_collected_real_data_source():
 
     assert result["economically_viable"] is False
     assert "data_source_not_collected_market_data" in result["rejection_reasons"]
+
+
+def test_paper_forward_readiness_rejects_high_single_trade_concentration():
+    result = paper_forward_readiness_gate(
+        _passing_metrics(
+            number_of_trades=25,
+            trade_details=[
+                {"net_return_pct": 0.020},
+                {"net_return_pct": 0.002},
+                {"net_return_pct": 0.001},
+                {"net_return_pct": -0.001},
+            ],
+        ),
+        _settings(),
+        fallback_prediction_used=False,
+        active_model_valid=True,
+        research_result_valid=True,
+        take_profit_pct=0.01,
+        round_trip_estimated_cost_pct=0.0076,
+        promotion_required_return_pct=0.0086,
+        source_used="collected_market_data",
+    )
+
+    assert result["economically_viable"] is False
+    assert "single_trade_return_concentration_too_high" in result["rejection_reasons"]
 
 
 def test_research_summary_never_auto_applies_or_enables_trading(tmp_path):
@@ -297,6 +327,33 @@ def test_buy_the_dip_mean_reversion_identifies_oversold_bounce_and_is_long_only(
     assert set(trades["entry_reason"]) == {"buy_the_dip_oversold_reversal_candidate"}
 
 
+def test_buy_the_dip_v2_wider_profile_finds_more_fixture_signals_than_strict_v1():
+    features = prepare_buy_the_dip_features(_oversold_bounce_bars())
+    strict = _buy_the_dip_config(
+        rsi_threshold=20.0,
+        zscore_threshold=-2.5,
+        vwap_distance_threshold=-0.010,
+        drawdown_threshold=0.020,
+        min_volume_zscore=2.0,
+        reversal_confirmation_required=True,
+        higher_timeframe_regime_filter=True,
+    )
+    wider = _buy_the_dip_config(
+        rsi_threshold=40.0,
+        zscore_threshold=-1.0,
+        vwap_distance_threshold=-0.002,
+        drawdown_threshold=0.003,
+        min_volume_zscore=-0.5,
+        reversal_confirmation_required=False,
+        higher_timeframe_regime_filter=False,
+    )
+
+    strict_trades, _ = build_buy_the_dip_research_trades(features, _settings(), strict)
+    wider_trades, _ = build_buy_the_dip_research_trades(features, _settings(), wider)
+
+    assert len(wider_trades) > len(strict_trades)
+
+
 def test_buy_the_dip_mean_reversion_is_deterministic_on_fixture_data():
     features = prepare_buy_the_dip_features(_oversold_bounce_bars())
     config = _buy_the_dip_config()
@@ -355,6 +412,89 @@ def test_buy_the_dip_reports_take_profit_cost_safety_in_summary(tmp_path):
     assert summary["buy_the_dip_economically_viable_count"] == 0
 
 
+def test_one_trade_config_is_statistically_weak_and_ranked_below_reliable_config(tmp_path):
+    one_trade_rank = research_rank_details(
+        {
+            "number_of_trades": 1,
+            "net_return_pct": 0.06,
+            "profit_factor_net": float("inf"),
+            "max_drawdown_pct": 0.0,
+        },
+        {"economically_viable": False, "paper_forward_eligible": False},
+        concentration=1.0,
+    )
+    reliable_rank = research_rank_details(
+        {
+            "number_of_trades": 25,
+            "net_return_pct": 0.015,
+            "profit_factor_net": 1.2,
+            "max_drawdown_pct": 0.004,
+        },
+        {"economically_viable": True, "paper_forward_eligible": False},
+        concentration=0.20,
+    )
+    settings = research_settings(_settings())
+    summary = build_research_summary(
+        [
+            {
+                "parameter_set_id": "one_trade",
+                "strategy_name": BUY_THE_DIP_STRATEGY,
+                "timeframe": "5Min",
+                "number_of_trades": 1,
+                "net_return_pct": 0.06,
+                "profit_factor_net": float("inf"),
+                "max_drawdown_pct": 0.0,
+                "single_trade_return_concentration": 1.0,
+                "economically_viable": False,
+                "paper_forward_eligible": False,
+                "rejection_reasons": "number_of_trades_below_20;single_trade_return_concentration_too_high",
+                "statistically_weak": one_trade_rank["statistically_weak"],
+                "adjusted_rank_score": one_trade_rank["adjusted_rank_score"],
+                "rank_score": one_trade_rank["raw_rank_score"],
+            },
+            {
+                "parameter_set_id": "reliable",
+                "strategy_name": BUY_THE_DIP_STRATEGY,
+                "timeframe": "5Min",
+                "number_of_trades": 25,
+                "net_return_pct": 0.015,
+                "profit_factor_net": 1.2,
+                "max_drawdown_pct": 0.004,
+                "single_trade_return_concentration": 0.20,
+                "economically_viable": True,
+                "paper_forward_eligible": False,
+                "rejection_reasons": "active_model_invalid",
+                "statistically_weak": reliable_rank["statistically_weak"],
+                "adjusted_rank_score": reliable_rank["adjusted_rank_score"],
+                "rank_score": reliable_rank["raw_rank_score"],
+            },
+        ],
+        settings,
+        data_source_reports={
+            "5Min": ResearchDataReport(
+                timeframe="5Min",
+                source_used="collected_market_data",
+                latest_timestamp="2026-06-07T09:30:00+00:00",
+                data_age_minutes=0.0,
+                row_count=1500,
+                synthetic_data_used=False,
+                research_result_valid=True,
+            )
+        },
+        csv_path=tmp_path / "research.csv",
+        summary_path=tmp_path / "research.json",
+        active_model_status={"active_model_valid": False},
+    )
+
+    assert one_trade_rank["statistically_weak"] is True
+    assert one_trade_rank["profit_factor_reliable"] is False
+    assert one_trade_rank["adjusted_rank_score"] < reliable_rank["adjusted_rank_score"]
+    assert summary["all_results"][0]["parameter_set_id"] == "reliable"
+    assert summary["buy_the_dip_best_config_20_plus_trades"]["parameter_set_id"] == "reliable"
+    assert summary["buy_the_dip_mean_reversion_trade_summary"]["configs_with_20_plus_trades"] == 1
+    assert summary["buy_the_dip_profitable_20_plus_trade_configs"] == 1
+
+
 def test_stale_market_data_client_data_is_rejected(tmp_path):
     now = datetime(2026, 6, 7, 9, 30, tzinfo=UTC)
     engine, Session = _session_factory(tmp_path)
@@ -388,6 +528,36 @@ def test_stale_market_data_client_data_is_rejected(tmp_path):
     assert market_source["status"] == "stale"
     assert "stale_latest_timestamp" in market_source["reason"]
     assert market_source["latest_timestamp"] == "2026-06-07T08:30:00+00:00"
+
+
+def test_future_market_data_client_data_is_rejected(tmp_path):
+    now = datetime(2026, 6, 7, 9, 30, tzinfo=UTC)
+    engine, Session = _session_factory(tmp_path)
+
+    class FutureClient:
+        async def fetch_bars(self, symbol, *, timeframe=None, limit=None, force_refresh=False):
+            assert symbol == "BTC/USD"
+            return _bars(latest=now + timedelta(minutes=5), count=limit or 3, step_minutes=5)
+
+    try:
+        result = asyncio.run(
+            _fetch_research_bars(
+                FutureClient(),
+                _settings(min_training_rows=1),
+                timeframe="5Min",
+                limit=3,
+                session_factory=Session,
+                now=now,
+                end=now + timedelta(hours=1),
+            )
+        )
+    finally:
+        engine.dispose()
+
+    assert result.bars.empty
+    assert result.report.source_used == "no_valid_real_data_source"
+    market_source = next(source for source in result.report.rejected_sources if source["source"] == "market_data_client")
+    assert "row_count_below_required" in market_source["reason"]
 
 
 def test_fresh_sqlite_collected_data_is_preferred(tmp_path):
@@ -489,6 +659,68 @@ def test_run_higher_timeframe_research_does_not_enable_trading(tmp_path):
     assert summary["auto_trade_enabled"] is False
     assert summary["fallback_trading_allowed"] is False
     assert summary["auto_apply_best_config"] is False
+
+
+def test_default_research_row_limit_remains_backward_compatible(tmp_path):
+    now = datetime(2026, 6, 7, 9, 30, tzinfo=UTC)
+    engine, Session = _session_factory(tmp_path)
+    _insert_collected_rows(Session, timeframe="5Min", latest=now - timedelta(minutes=5), count=80, step_minutes=5)
+    _insert_collected_rows(Session, timeframe="15Min", latest=now - timedelta(minutes=15), count=80, step_minutes=15)
+
+    class ShouldNotFetchClient:
+        async def fetch_bars(self, *args, **kwargs):
+            raise AssertionError("fresh collected_market_data should be used before fetching client bars")
+
+    try:
+        summary = asyncio.run(
+            run_higher_timeframe_research(
+                _settings(min_training_rows=1),
+                bar_limit=40,
+                client=ShouldNotFetchClient(),
+                output_dir=tmp_path,
+                session_factory=Session,
+                now=now,
+                strategy=BUY_THE_DIP_STRATEGY,
+                max_buy_dip_configs=8,
+            )
+        )
+    finally:
+        engine.dispose()
+
+    assert summary["requested_max_rows_by_timeframe"] == {"5Min": 40, "15Min": 40}
+    assert summary["used_rows_by_timeframe"] == {"5Min": 40, "15Min": 40}
+
+
+def test_larger_research_row_window_is_used_when_requested(tmp_path):
+    now = datetime(2026, 6, 7, 9, 30, tzinfo=UTC)
+    engine, Session = _session_factory(tmp_path)
+    _insert_collected_rows(Session, timeframe="5Min", latest=now - timedelta(minutes=5), count=120, step_minutes=5)
+    _insert_collected_rows(Session, timeframe="15Min", latest=now - timedelta(minutes=15), count=90, step_minutes=15)
+
+    class ShouldNotFetchClient:
+        async def fetch_bars(self, *args, **kwargs):
+            raise AssertionError("fresh collected_market_data should be used before fetching client bars")
+
+    try:
+        summary = asyncio.run(
+            run_higher_timeframe_research(
+                _settings(min_training_rows=1),
+                bar_limit=40,
+                max_rows_by_timeframe={"5Min": 80, "15Min": 60},
+                client=ShouldNotFetchClient(),
+                output_dir=tmp_path,
+                session_factory=Session,
+                now=now,
+                strategy=BUY_THE_DIP_STRATEGY,
+                max_buy_dip_configs=8,
+            )
+        )
+    finally:
+        engine.dispose()
+
+    assert summary["available_rows_by_timeframe"] == {"5Min": 120, "15Min": 90}
+    assert summary["requested_max_rows_by_timeframe"] == {"5Min": 80, "15Min": 60}
+    assert summary["actual_used_rows_by_timeframe"] == {"5Min": 80, "15Min": 60}
 
 
 def test_trend_pullback_strategy_is_long_only_when_position_exists():

@@ -863,6 +863,9 @@ def _finish_report(report: dict[str, Any]) -> None:
     )
     report["trading_remained_disabled"] = trading_remained_disabled
     report["orders_placed"] = 0
+    strategy_training_summary = build_strategy_training_summary(report)
+    report["strategy_training_summary"] = strategy_training_summary
+    report.update(strategy_training_summary)
     report["final_recommendation"] = final_recommendation(
         safety_flags=safety_flags,
         data_readiness_by_timeframe=data_readiness,
@@ -877,6 +880,53 @@ def _finish_report(report: dict[str, Any]) -> None:
     )
 
 
+def build_strategy_training_summary(report: dict[str, Any]) -> dict[str, Any]:
+    research_summary = report.get("research_summary") or {}
+    diagnostics = report.get("diagnostics_summary") or {}
+    gates = report.get("training_gate_results") or {}
+    blocked_reasons = list(gates.get("blocked_reasons") or [])
+    trade_summary = research_summary.get("buy_the_dip_mean_reversion_trade_summary") or {}
+    current_scalping_blocked = (
+        diagnostics.get("target_vs_cost_unsafe") is True
+        or "target_vs_cost_unsafe" in blocked_reasons
+    )
+    configs_tested = _summary_int(research_summary, "buy_the_dip_configs_tested", trade_summary.get("configs_tested", 0))
+    twenty_plus = _summary_int(
+        research_summary,
+        "buy_the_dip_20_plus_trade_configs",
+        trade_summary.get("configs_with_20_plus_trades", 0),
+    )
+    profitable_twenty_plus = _summary_int(
+        research_summary,
+        "buy_the_dip_profitable_20_plus_trade_configs",
+        trade_summary.get("profitable_configs_with_20_plus_trades", 0),
+    )
+    economic_count = _summary_int(
+        research_summary,
+        "buy_the_dip_economically_viable_count",
+        trade_summary.get("economically_viable_count", 0),
+    )
+    best_20_plus = (
+        research_summary.get("buy_the_dip_best_config_20_plus_trades")
+        or trade_summary.get("best_config_20_plus_trades")
+    )
+    no_trainable_strategy = (
+        report.get("training_was_run") is False
+        and current_scalping_blocked
+        and economic_count == 0
+    )
+    return {
+        "current_scalping_training_blocked_by_target_vs_cost": current_scalping_blocked,
+        "buy_the_dip_research_available": bool(configs_tested and research_summary.get("research_result_valid")),
+        "buy_the_dip_configs_tested": configs_tested,
+        "buy_the_dip_20_plus_trade_configs": twenty_plus,
+        "buy_the_dip_profitable_20_plus_trade_configs": profitable_twenty_plus,
+        "buy_the_dip_economically_viable_count": economic_count,
+        "buy_the_dip_best_config_20_plus_trades": best_20_plus,
+        "training_skipped_no_trainable_strategy_exists_yet": no_trainable_strategy,
+    }
+
+
 def final_recommendation(
     *,
     safety_flags: dict[str, Any],
@@ -886,13 +936,21 @@ def final_recommendation(
     train_model_result: dict[str, Any],
 ) -> str:
     if training_was_run and train_model_result.get("accepted") is True:
-        return "model_promoted_but_manual_review_required"
+        return "keep_auto_trading_disabled"
     if safety_flags.get("trading_enabled") or safety_flags.get("auto_trade_enabled"):
         return "keep_auto_trading_disabled"
     if any(not report.get("ready_for_training") for report in data_readiness_by_timeframe.values()):
         return "collect_more_data"
+    research_recommendation = str((research_summary.get("concise_summary") or {}).get("recommendation") or "")
+    if research_recommendation in {"collect_more_data", "run_longer_backfill", "improve_strategy"}:
+        return research_recommendation
+    if int(research_summary.get("buy_the_dip_configs_tested", 0) or 0) > 0:
+        if int(research_summary.get("buy_the_dip_20_plus_trade_configs", 0) or 0) == 0:
+            return "run_longer_backfill"
+        if int(research_summary.get("buy_the_dip_economically_viable_count", 0) or 0) == 0:
+            return "improve_strategy"
     if int(research_summary.get("economically_viable_config_count", 0) or 0) > 0:
-        return "research_candidate_found_but_not_tradeable"
+        return "keep_auto_trading_disabled"
     return "keep_auto_trading_disabled"
 
 
@@ -938,6 +996,11 @@ def _empty_research_summary(reason: str) -> dict[str, Any]:
         "reason": reason,
         "paper_forward_eligible_config_count": 0,
         "economically_viable_config_count": 0,
+        "buy_the_dip_configs_tested": 0,
+        "buy_the_dip_20_plus_trade_configs": 0,
+        "buy_the_dip_profitable_20_plus_trade_configs": 0,
+        "buy_the_dip_economically_viable_count": 0,
+        "buy_the_dip_best_config_20_plus_trades": None,
         "research_result_valid": False,
         "synthetic_data_used": False,
         "invalid_for_trading_decisions": True,
@@ -1017,6 +1080,13 @@ def _training_bar_limit(settings: Any, readiness: dict[str, Any]) -> int:
         int(readiness.get("minimum_required_rows", 0) or 0),
     )
     return max(1, min(max(row_count, desired), 20_000))
+
+
+def _summary_int(summary: dict[str, Any], key: str, default: Any = 0) -> int:
+    try:
+        return int(summary.get(key, default) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _research_used_fallback_predictions(research_summary: dict[str, Any]) -> bool:

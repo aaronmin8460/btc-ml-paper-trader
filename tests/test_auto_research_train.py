@@ -265,7 +265,10 @@ def test_auto_research_train_preserves_buy_the_dip_research_summary_fields():
             "paper_forward_eligible_config_count": 0,
             "economically_viable_config_count": 1,
             "buy_the_dip_configs_tested": 960,
+            "buy_the_dip_20_plus_trade_configs": 12,
+            "buy_the_dip_profitable_20_plus_trade_configs": 3,
             "buy_the_dip_economically_viable_count": 1,
+            "buy_the_dip_best_config_20_plus_trades": {"parameter_set_id": "btd_20_plus"},
             "buy_the_dip_best_net_return_pct": 0.02,
             "strategy_breakdown": {
                 "buy_the_dip_mean_reversion": {
@@ -288,8 +291,35 @@ def test_auto_research_train_preserves_buy_the_dip_research_summary_fields():
     )
 
     assert summary["buy_the_dip_configs_tested"] == 960
+    assert summary["buy_the_dip_20_plus_trade_configs"] == 12
+    assert summary["buy_the_dip_profitable_20_plus_trade_configs"] == 3
     assert summary["buy_the_dip_economically_viable_count"] == 1
     assert diagnostics["economically_viable_config_count"] == 1
+
+
+def test_auto_research_train_reports_buy_the_dip_v2_trainability_fields():
+    report = {
+        "training_was_run": False,
+        "diagnostics_summary": {"target_vs_cost_unsafe": True},
+        "training_gate_results": {"blocked_reasons": ["target_vs_cost_unsafe"]},
+        "research_summary": {
+            "research_result_valid": True,
+            "buy_the_dip_configs_tested": 2000,
+            "buy_the_dip_20_plus_trade_configs": 5,
+            "buy_the_dip_profitable_20_plus_trade_configs": 1,
+            "buy_the_dip_economically_viable_count": 0,
+            "buy_the_dip_best_config_20_plus_trades": {"parameter_set_id": "btd_20_plus"},
+        },
+    }
+
+    summary = art.build_strategy_training_summary(report)
+
+    assert summary["current_scalping_training_blocked_by_target_vs_cost"] is True
+    assert summary["buy_the_dip_research_available"] is True
+    assert summary["buy_the_dip_configs_tested"] == 2000
+    assert summary["buy_the_dip_20_plus_trade_configs"] == 5
+    assert summary["buy_the_dip_profitable_20_plus_trade_configs"] == 1
+    assert summary["training_skipped_no_trainable_strategy_exists_yet"] is True
 
 
 def test_systemd_service_does_not_start_paper_trader_service():

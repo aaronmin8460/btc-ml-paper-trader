@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import csv
 import json
 import math
 import os
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from app.strategy.strategies import MarketContext, MarketRegimeFilter, TrendPull
 RESEARCH_TIMEFRAMES = ("5Min", "15Min")
 TREND_PULLBACK_STRATEGY = "trend_pullback"
 BUY_THE_DIP_STRATEGY = "buy_the_dip_mean_reversion"
+STRATEGY_CHOICES = ("all", TREND_PULLBACK_STRATEGY, BUY_THE_DIP_STRATEGY)
 TAKE_PROFIT_VALUES = (0.008, 0.01, 0.015, 0.02)
 STOP_LOSS_VALUES = (0.003, 0.005, 0.008)
 MAX_HOLD_BARS_VALUES = (6, 12, 24, 48)
@@ -86,6 +88,17 @@ BUY_THE_DIP_SIGNAL_PROFILES = (
         "higher_timeframe_regime_filter": True,
     },
 )
+BUY_THE_DIP_V2_PROFILE_VALUES = {
+    "rsi_threshold": (25.0, 30.0, 35.0, 40.0),
+    "zscore_threshold": (-1.0, -1.25, -1.5, -2.0),
+    "vwap_distance_threshold": (-0.002, -0.003, -0.005, -0.008),
+    "drawdown_threshold": (0.003, 0.005, 0.008, 0.012),
+    "min_volume_zscore": (-0.5, 0.0, 0.5, 1.0),
+    "reversal_confirmation_required": (True, False),
+    "higher_timeframe_regime_filter": (True, False),
+}
+DEFAULT_MAX_BUY_DIP_CONFIGS = 960
+PREFERRED_RESEARCH_TRADES = 50
 MIN_RESEARCH_TRADES = 20
 MIN_RESEARCH_PROFIT_FACTOR_NET = 1.05
 MAX_SINGLE_TRADE_RETURN_SHARE = 0.60
@@ -119,6 +132,12 @@ class ResearchDataReport:
     research_result_valid: bool
     rejection_reason: str | None = None
     rejected_sources: tuple[dict[str, Any], ...] = ()
+    available_rows: int | None = None
+    used_rows: int | None = None
+    first_timestamp: str | None = None
+    requested_max_rows: int | None = None
+    requested_start: str | None = None
+    requested_end: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,12 +150,49 @@ class ResearchBarsResult:
         yield self.report.source_used
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run offline BTC/USD higher-timeframe research.")
+    parser.add_argument("--json", action="store_true", help="Print JSON output. JSON is also the default output format.")
+    parser.add_argument(
+        "--strategy",
+        choices=STRATEGY_CHOICES,
+        default="all",
+        help="Limit research to a single strategy or run all strategies.",
+    )
+    parser.add_argument("--max-rows-per-timeframe", type=int, default=None, help="Maximum rows per timeframe.")
+    parser.add_argument("--max-rows-5min", type=int, default=None, help="Maximum 5Min rows.")
+    parser.add_argument("--max-rows-15min", type=int, default=None, help="Maximum 15Min rows.")
+    parser.add_argument("--start", default=None, help="UTC start date or ISO timestamp.")
+    parser.add_argument("--end", default=None, help="UTC end date or ISO timestamp.")
+    parser.add_argument("--lookback-days", type=int, default=None, help="Look back this many days from end/now.")
+    parser.add_argument(
+        "--max-buy-dip-configs",
+        type=int,
+        default=DEFAULT_MAX_BUY_DIP_CONFIGS,
+        help="Maximum buy-the-dip configs to evaluate.",
+    )
+    return parser.parse_args()
+
+
 async def main() -> None:
+    args = _parse_args()
     settings = research_settings(get_settings())
     bar_limit = int(os.getenv("RESEARCH_BAR_LIMIT", str(max(1500, settings.min_training_rows + 500))))
+    row_limits = _row_limits_by_timeframe(
+        default_limit=bar_limit,
+        max_rows_per_timeframe=args.max_rows_per_timeframe,
+        max_rows_5min=args.max_rows_5min,
+        max_rows_15min=args.max_rows_15min,
+    )
     report = await run_higher_timeframe_research(
         settings,
         bar_limit=bar_limit,
+        max_rows_by_timeframe=row_limits,
+        start=args.start,
+        end=args.end,
+        lookback_days=args.lookback_days,
+        strategy=args.strategy,
+        max_buy_dip_configs=args.max_buy_dip_configs,
         output_dir=Path(settings.log_dir),
         allow_synthetic_fallback=_synthetic_research_mode_enabled(),
     )
@@ -147,6 +203,12 @@ async def run_higher_timeframe_research(
     base_settings: Settings,
     *,
     bar_limit: int = 1500,
+    max_rows_by_timeframe: dict[str, int] | None = None,
+    start: Any | None = None,
+    end: Any | None = None,
+    lookback_days: int | None = None,
+    strategy: str = "all",
+    max_buy_dip_configs: int = DEFAULT_MAX_BUY_DIP_CONFIGS,
     client: MarketDataClient | None = None,
     output_dir: Path | None = None,
     session_factory: Any | None = None,
@@ -154,20 +216,34 @@ async def run_higher_timeframe_research(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     settings = research_settings(base_settings)
+    if strategy not in STRATEGY_CHOICES:
+        raise ValueError(f"Unsupported research strategy: {strategy}")
+    if max_buy_dip_configs <= 0:
+        raise ValueError("max_buy_dip_configs must be positive")
     client = client or MarketDataClient(settings)
     active_model = ModelRegistry(settings).validate_active_model()
     bars_by_timeframe: dict[str, pd.DataFrame] = {}
     data_source_reports: dict[str, ResearchDataReport] = {}
     current_time = _utc_timestamp(now or datetime.now(UTC))
+    window_start, window_end = _resolve_research_window(
+        start=start,
+        end=end,
+        lookback_days=lookback_days,
+        now=current_time,
+    )
+    row_limits = max_rows_by_timeframe or {timeframe: int(bar_limit) for timeframe in RESEARCH_TIMEFRAMES}
     for timeframe in RESEARCH_TIMEFRAMES:
+        limit = int(row_limits.get(timeframe, bar_limit))
         result = await _fetch_research_bars(
             client,
             settings,
             timeframe=timeframe,
-            limit=bar_limit,
+            limit=limit,
             session_factory=session_factory,
             allow_synthetic_fallback=allow_synthetic_fallback,
             now=current_time,
+            start=window_start,
+            end=window_end,
         )
         bars_by_timeframe[timeframe] = result.bars
         data_source_reports[timeframe] = result.report
@@ -177,6 +253,8 @@ async def run_higher_timeframe_research(
         active_model_valid=active_model.valid,
         active_model_status=active_model.to_dict(),
         data_source_reports=data_source_reports,
+        strategy=strategy,
+        max_buy_dip_configs=max_buy_dip_configs,
     )
     output_path = output_dir or Path(settings.log_dir)
     csv_path = output_path / "higher_timeframe_research.csv"
@@ -188,6 +266,11 @@ async def run_higher_timeframe_research(
         csv_path=csv_path,
         summary_path=summary_path,
         active_model_status=active_model.to_dict(),
+        requested_max_rows_by_timeframe=row_limits,
+        requested_start=window_start.isoformat() if window_start else None,
+        requested_end=window_end.isoformat() if window_end else None,
+        strategy_filter=strategy,
+        max_buy_dip_configs=max_buy_dip_configs,
     )
     write_research_outputs(rows, summary, csv_path=csv_path, summary_path=summary_path)
     return summary
@@ -208,6 +291,40 @@ def research_settings(settings: Settings) -> Settings:
     return Settings(_env_file=None, **data)
 
 
+def _row_limits_by_timeframe(
+    *,
+    default_limit: int,
+    max_rows_per_timeframe: int | None = None,
+    max_rows_5min: int | None = None,
+    max_rows_15min: int | None = None,
+) -> dict[str, int]:
+    base = max(1, int(max_rows_per_timeframe or default_limit))
+    return {
+        "5Min": max(1, int(max_rows_5min or base)),
+        "15Min": max(1, int(max_rows_15min or base)),
+    }
+
+
+def _resolve_research_window(
+    *,
+    start: Any | None,
+    end: Any | None,
+    lookback_days: int | None,
+    now: datetime,
+) -> tuple[datetime | None, datetime]:
+    window_end = _utc_timestamp(end) if end is not None else now
+    window_end = min(window_end, now)
+    window_start = _utc_timestamp(start) if start is not None else None
+    if lookback_days is not None:
+        if lookback_days <= 0:
+            raise ValueError("lookback_days must be positive")
+        implied_start = window_end - timedelta(days=int(lookback_days))
+        window_start = max(window_start, implied_start) if window_start is not None else implied_start
+    if window_start is not None and window_start >= window_end:
+        raise ValueError("research start must be before end")
+    return window_start, window_end
+
+
 def evaluate_research_configs(
     bars_by_timeframe: dict[str, pd.DataFrame],
     settings: Settings,
@@ -215,6 +332,8 @@ def evaluate_research_configs(
     active_model_valid: bool,
     active_model_status: dict[str, Any] | None = None,
     data_source_reports: dict[str, ResearchDataReport | dict[str, Any]] | None = None,
+    strategy: str = "all",
+    max_buy_dip_configs: int = DEFAULT_MAX_BUY_DIP_CONFIGS,
 ) -> list[dict[str, Any]]:
     if settings.symbol != ALLOWED_SYMBOL:
         raise ValueError("Higher-timeframe research is BTC/USD-only.")
@@ -228,7 +347,7 @@ def evaluate_research_configs(
         for timeframe, bars in bars_by_timeframe.items()
         if not bars.empty
     }
-    for config in generate_research_configs():
+    for config in generate_research_configs(strategy=strategy, max_buy_dip_configs=max_buy_dip_configs):
         candidate_settings = research_settings(
             Settings(
                 _env_file=None,
@@ -277,6 +396,8 @@ def evaluate_research_configs(
             promotion_required_return_pct=promotion_required,
             source_used=source_report.source_used if source_report is not None else None,
         )
+        concentration = single_trade_return_concentration(metrics.get("trade_details", []))
+        rank_details = research_rank_details(metrics, readiness, concentration=concentration)
         rows.append(
             {
                 "parameter_set_id": config.parameter_set_id,
@@ -304,9 +425,14 @@ def evaluate_research_configs(
                 "take_profit_vs_cost_safe": take_profit_vs_cost_safe,
                 "take_profit_vs_promotion_safe": take_profit_vs_promotion_safe,
                 "gross_winners_became_net_losers": int(metrics.get("gross_winners_became_net_losers", 0) or 0),
-                "single_trade_return_concentration": single_trade_return_concentration(
-                    metrics.get("trade_details", [])
-                ),
+                "single_trade_return_concentration": concentration,
+                "statistically_weak": rank_details["statistically_weak"],
+                "trade_count_score": rank_details["trade_count_score"],
+                "concentration_penalty": rank_details["concentration_penalty"],
+                "reliability_score": rank_details["reliability_score"],
+                "profit_factor_reliable": rank_details["profit_factor_reliable"],
+                "adjusted_rank_score": rank_details["adjusted_rank_score"],
+                "reason_ranked_lower_if_any": rank_details["reason_ranked_lower_if_any"],
                 "source_used": source_report.source_used if source_report is not None else "unknown",
                 "latest_timestamp": source_report.latest_timestamp if source_report is not None else None,
                 "data_age_minutes": source_report.data_age_minutes if source_report is not None else None,
@@ -321,14 +447,22 @@ def evaluate_research_configs(
                 "economically_viable": readiness["economically_viable"],
                 "paper_forward_eligible": readiness["paper_forward_eligible"],
                 "rejection_reasons": ";".join(readiness["rejection_reasons"]),
-                "rank_score": research_rank_score(metrics, readiness),
+                "rank_score": rank_details["raw_rank_score"],
             }
         )
     return rows
 
 
-def generate_research_configs() -> list[ResearchConfig]:
-    return generate_trend_pullback_configs() + generate_buy_the_dip_configs()
+def generate_research_configs(
+    *,
+    strategy: str = "all",
+    max_buy_dip_configs: int = DEFAULT_MAX_BUY_DIP_CONFIGS,
+) -> list[ResearchConfig]:
+    if strategy == TREND_PULLBACK_STRATEGY:
+        return generate_trend_pullback_configs()
+    if strategy == BUY_THE_DIP_STRATEGY:
+        return generate_buy_the_dip_configs(max_configs=max_buy_dip_configs)
+    return generate_trend_pullback_configs() + generate_buy_the_dip_configs(max_configs=max_buy_dip_configs)
 
 
 def generate_trend_pullback_configs() -> list[ResearchConfig]:
@@ -354,19 +488,19 @@ def generate_trend_pullback_configs() -> list[ResearchConfig]:
     return configs
 
 
-def generate_buy_the_dip_configs() -> list[ResearchConfig]:
-    configs: list[ResearchConfig] = []
-    index = 0
+def generate_buy_the_dip_configs(*, max_configs: int = DEFAULT_MAX_BUY_DIP_CONFIGS) -> list[ResearchConfig]:
+    raw_configs: list[ResearchConfig] = []
     for timeframe, take_profit_pct, stop_loss_pct, max_hold_bars, profile in product(
         RESEARCH_TIMEFRAMES,
         BUY_THE_DIP_TAKE_PROFIT_VALUES,
         BUY_THE_DIP_STOP_LOSS_VALUES,
         BUY_THE_DIP_MAX_HOLD_BARS_VALUES,
-        BUY_THE_DIP_SIGNAL_PROFILES,
+        generate_buy_the_dip_signal_profiles(),
     ):
-        configs.append(
+        raw_index = len(raw_configs)
+        raw_configs.append(
             ResearchConfig(
-                parameter_set_id=f"btd_{index:04d}",
+                parameter_set_id=f"btd_{raw_index:05d}",
                 strategy_name=BUY_THE_DIP_STRATEGY,
                 timeframe=timeframe,
                 take_profit_pct=float(take_profit_pct),
@@ -381,8 +515,68 @@ def generate_buy_the_dip_configs() -> list[ResearchConfig]:
                 higher_timeframe_regime_filter=bool(profile["higher_timeframe_regime_filter"]),
             )
         )
-        index += 1
-    return configs
+    if len(raw_configs) <= max_configs:
+        return raw_configs
+    return [raw_configs[index] for index in _evenly_spaced_indexes(len(raw_configs), max_configs)]
+
+
+def generate_buy_the_dip_signal_profiles() -> tuple[dict[str, Any], ...]:
+    profiles: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add_profile(profile: dict[str, Any]) -> None:
+        key = tuple(sorted(profile.items()))
+        if key not in seen:
+            seen.add(key)
+            profiles.append(profile)
+
+    for profile in BUY_THE_DIP_SIGNAL_PROFILES:
+        add_profile(dict(profile))
+
+    severity_profiles = zip(
+        reversed(BUY_THE_DIP_V2_PROFILE_VALUES["rsi_threshold"]),
+        BUY_THE_DIP_V2_PROFILE_VALUES["zscore_threshold"],
+        BUY_THE_DIP_V2_PROFILE_VALUES["vwap_distance_threshold"],
+        BUY_THE_DIP_V2_PROFILE_VALUES["drawdown_threshold"],
+        strict=True,
+    )
+    volume_values = BUY_THE_DIP_V2_PROFILE_VALUES["min_volume_zscore"]
+    reversal_values = BUY_THE_DIP_V2_PROFILE_VALUES["reversal_confirmation_required"]
+    regime_values = BUY_THE_DIP_V2_PROFILE_VALUES["higher_timeframe_regime_filter"]
+    for rsi, zscore, vwap, drawdown in severity_profiles:
+        for volume, reversal_required, regime_filter in product(volume_values, reversal_values, regime_values):
+            add_profile(
+                {
+                    "rsi_threshold": float(rsi),
+                    "zscore_threshold": float(zscore),
+                    "vwap_distance_threshold": float(vwap),
+                    "drawdown_threshold": float(drawdown),
+                    "min_volume_zscore": float(volume),
+                    "reversal_confirmation_required": bool(reversal_required),
+                    "higher_timeframe_regime_filter": bool(regime_filter),
+                }
+            )
+    return tuple(profiles)
+
+
+def _evenly_spaced_indexes(total: int, desired: int) -> list[int]:
+    if desired <= 0:
+        raise ValueError("desired config count must be positive")
+    if total <= desired:
+        return list(range(total))
+    if desired == 1:
+        return [0]
+    indexes = {0, total - 1}
+    step = (total - 1) / (desired - 1)
+    for offset in range(desired):
+        indexes.add(int(round(offset * step)))
+    if len(indexes) > desired:
+        return sorted(indexes)[:desired]
+    candidate = 0
+    while len(indexes) < desired:
+        indexes.add(candidate)
+        candidate += 1
+    return sorted(indexes)
 
 
 def build_trend_pullback_research_trades(
@@ -627,8 +821,13 @@ def build_research_summary(
     csv_path: Path,
     summary_path: Path,
     active_model_status: dict[str, Any],
+    requested_max_rows_by_timeframe: dict[str, int] | None = None,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    strategy_filter: str = "all",
+    max_buy_dip_configs: int = DEFAULT_MAX_BUY_DIP_CONFIGS,
 ) -> dict[str, Any]:
-    ranked = sorted(rows, key=lambda row: float(row.get("rank_score", -1_000_000.0)), reverse=True)
+    ranked = sorted(rows, key=_rank_sort_key, reverse=True)
     raw_economically_viable = [row for row in ranked if row.get("economically_viable")]
     source_reports = _summary_source_reports(data_source_reports=data_source_reports, data_sources=data_sources)
     source_report_payload = {timeframe: _data_report_to_dict(report) for timeframe, report in source_reports.items()}
@@ -650,12 +849,20 @@ def build_research_summary(
     buy_the_dip_rows = [row for row in ranked if row.get("strategy_name") == BUY_THE_DIP_STRATEGY]
     buy_the_dip_economic = [row for row in economically_viable if row.get("strategy_name") == BUY_THE_DIP_STRATEGY]
     buy_the_dip_eligible = [row for row in eligible if row.get("strategy_name") == BUY_THE_DIP_STRATEGY]
+    buy_the_dip_trade_summary = buy_the_dip_trade_count_summary(
+        buy_the_dip_rows,
+        economically_viable=buy_the_dip_economic,
+        eligible=buy_the_dip_eligible,
+    )
+    if BUY_THE_DIP_STRATEGY in strategy_breakdown:
+        strategy_breakdown[BUY_THE_DIP_STRATEGY].update(buy_the_dip_trade_summary)
     concise_summary = build_concise_research_summary(
         ranked,
         research_result_valid=research_result_valid,
         buy_the_dip_rows=buy_the_dip_rows,
         buy_the_dip_economic=buy_the_dip_economic,
         buy_the_dip_eligible=buy_the_dip_eligible,
+        buy_the_dip_trade_summary=buy_the_dip_trade_summary,
         target_vs_cost_unsafe=(
             float(settings.scalping_take_profit_pct) <= estimated_round_trip_execution_cost_pct(settings)
             or float(settings.scalping_label_take_profit_pct) <= estimated_round_trip_execution_cost_pct(settings)
@@ -695,6 +902,32 @@ def build_research_summary(
             "row_count": {
                 timeframe: report.row_count for timeframe, report in source_reports.items()
             },
+            "available_rows_by_timeframe": {
+                timeframe: report.available_rows if report.available_rows is not None else report.row_count
+                for timeframe, report in source_reports.items()
+            },
+            "used_rows_by_timeframe": {
+                timeframe: report.used_rows if report.used_rows is not None else report.row_count
+                for timeframe, report in source_reports.items()
+            },
+            "first_timestamp_by_timeframe": {
+                timeframe: report.first_timestamp for timeframe, report in source_reports.items()
+            },
+            "latest_timestamp_by_timeframe": {
+                timeframe: report.latest_timestamp for timeframe, report in source_reports.items()
+            },
+            "requested_max_rows_by_timeframe": {
+                timeframe: int((requested_max_rows_by_timeframe or {}).get(timeframe, report.requested_max_rows or report.row_count))
+                for timeframe, report in source_reports.items()
+            },
+            "actual_used_rows_by_timeframe": {
+                timeframe: report.used_rows if report.used_rows is not None else report.row_count
+                for timeframe, report in source_reports.items()
+            },
+            "requested_start": requested_start,
+            "requested_end": requested_end,
+            "strategy_filter": strategy_filter,
+            "max_buy_dip_configs": max_buy_dip_configs,
             "synthetic_data_used": synthetic_data_used,
             "research_result_valid": research_result_valid,
             "csv_path": str(csv_path),
@@ -704,6 +937,7 @@ def build_research_summary(
             "strategy_breakdown": strategy_breakdown,
             "best_configs_by_strategy": best_by_strategy,
             "buy_the_dip_mean_reversion_best_configs": best_by_strategy.get(BUY_THE_DIP_STRATEGY, []),
+            "buy_the_dip_mean_reversion_trade_summary": buy_the_dip_trade_summary,
             "rejection_reason_counts": rejection_reason_counts(ranked),
             "take_profit_vs_cost_safe_config_count": sum(
                 1 for row in ranked if bool(row.get("take_profit_vs_cost_safe"))
@@ -729,7 +963,9 @@ def build_research_summary(
                     "stop_loss_pct": list(BUY_THE_DIP_STOP_LOSS_VALUES),
                     "max_hold_bars": list(BUY_THE_DIP_MAX_HOLD_BARS_VALUES),
                     "signal_profiles": list(BUY_THE_DIP_SIGNAL_PROFILES),
-                    "grid_note": "Bounded deterministic profiles use the suggested thresholds without the full Cartesian explosion.",
+                    "v2_profile_values": BUY_THE_DIP_V2_PROFILE_VALUES,
+                    "max_buy_dip_configs": max_buy_dip_configs,
+                    "grid_note": "Bounded deterministic profiles use wider v2 thresholds without an unbounded Cartesian explosion.",
                 },
             },
             "active_model_status": active_model_status,
@@ -775,30 +1011,24 @@ def best_configs_by_strategy(rows: list[dict[str, Any]], *, limit: int = 10) -> 
     out: dict[str, list[dict[str, Any]]] = {}
     for strategy in sorted({str(row.get("strategy_name") or "unknown") for row in rows}):
         strategy_rows = [row for row in rows if str(row.get("strategy_name") or "unknown") == strategy]
-        out[strategy] = sorted(
-            strategy_rows,
-            key=lambda row: (
-                bool(row.get("economically_viable")),
-                _metric_float(row.get("net_return_pct")),
-                _profit_factor_value(row.get("profit_factor_net")),
-                _metric_float(row.get("rank_score")),
-            ),
-            reverse=True,
-        )[:limit]
+        out[strategy] = sorted(strategy_rows, key=_rank_sort_key, reverse=True)[:limit]
     return out
 
 
 def best_ranked_config(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not rows:
         return None
-    return max(
-        rows,
-        key=lambda row: (
-            bool(row.get("economically_viable")),
-            _metric_float(row.get("net_return_pct")),
-            _profit_factor_value(row.get("profit_factor_net")),
-            _metric_float(row.get("rank_score")),
-        ),
+    return max(rows, key=_rank_sort_key)
+
+
+def _rank_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        bool(row.get("economically_viable")),
+        not bool(row.get("statistically_weak")),
+        _metric_float(row.get("adjusted_rank_score", row.get("rank_score"))),
+        int(row.get("number_of_trades", 0) or 0),
+        _metric_float(row.get("net_return_pct")),
+        min(5.0, _profit_factor_value(row.get("profit_factor_net"))),
     )
 
 
@@ -811,6 +1041,36 @@ def rejection_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def buy_the_dip_trade_count_summary(
+    rows: list[dict[str, Any]],
+    *,
+    economically_viable: list[dict[str, Any]],
+    eligible: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows_1_to_4 = [row for row in rows if 1 <= int(row.get("number_of_trades", 0) or 0) <= 4]
+    rows_5_to_19 = [row for row in rows if 5 <= int(row.get("number_of_trades", 0) or 0) <= 19]
+    rows_20_plus = [row for row in rows if int(row.get("number_of_trades", 0) or 0) >= MIN_RESEARCH_TRADES]
+    rows_50_plus = [row for row in rows if int(row.get("number_of_trades", 0) or 0) >= PREFERRED_RESEARCH_TRADES]
+    profitable = [row for row in rows if _metric_float(row.get("net_return_pct")) > 0]
+    profitable_20_plus = [row for row in rows_20_plus if _metric_float(row.get("net_return_pct")) > 0]
+    return {
+        "configs_tested": len(rows),
+        "configs_with_0_trades": sum(1 for row in rows if int(row.get("number_of_trades", 0) or 0) == 0),
+        "configs_with_1_to_4_trades": len(rows_1_to_4),
+        "configs_with_5_to_19_trades": len(rows_5_to_19),
+        "configs_with_20_plus_trades": len(rows_20_plus),
+        "configs_with_50_plus_trades": len(rows_50_plus),
+        "profitable_configs": len(profitable),
+        "profitable_configs_with_20_plus_trades": len(profitable_20_plus),
+        "economically_viable_count": len(economically_viable),
+        "paper_forward_eligible_count": len(eligible),
+        "best_config_any_trade_count": best_ranked_config(rows),
+        "best_config_20_plus_trades": best_ranked_config(rows_20_plus),
+        "best_config_50_plus_trades": best_ranked_config(rows_50_plus),
+        "rejection_reason_counts": rejection_reason_counts(rows),
+    }
+
+
 def build_concise_research_summary(
     rows: list[dict[str, Any]],
     *,
@@ -818,23 +1078,42 @@ def build_concise_research_summary(
     buy_the_dip_rows: list[dict[str, Any]],
     buy_the_dip_economic: list[dict[str, Any]],
     buy_the_dip_eligible: list[dict[str, Any]],
+    buy_the_dip_trade_summary: dict[str, Any],
     target_vs_cost_unsafe: bool,
 ) -> dict[str, Any]:
-    best = best_ranked_config(buy_the_dip_rows)
+    best = buy_the_dip_trade_summary.get("best_config_any_trade_count") or best_ranked_config(buy_the_dip_rows)
+    best_20_plus = buy_the_dip_trade_summary.get("best_config_20_plus_trades")
+    best_50_plus = buy_the_dip_trade_summary.get("best_config_50_plus_trades")
     recommendation = "keep_auto_trading_disabled"
-    if research_result_valid and not buy_the_dip_economic:
-        recommendation = "improve_strategy"
-    if buy_the_dip_economic:
+    if not research_result_valid:
+        recommendation = "collect_more_data"
+    elif buy_the_dip_economic:
         recommendation = "manual_review_buy_the_dip_candidates"
+    elif len(buy_the_dip_rows) and int(buy_the_dip_trade_summary.get("configs_with_20_plus_trades", 0) or 0) == 0:
+        recommendation = "run_longer_backfill"
+    elif research_result_valid and not buy_the_dip_economic:
+        recommendation = "improve_strategy"
     return {
         "data_ready": research_result_valid,
         "target_vs_cost_unsafe": target_vs_cost_unsafe,
         "buy_the_dip_configs_tested": len(buy_the_dip_rows),
+        "buy_the_dip_20_plus_trade_configs": int(
+            buy_the_dip_trade_summary.get("configs_with_20_plus_trades", 0) or 0
+        ),
+        "buy_the_dip_50_plus_trade_configs": int(
+            buy_the_dip_trade_summary.get("configs_with_50_plus_trades", 0) or 0
+        ),
+        "buy_the_dip_profitable_configs": int(buy_the_dip_trade_summary.get("profitable_configs", 0) or 0),
+        "buy_the_dip_profitable_20_plus_trade_configs": int(
+            buy_the_dip_trade_summary.get("profitable_configs_with_20_plus_trades", 0) or 0
+        ),
         "buy_the_dip_economically_viable_count": len(buy_the_dip_economic),
         "buy_the_dip_paper_forward_eligible_count": len(buy_the_dip_eligible),
         "buy_the_dip_best_net_return_pct": best.get("net_return_pct") if best else None,
         "buy_the_dip_best_profit_factor_net": best.get("profit_factor_net") if best else None,
         "buy_the_dip_best_max_drawdown_pct": best.get("max_drawdown_pct") if best else None,
+        "buy_the_dip_best_config_20_plus_trades": best_20_plus,
+        "buy_the_dip_best_config_50_plus_trades": best_50_plus,
         "recommendation": recommendation,
     }
 
@@ -865,8 +1144,11 @@ async def _fetch_research_bars(
     session_factory: Any | None = None,
     allow_synthetic_fallback: bool = False,
     now: datetime | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
 ) -> ResearchBarsResult:
     current_time = _utc_timestamp(now or datetime.now(UTC))
+    effective_end = min(_utc_timestamp(end or current_time), current_time)
     min_rows = _minimum_research_rows(settings, limit)
     rejected_sources: list[dict[str, Any]] = []
 
@@ -875,6 +1157,15 @@ async def _fetch_research_bars(
         timeframe=timeframe,
         limit=limit,
         session_factory=session_factory,
+        start=start,
+        end=effective_end,
+    )
+    sqlite_stats = _collected_market_data_window_stats(
+        settings,
+        timeframe=timeframe,
+        session_factory=session_factory,
+        start=start,
+        end=effective_end,
     )
     sqlite_report = _assess_research_bars(
         sqlite_bars,
@@ -883,6 +1174,10 @@ async def _fetch_research_bars(
         min_rows=min_rows,
         now=current_time,
         synthetic_data_used=False,
+        available_rows=int(sqlite_stats["available_rows"]),
+        requested_max_rows=limit,
+        requested_start=start.isoformat() if start else None,
+        requested_end=effective_end.isoformat(),
     )
     if sqlite_report.research_result_valid:
         return ResearchBarsResult(sqlite_bars, sqlite_report)
@@ -902,6 +1197,7 @@ async def _fetch_research_bars(
     else:
         try:
             client_bars = await client.fetch_bars(settings.symbol, timeframe=timeframe, limit=limit, force_refresh=True)
+            client_bars = _filter_bars_to_window(client_bars, start=start, end=effective_end)
             client_report = _assess_research_bars(
                 client_bars,
                 source_used="market_data_client",
@@ -909,6 +1205,9 @@ async def _fetch_research_bars(
                 min_rows=min_rows,
                 now=current_time,
                 synthetic_data_used=False,
+                requested_max_rows=limit,
+                requested_start=start.isoformat() if start else None,
+                requested_end=effective_end.isoformat(),
             )
             if client_report.research_result_valid:
                 return ResearchBarsResult(client_bars, client_report)
@@ -928,6 +1227,7 @@ async def _fetch_research_bars(
 
     if allow_synthetic_fallback:
         synthetic_bars = MarketDataClient.synthetic_btc_bars(limit=limit, timeframe=timeframe)
+        synthetic_bars = _filter_bars_to_window(synthetic_bars, start=start, end=effective_end)
         synthetic_report = _assess_research_bars(
             synthetic_bars,
             source_used="synthetic_explicit_test_demo_mode",
@@ -936,6 +1236,9 @@ async def _fetch_research_bars(
             now=current_time,
             synthetic_data_used=True,
             force_invalid_reason="synthetic_data_not_valid_for_research_decisions",
+            requested_max_rows=limit,
+            requested_start=start.isoformat() if start else None,
+            requested_end=effective_end.isoformat(),
         )
         return ResearchBarsResult(
             synthetic_bars,
@@ -952,6 +1255,12 @@ async def _fetch_research_bars(
         research_result_valid=False,
         rejection_reason="no_fresh_real_bars_available",
         rejected_sources=tuple(rejected_sources),
+        available_rows=int(sqlite_stats["available_rows"]),
+        used_rows=0,
+        first_timestamp=None,
+        requested_max_rows=limit,
+        requested_start=start.isoformat() if start else None,
+        requested_end=effective_end.isoformat(),
     )
     return ResearchBarsResult(pd.DataFrame(), report)
 
@@ -962,21 +1271,22 @@ def _load_collected_market_data(
     timeframe: str,
     limit: int,
     session_factory: Any | None,
+    start: datetime | None = None,
+    end: datetime | None = None,
 ) -> pd.DataFrame:
     if session_factory is None:
         init_db()
         session_factory = SessionLocal
     with session_factory() as db:
-        rows = (
-            db.query(CollectedMarketData)
-            .filter(
-                CollectedMarketData.symbol == settings.symbol,
-                CollectedMarketData.timeframe == timeframe,
-            )
-            .order_by(CollectedMarketData.timestamp.desc())
-            .limit(limit)
-            .all()
+        query = db.query(CollectedMarketData).filter(
+            CollectedMarketData.symbol == settings.symbol,
+            CollectedMarketData.timeframe == timeframe,
         )
+        if start is not None:
+            query = query.filter(CollectedMarketData.timestamp >= _sqlite_filter_timestamp(start))
+        if end is not None:
+            query = query.filter(CollectedMarketData.timestamp <= _sqlite_filter_timestamp(end))
+        rows = query.order_by(CollectedMarketData.timestamp.desc()).limit(limit).all()
     if not rows:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
     records = [
@@ -993,6 +1303,58 @@ def _load_collected_market_data(
     return normalize_ohlcv(pd.DataFrame(records))
 
 
+def _filter_bars_to_window(
+    bars: pd.DataFrame,
+    *,
+    start: datetime | None,
+    end: datetime | None,
+) -> pd.DataFrame:
+    if bars.empty or "timestamp" not in bars:
+        return bars
+    normalized = normalize_ohlcv(bars)
+    timestamps = pd.to_datetime(normalized["timestamp"], utc=True)
+    mask = pd.Series(True, index=normalized.index)
+    if start is not None:
+        mask &= timestamps >= pd.Timestamp(start)
+    if end is not None:
+        mask &= timestamps <= pd.Timestamp(end)
+    return normalized.loc[mask].reset_index(drop=True)
+
+
+def _collected_market_data_window_stats(
+    settings: Settings,
+    *,
+    timeframe: str,
+    session_factory: Any | None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> dict[str, Any]:
+    if session_factory is None:
+        init_db()
+        session_factory = SessionLocal
+    from sqlalchemy import func
+
+    with session_factory() as db:
+        query = db.query(
+            func.count(CollectedMarketData.id),
+            func.min(CollectedMarketData.timestamp),
+            func.max(CollectedMarketData.timestamp),
+        ).filter(
+            CollectedMarketData.symbol == settings.symbol,
+            CollectedMarketData.timeframe == timeframe,
+        )
+        if start is not None:
+            query = query.filter(CollectedMarketData.timestamp >= _sqlite_filter_timestamp(start))
+        if end is not None:
+            query = query.filter(CollectedMarketData.timestamp <= _sqlite_filter_timestamp(end))
+        row = query.one()
+    return {
+        "available_rows": int(row[0] or 0),
+        "first_timestamp": row[1],
+        "latest_timestamp": row[2],
+    }
+
+
 def _assess_research_bars(
     bars: pd.DataFrame,
     *,
@@ -1002,8 +1364,13 @@ def _assess_research_bars(
     now: datetime,
     synthetic_data_used: bool,
     force_invalid_reason: str | None = None,
+    available_rows: int | None = None,
+    requested_max_rows: int | None = None,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
 ) -> ResearchDataReport:
     normalized = normalize_ohlcv(bars) if not bars.empty else bars
+    first = _first_timestamp(normalized)
     latest = _latest_timestamp(normalized)
     age_minutes = _data_age_minutes(latest, now)
     rejection_reasons: list[str] = []
@@ -1011,6 +1378,8 @@ def _assess_research_bars(
         rejection_reasons.append(f"row_count_below_required_{min_rows}")
     if latest is None:
         rejection_reasons.append("latest_timestamp_missing")
+    elif latest > pd.Timestamp(_utc_timestamp(now)):
+        rejection_reasons.append("future_timestamp_detected")
     elif age_minutes is not None:
         max_age_minutes = stale_threshold_for_timeframe(timeframe).total_seconds() / 60
         if age_minutes > max_age_minutes:
@@ -1028,6 +1397,12 @@ def _assess_research_bars(
         synthetic_data_used=synthetic_data_used,
         research_result_valid=not rejection_reasons,
         rejection_reason=";".join(rejection_reasons) if rejection_reasons else None,
+        available_rows=available_rows if available_rows is not None else int(len(normalized)),
+        used_rows=int(len(normalized)),
+        first_timestamp=first.isoformat() if first is not None else None,
+        requested_max_rows=requested_max_rows,
+        requested_start=requested_start,
+        requested_end=requested_end,
     )
 
 
@@ -1046,6 +1421,17 @@ def _latest_timestamp(bars: pd.DataFrame) -> pd.Timestamp | None:
     return latest
 
 
+def _first_timestamp(bars: pd.DataFrame) -> pd.Timestamp | None:
+    if bars.empty or "timestamp" not in bars:
+        return None
+    first = pd.Timestamp(bars["timestamp"].iloc[0])
+    if first.tzinfo is None:
+        first = first.tz_localize("UTC")
+    else:
+        first = first.tz_convert("UTC")
+    return first
+
+
 def _data_age_minutes(latest: pd.Timestamp | None, now: datetime) -> float | None:
     if latest is None:
         return None
@@ -1062,6 +1448,10 @@ def _utc_timestamp(value: Any) -> datetime:
     return timestamp.to_pydatetime()
 
 
+def _sqlite_filter_timestamp(value: Any) -> datetime:
+    return _utc_timestamp(value).replace(tzinfo=None)
+
+
 def _data_report_to_rejected_source(report: ResearchDataReport) -> dict[str, Any]:
     return {
         "source": report.source_used,
@@ -1070,6 +1460,10 @@ def _data_report_to_rejected_source(report: ResearchDataReport) -> dict[str, Any
         "latest_timestamp": report.latest_timestamp,
         "data_age_minutes": report.data_age_minutes,
         "row_count": report.row_count,
+        "available_rows": report.available_rows,
+        "used_rows": report.used_rows,
+        "first_timestamp": report.first_timestamp,
+        "requested_max_rows": report.requested_max_rows,
     }
 
 
@@ -1091,6 +1485,12 @@ def _with_rejected_sources(
         research_result_valid=report.research_result_valid,
         rejection_reason=report.rejection_reason,
         rejected_sources=tuple(rejected_sources),
+        available_rows=report.available_rows,
+        used_rows=report.used_rows,
+        first_timestamp=report.first_timestamp,
+        requested_max_rows=report.requested_max_rows,
+        requested_start=report.requested_start,
+        requested_end=report.requested_end,
     )
 
 
@@ -1109,6 +1509,12 @@ def _coerce_data_report(timeframe: str, value: ResearchDataReport | dict[str, An
         research_result_valid=bool(value.get("research_result_valid", not synthetic_data_used)),
         rejection_reason=value.get("rejection_reason"),
         rejected_sources=tuple(value.get("rejected_sources", ())),
+        available_rows=value.get("available_rows"),
+        used_rows=value.get("used_rows", value.get("row_count")),
+        first_timestamp=value.get("first_timestamp"),
+        requested_max_rows=value.get("requested_max_rows"),
+        requested_start=value.get("requested_start"),
+        requested_end=value.get("requested_end"),
     )
 
 
@@ -1131,6 +1537,8 @@ def _summary_source_reports(
             row_count=0,
             synthetic_data_used=source.startswith("synthetic"),
             research_result_valid=not source.startswith("synthetic"),
+            available_rows=0,
+            used_rows=0,
         )
         for timeframe, source in (data_sources or {}).items()
     }
@@ -1146,6 +1554,12 @@ def _data_report_to_dict(report: ResearchDataReport) -> dict[str, Any]:
         "research_result_valid": report.research_result_valid,
         "rejection_reason": report.rejection_reason,
         "rejected_sources": list(report.rejected_sources),
+        "available_rows": report.available_rows,
+        "used_rows": report.used_rows,
+        "first_timestamp": report.first_timestamp,
+        "requested_max_rows": report.requested_max_rows,
+        "requested_start": report.requested_start,
+        "requested_end": report.requested_end,
     }
 
 
@@ -1313,6 +1727,62 @@ def research_rank_score(metrics: dict[str, Any], readiness: dict[str, Any]) -> f
     if not readiness.get("paper_forward_eligible"):
         base -= 10_000
     return base
+
+
+def research_rank_details(
+    metrics: dict[str, Any],
+    readiness: dict[str, Any],
+    *,
+    concentration: float | None = None,
+) -> dict[str, Any]:
+    trades = int(metrics.get("number_of_trades", 0) or 0)
+    concentration_value = _metric_float(concentration)
+    statistically_weak = trades < MIN_RESEARCH_TRADES
+    trade_count_score = max(0.0, min(1.0, trades / PREFERRED_RESEARCH_TRADES))
+    concentration_penalty = max(0.0, min(1.0, concentration_value))
+    profit_factor = _profit_factor_value(metrics.get("profit_factor_net"))
+    profit_factor_reliable = not (statistically_weak and profit_factor >= MIN_RESEARCH_PROFIT_FACTOR_NET)
+    reliability_score = trade_count_score * max(0.0, 1.0 - concentration_penalty)
+    if statistically_weak:
+        reliability_score *= max(0.05, trades / max(1, MIN_RESEARCH_TRADES)) * 0.25
+    if not profit_factor_reliable:
+        reliability_score *= 0.50
+
+    raw_rank_score = research_rank_score(metrics, readiness)
+    adjusted_rank_score = raw_rank_score
+    adjusted_rank_score += reliability_score * 10_000
+    adjusted_rank_score -= (1.0 - trade_count_score) * 20_000
+    adjusted_rank_score -= concentration_penalty * 25_000
+
+    reasons: list[str] = []
+    if statistically_weak:
+        adjusted_rank_score -= 100_000 + (MIN_RESEARCH_TRADES - trades) * 2_000
+        reasons.append("number_of_trades_below_20")
+    if trades == 1:
+        adjusted_rank_score -= 100_000
+        reasons.append("one_trade_result_not_reliable")
+    elif 1 < trades < 5:
+        adjusted_rank_score -= 50_000
+        reasons.append("very_low_trade_count")
+    if concentration_value > MAX_SINGLE_TRADE_RETURN_SHARE:
+        adjusted_rank_score -= 75_000
+        reasons.append("single_trade_return_concentration_too_high")
+    if not profit_factor_reliable:
+        adjusted_rank_score -= 25_000
+        reasons.append("profit_factor_not_reliable_at_low_trade_count")
+    if not readiness.get("economically_viable"):
+        reasons.append("not_economically_viable")
+
+    return {
+        "raw_rank_score": raw_rank_score,
+        "statistically_weak": statistically_weak,
+        "trade_count_score": trade_count_score,
+        "concentration_penalty": concentration_penalty,
+        "reliability_score": reliability_score,
+        "profit_factor_reliable": profit_factor_reliable,
+        "adjusted_rank_score": adjusted_rank_score,
+        "reason_ranked_lower_if_any": ";".join(dict.fromkeys(reasons)) if reasons else None,
+    }
 
 
 def _metric_float(value: Any) -> float:

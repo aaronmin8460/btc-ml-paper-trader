@@ -63,6 +63,7 @@ jq . logs/auto_research_train_report_latest.json
 jq '.data_readiness_by_timeframe' logs/auto_research_train_report_latest.json
 jq '.training_gate_results' logs/auto_research_train_report_latest.json
 jq '.model_registry_status' logs/auto_research_train_report_latest.json
+jq '.buy_the_dip_20_plus_trade_configs, .buy_the_dip_profitable_20_plus_trade_configs, .buy_the_dip_economically_viable_count' logs/auto_research_train_report_latest.json
 ```
 
 The report always includes `orders_placed: 0`.
@@ -117,6 +118,27 @@ SYMBOL=BTC/USD
 
 The 15Min research path needs enough real collected bars to cover indicator warmup, label horizons, trade simulation, and validation without leaning on stale market-data-client output or synthetic fallback. Around 1000 collected rows gives the research script enough sample depth to reject weak configs honestly instead of overreading a tiny window.
 
+## Buy-The-Dip V2 Research
+
+`buy_the_dip_mean_reversion` is an offline 5Min/15Min research strategy. It looks for BTC/USD pullbacks that are stretched below short-term fair value, show stabilization, and have targets larger than conservative round-trip costs. It is long-only and research-only.
+
+For this strategy, rare oversold bounce events usually need a longer historical window than the default timer run. After a safe 30-day backfill, consider 180-day or 365-day real-data backfills, then run:
+
+```bash
+.venv/bin/python scripts/research_higher_timeframe.py \
+  --strategy buy_the_dip_mean_reversion \
+  --max-rows-5min 8000 \
+  --max-rows-15min 2880 \
+  --max-buy-dip-configs 2000 \
+  --json
+```
+
+The v2 report penalizes one-trade luck. Configs below 20 trades are marked `statistically_weak`, configs with one dominant winner are ranked lower, and the report separates best configs with any trades from best configs with 20+ and 50+ trades.
+
+Future buy-the-dip labels are scaffolded separately from the current 1Min scalping training path. They must not be wired into training until a manually reviewed economically viable config exists, data is real and fresh, take-profit exceeds the conservative cost requirement, and chronological validation remains intact.
+
 ## Paper-Forward Is Not Trading Permission
 
 Paper-forward eligibility only means a config survived offline checks in the report. It does not enable auto trading, does not apply that config, does not prove profitability, and does not authorize orders. Treat it as a candidate for manual review, not a switch to flip.
+
+Never use a random split for trading time series. Train on older rows, validate/test on newer rows, and keep the most recent sample for validation, test, or paper-forward checks.
