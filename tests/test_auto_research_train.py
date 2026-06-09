@@ -257,6 +257,41 @@ def test_synthetic_fallback_cannot_produce_trading_valid_output():
     assert summary["economically_viable_config_count"] == 0
 
 
+def test_auto_research_train_preserves_buy_the_dip_research_summary_fields():
+    summary = art.normalize_research_summary(
+        {
+            "synthetic_data_used": False,
+            "research_result_valid": True,
+            "paper_forward_eligible_config_count": 0,
+            "economically_viable_config_count": 1,
+            "buy_the_dip_configs_tested": 960,
+            "buy_the_dip_economically_viable_count": 1,
+            "buy_the_dip_best_net_return_pct": 0.02,
+            "strategy_breakdown": {
+                "buy_the_dip_mean_reversion": {
+                    "configs_tested": 960,
+                    "economically_viable_count": 1,
+                }
+            },
+        },
+        status="run",
+    )
+
+    diagnostics = art.merge_research_into_diagnostics(
+        {
+            "paper_forward_eligible_config_count": 0,
+            "economically_viable_config_count": 0,
+            "research_result_valid": False,
+            "synthetic_data_used": False,
+        },
+        summary,
+    )
+
+    assert summary["buy_the_dip_configs_tested"] == 960
+    assert summary["buy_the_dip_economically_viable_count"] == 1
+    assert diagnostics["economically_viable_config_count"] == 1
+
+
 def test_systemd_service_does_not_start_paper_trader_service():
     service = Path("deploy/systemd/btc-model-research-train.service").read_text(encoding="utf-8")
 

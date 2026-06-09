@@ -12,11 +12,17 @@ from app.db.models import CollectedMarketData
 from app.risk.risk_manager import PositionState
 from app.strategy.strategies import MarketContext, MarketRegime, TrendPullbackStrategy
 from scripts.research_higher_timeframe import (
+    BUY_THE_DIP_STRATEGY,
     ResearchDataReport,
+    ResearchConfig,
+    build_buy_the_dip_research_trades,
     build_research_summary,
     _fetch_research_bars,
+    generate_buy_the_dip_configs,
     generate_research_configs,
+    generate_trend_pullback_configs,
     paper_forward_readiness_gate,
+    prepare_buy_the_dip_features,
     research_settings,
     run_higher_timeframe_research,
 )
@@ -112,12 +118,18 @@ def test_higher_timeframe_research_settings_do_not_enable_trading():
 
 
 def test_research_config_space_matches_requested_values():
-    configs = generate_research_configs()
+    configs = generate_trend_pullback_configs()
 
     assert {config.timeframe for config in configs} == {"5Min", "15Min"}
     assert {config.take_profit_pct for config in configs} == {0.008, 0.01, 0.015, 0.02}
     assert {config.stop_loss_pct for config in configs} == {0.003, 0.005, 0.008}
     assert {config.max_hold_bars for config in configs} == {6, 12, 24, 48}
+    all_configs = generate_research_configs()
+    buy_the_dip_configs = generate_buy_the_dip_configs()
+    assert len(all_configs) == len(configs) + len(buy_the_dip_configs)
+    assert {config.strategy_name for config in configs} == {"trend_pullback"}
+    assert {config.strategy_name for config in buy_the_dip_configs} == {BUY_THE_DIP_STRATEGY}
+    assert {config.take_profit_pct for config in buy_the_dip_configs} == {0.0086, 0.01, 0.0125, 0.015, 0.02, 0.025}
 
 
 def test_paper_forward_readiness_blocks_fallback_and_invalid_model():
@@ -158,6 +170,42 @@ def test_paper_forward_readiness_requires_economic_thresholds():
     assert "number_of_trades_below_20" in result["rejection_reasons"]
 
 
+def test_paper_forward_readiness_rejects_take_profit_below_cost():
+    result = paper_forward_readiness_gate(
+        _passing_metrics(),
+        _settings(),
+        fallback_prediction_used=False,
+        active_model_valid=True,
+        research_result_valid=True,
+        take_profit_pct=0.005,
+        round_trip_estimated_cost_pct=0.0076,
+        promotion_required_return_pct=0.0086,
+        source_used="collected_market_data",
+    )
+
+    assert result["economically_viable"] is False
+    assert result["paper_forward_eligible"] is False
+    assert "take_profit_not_above_round_trip_cost" in result["rejection_reasons"]
+    assert "take_profit_below_promotion_required_return" in result["rejection_reasons"]
+
+
+def test_paper_forward_readiness_requires_collected_real_data_source():
+    result = paper_forward_readiness_gate(
+        _passing_metrics(),
+        _settings(),
+        fallback_prediction_used=False,
+        active_model_valid=True,
+        research_result_valid=True,
+        take_profit_pct=0.01,
+        round_trip_estimated_cost_pct=0.0076,
+        promotion_required_return_pct=0.0086,
+        source_used="synthetic_explicit_test_demo_mode",
+    )
+
+    assert result["economically_viable"] is False
+    assert "data_source_not_collected_market_data" in result["rejection_reasons"]
+
+
 def test_research_summary_never_auto_applies_or_enables_trading(tmp_path):
     settings = research_settings(_settings())
     summary = build_research_summary(
@@ -174,6 +222,137 @@ def test_research_summary_never_auto_applies_or_enables_trading(tmp_path):
     assert summary["auto_trade_enabled"] is False
     assert summary["fallback_trading_allowed"] is False
     assert summary["paper_forward_eligible_config_count"] == 0
+    assert "strategy_breakdown" in summary
+    assert "concise_summary" in summary
+
+
+def _buy_the_dip_config(**overrides) -> ResearchConfig:
+    values = {
+        "parameter_set_id": "btd_test",
+        "strategy_name": BUY_THE_DIP_STRATEGY,
+        "timeframe": "5Min",
+        "take_profit_pct": 0.01,
+        "stop_loss_pct": 0.006,
+        "max_hold_bars": 12,
+        "rsi_threshold": 35.0,
+        "zscore_threshold": -1.5,
+        "vwap_distance_threshold": -0.003,
+        "drawdown_threshold": 0.005,
+        "min_volume_zscore": 0.5,
+        "reversal_confirmation_required": True,
+        "higher_timeframe_regime_filter": False,
+    }
+    values.update(overrides)
+    return ResearchConfig(**values)
+
+
+def _oversold_bounce_bars() -> pd.DataFrame:
+    latest = datetime(2026, 6, 7, 9, 30, tzinfo=UTC)
+    timestamps = [latest - timedelta(minutes=5 * (89 - index)) for index in range(90)]
+    closes = [100.0 + (index % 5) * 0.03 for index in range(60)]
+    closes.extend([99.5, 99.0, 98.2, 97.4, 96.6, 95.8, 94.8, 94.2, 95.1, 95.8])
+    closes.extend([96.5, 97.2, 97.8, 98.1, 98.4, 98.7, 99.0, 99.2, 99.4, 99.5])
+    closes.extend([99.6 + (index % 3) * 0.02 for index in range(90 - len(closes))])
+    rows = []
+    previous_close = closes[0]
+    for index, close in enumerate(closes):
+        open_ = previous_close
+        high = max(open_, close) * 1.001
+        low = min(open_, close) * 0.999
+        volume = 10.0
+        if 62 <= index <= 69:
+            volume = 30.0 + index
+        if index == 68:
+            open_ = 94.1
+            close = 95.1
+            high = 95.7
+            low = 93.0
+            volume = 120.0
+        rows.append(
+            {
+                "timestamp": timestamps[index],
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+            }
+        )
+        previous_close = close
+    return pd.DataFrame(rows)
+
+
+def test_buy_the_dip_mean_reversion_identifies_oversold_bounce_and_is_long_only():
+    features = prepare_buy_the_dip_features(_oversold_bounce_bars())
+
+    trades, signals = build_buy_the_dip_research_trades(features, _settings(), _buy_the_dip_config())
+
+    assert not trades.empty
+    assert not signals.empty
+    assert set(trades["strategy_name"]) == {BUY_THE_DIP_STRATEGY}
+    assert set(signals["strategy_name"]) == {BUY_THE_DIP_STRATEGY}
+    assert set(trades["ml_sell_probability"]) == {0.0}
+    assert "side" not in trades.columns
+    assert "short" not in set(str(reason).lower() for reason in trades["entry_reason"])
+    assert set(trades["entry_reason"]) == {"buy_the_dip_oversold_reversal_candidate"}
+
+
+def test_buy_the_dip_mean_reversion_is_deterministic_on_fixture_data():
+    features = prepare_buy_the_dip_features(_oversold_bounce_bars())
+    config = _buy_the_dip_config()
+
+    first_trades, _ = build_buy_the_dip_research_trades(features, _settings(), config)
+    second_trades, _ = build_buy_the_dip_research_trades(features, _settings(), config)
+
+    columns = ["timestamp", "buy_exit_return_pct", "buy_exit_reason", "buy_hold_bars"]
+    pd.testing.assert_frame_equal(
+        first_trades[columns].reset_index(drop=True),
+        second_trades[columns].reset_index(drop=True),
+    )
+
+
+def test_buy_the_dip_reports_take_profit_cost_safety_in_summary(tmp_path):
+    settings = research_settings(_settings())
+    summary = build_research_summary(
+        [
+            {
+                "parameter_set_id": "btd_low_target",
+                "strategy_name": BUY_THE_DIP_STRATEGY,
+                "timeframe": "5Min",
+                "take_profit_pct": 0.005,
+                "round_trip_estimated_cost_pct": 0.0076,
+                "promotion_required_return_pct": 0.0086,
+                "take_profit_vs_cost_safe": False,
+                "net_return_pct": 0.01,
+                "profit_factor_net": 1.2,
+                "max_drawdown_pct": 0.001,
+                "number_of_trades": 25,
+                "economically_viable": False,
+                "paper_forward_eligible": False,
+                "rejection_reasons": "take_profit_not_above_round_trip_cost",
+                "rank_score": -100.0,
+            }
+        ],
+        settings,
+        data_source_reports={
+            "5Min": ResearchDataReport(
+                timeframe="5Min",
+                source_used="collected_market_data",
+                latest_timestamp="2026-06-07T09:30:00+00:00",
+                data_age_minutes=0.0,
+                row_count=1500,
+                synthetic_data_used=False,
+                research_result_valid=True,
+            )
+        },
+        csv_path=tmp_path / "research.csv",
+        summary_path=tmp_path / "research.json",
+        active_model_status={"active_model_valid": True},
+    )
+
+    assert summary["strategy_breakdown"][BUY_THE_DIP_STRATEGY]["take_profit_vs_cost_safe_count"] == 0
+    assert summary["buy_the_dip_configs_tested"] == 1
+    assert summary["buy_the_dip_economically_viable_count"] == 0
 
 
 def test_stale_market_data_client_data_is_rejected(tmp_path):

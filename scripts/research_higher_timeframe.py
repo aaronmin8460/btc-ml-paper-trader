@@ -18,7 +18,12 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 import pandas as pd
 
-from app.backtest.scalping import backtest_assumptions, calculate_fee_aware_metrics
+from app.backtest.scalping import (
+    backtest_assumptions,
+    calculate_fee_aware_metrics,
+    estimated_round_trip_execution_cost_pct,
+    promotion_required_return_pct as estimated_promotion_required_return_pct,
+)
 from app.config import ALLOWED_SYMBOL, Settings, get_settings
 from app.data.feature_engineering import add_features
 from app.data.market_data import (
@@ -35,9 +40,52 @@ from app.strategy.strategies import MarketContext, MarketRegimeFilter, TrendPull
 
 
 RESEARCH_TIMEFRAMES = ("5Min", "15Min")
+TREND_PULLBACK_STRATEGY = "trend_pullback"
+BUY_THE_DIP_STRATEGY = "buy_the_dip_mean_reversion"
 TAKE_PROFIT_VALUES = (0.008, 0.01, 0.015, 0.02)
 STOP_LOSS_VALUES = (0.003, 0.005, 0.008)
 MAX_HOLD_BARS_VALUES = (6, 12, 24, 48)
+BUY_THE_DIP_TAKE_PROFIT_VALUES = (0.0086, 0.01, 0.0125, 0.015, 0.02, 0.025)
+BUY_THE_DIP_STOP_LOSS_VALUES = (0.004, 0.006, 0.008, 0.01)
+BUY_THE_DIP_MAX_HOLD_BARS_VALUES = (6, 12, 24, 48, 72)
+BUY_THE_DIP_SIGNAL_PROFILES = (
+    {
+        "rsi_threshold": 35.0,
+        "zscore_threshold": -1.5,
+        "vwap_distance_threshold": -0.003,
+        "drawdown_threshold": 0.005,
+        "min_volume_zscore": 0.5,
+        "reversal_confirmation_required": False,
+        "higher_timeframe_regime_filter": False,
+    },
+    {
+        "rsi_threshold": 30.0,
+        "zscore_threshold": -2.0,
+        "vwap_distance_threshold": -0.005,
+        "drawdown_threshold": 0.008,
+        "min_volume_zscore": 1.0,
+        "reversal_confirmation_required": True,
+        "higher_timeframe_regime_filter": False,
+    },
+    {
+        "rsi_threshold": 25.0,
+        "zscore_threshold": -2.0,
+        "vwap_distance_threshold": -0.008,
+        "drawdown_threshold": 0.012,
+        "min_volume_zscore": 1.5,
+        "reversal_confirmation_required": True,
+        "higher_timeframe_regime_filter": True,
+    },
+    {
+        "rsi_threshold": 20.0,
+        "zscore_threshold": -2.5,
+        "vwap_distance_threshold": -0.010,
+        "drawdown_threshold": 0.020,
+        "min_volume_zscore": 2.0,
+        "reversal_confirmation_required": True,
+        "higher_timeframe_regime_filter": True,
+    },
+)
 MIN_RESEARCH_TRADES = 20
 MIN_RESEARCH_PROFIT_FACTOR_NET = 1.05
 MAX_SINGLE_TRADE_RETURN_SHARE = 0.60
@@ -46,10 +94,18 @@ MAX_SINGLE_TRADE_RETURN_SHARE = 0.60
 @dataclass(frozen=True)
 class ResearchConfig:
     parameter_set_id: str
+    strategy_name: str
     timeframe: str
     take_profit_pct: float
     stop_loss_pct: float
     max_hold_bars: int
+    rsi_threshold: float | None = None
+    zscore_threshold: float | None = None
+    vwap_distance_threshold: float | None = None
+    drawdown_threshold: float | None = None
+    min_volume_zscore: float | None = None
+    reversal_confirmation_required: bool | None = None
+    higher_timeframe_regime_filter: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -160,10 +216,17 @@ def evaluate_research_configs(
     active_model_status: dict[str, Any] | None = None,
     data_source_reports: dict[str, ResearchDataReport | dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    if settings.symbol != ALLOWED_SYMBOL:
+        raise ValueError("Higher-timeframe research is BTC/USD-only.")
     rows: list[dict[str, Any]] = []
     source_reports = {
         timeframe: _coerce_data_report(timeframe, report)
         for timeframe, report in (data_source_reports or {}).items()
+    }
+    buy_the_dip_features = {
+        timeframe: prepare_buy_the_dip_features(bars)
+        for timeframe, bars in bars_by_timeframe.items()
+        if not bars.empty
     }
     for config in generate_research_configs():
         candidate_settings = research_settings(
@@ -173,6 +236,8 @@ def evaluate_research_configs(
                     **settings.model_dump(),
                     "take_profit_pct": config.take_profit_pct,
                     "stop_loss_pct": config.stop_loss_pct,
+                    "scalping_take_profit_pct": config.take_profit_pct,
+                    "scalping_stop_loss_pct": config.stop_loss_pct,
                     "label_horizon_bars": config.max_hold_bars,
                 },
             )
@@ -184,23 +249,49 @@ def evaluate_research_configs(
         if bars.empty or not source_valid:
             metrics = _empty_research_metrics("invalid_research_data_source" if not source_valid else "no_bars")
         else:
-            trades, signal_frame = build_research_trades(bars, candidate_settings, config)
+            if config.strategy_name == BUY_THE_DIP_STRATEGY:
+                trades, signal_frame = build_buy_the_dip_research_trades(
+                    buy_the_dip_features.get(config.timeframe, pd.DataFrame()),
+                    candidate_settings,
+                    config,
+                )
+            else:
+                trades, signal_frame = build_trend_pullback_research_trades(bars, candidate_settings, config)
             metrics = calculate_fee_aware_metrics(trades, candidate_settings, signal_frame=signal_frame)
+        round_trip_cost = _metric_float(metrics.get("round_trip_estimated_cost_pct"))
+        if round_trip_cost <= 0:
+            round_trip_cost = estimated_round_trip_execution_cost_pct(candidate_settings)
+        promotion_required = _metric_float(metrics.get("promotion_required_return_pct"))
+        if promotion_required <= 0:
+            promotion_required = estimated_promotion_required_return_pct(candidate_settings)
+        take_profit_vs_cost_safe = config.take_profit_pct > round_trip_cost
+        take_profit_vs_promotion_safe = config.take_profit_pct >= promotion_required
         readiness = paper_forward_readiness_gate(
             metrics,
             candidate_settings,
             fallback_prediction_used=synthetic_data_used,
             active_model_valid=active_model_valid,
             research_result_valid=source_valid,
+            take_profit_pct=config.take_profit_pct,
+            round_trip_estimated_cost_pct=round_trip_cost,
+            promotion_required_return_pct=promotion_required,
+            source_used=source_report.source_used if source_report is not None else None,
         )
         rows.append(
             {
                 "parameter_set_id": config.parameter_set_id,
-                "strategy_name": TrendPullbackStrategy.name,
+                "strategy_name": config.strategy_name,
                 "timeframe": config.timeframe,
                 "take_profit_pct": config.take_profit_pct,
                 "stop_loss_pct": config.stop_loss_pct,
                 "max_hold_bars": config.max_hold_bars,
+                "rsi_threshold": config.rsi_threshold,
+                "zscore_threshold": config.zscore_threshold,
+                "vwap_distance_threshold": config.vwap_distance_threshold,
+                "drawdown_threshold": config.drawdown_threshold,
+                "min_volume_zscore": config.min_volume_zscore,
+                "reversal_confirmation_required": config.reversal_confirmation_required,
+                "higher_timeframe_regime_filter": config.higher_timeframe_regime_filter,
                 "number_of_trades": int(metrics.get("number_of_trades", 0) or 0),
                 "gross_return_pct": _metric_float(metrics.get("gross_return_pct")),
                 "net_return_pct": _metric_float(metrics.get("net_return_pct")),
@@ -208,8 +299,10 @@ def evaluate_research_configs(
                 "max_drawdown_pct": _metric_float(metrics.get("max_drawdown_pct")),
                 "win_rate_net": _metric_float(metrics.get("win_rate_net")),
                 "expectancy": _metric_float(metrics.get("expectancy")),
-                "round_trip_estimated_cost_pct": _metric_float(metrics.get("round_trip_estimated_cost_pct")),
-                "promotion_required_return_pct": _metric_float(metrics.get("promotion_required_return_pct")),
+                "round_trip_estimated_cost_pct": round_trip_cost,
+                "promotion_required_return_pct": promotion_required,
+                "take_profit_vs_cost_safe": take_profit_vs_cost_safe,
+                "take_profit_vs_promotion_safe": take_profit_vs_promotion_safe,
                 "gross_winners_became_net_losers": int(metrics.get("gross_winners_became_net_losers", 0) or 0),
                 "single_trade_return_concentration": single_trade_return_concentration(
                     metrics.get("trade_details", [])
@@ -235,6 +328,10 @@ def evaluate_research_configs(
 
 
 def generate_research_configs() -> list[ResearchConfig]:
+    return generate_trend_pullback_configs() + generate_buy_the_dip_configs()
+
+
+def generate_trend_pullback_configs() -> list[ResearchConfig]:
     configs: list[ResearchConfig] = []
     index = 0
     for timeframe, take_profit_pct, stop_loss_pct, max_hold_bars in product(
@@ -246,6 +343,7 @@ def generate_research_configs() -> list[ResearchConfig]:
         configs.append(
             ResearchConfig(
                 parameter_set_id=f"htf_{index:03d}",
+                strategy_name=TREND_PULLBACK_STRATEGY,
                 timeframe=timeframe,
                 take_profit_pct=float(take_profit_pct),
                 stop_loss_pct=float(stop_loss_pct),
@@ -256,7 +354,38 @@ def generate_research_configs() -> list[ResearchConfig]:
     return configs
 
 
-def build_research_trades(
+def generate_buy_the_dip_configs() -> list[ResearchConfig]:
+    configs: list[ResearchConfig] = []
+    index = 0
+    for timeframe, take_profit_pct, stop_loss_pct, max_hold_bars, profile in product(
+        RESEARCH_TIMEFRAMES,
+        BUY_THE_DIP_TAKE_PROFIT_VALUES,
+        BUY_THE_DIP_STOP_LOSS_VALUES,
+        BUY_THE_DIP_MAX_HOLD_BARS_VALUES,
+        BUY_THE_DIP_SIGNAL_PROFILES,
+    ):
+        configs.append(
+            ResearchConfig(
+                parameter_set_id=f"btd_{index:04d}",
+                strategy_name=BUY_THE_DIP_STRATEGY,
+                timeframe=timeframe,
+                take_profit_pct=float(take_profit_pct),
+                stop_loss_pct=float(stop_loss_pct),
+                max_hold_bars=int(max_hold_bars),
+                rsi_threshold=float(profile["rsi_threshold"]),
+                zscore_threshold=float(profile["zscore_threshold"]),
+                vwap_distance_threshold=float(profile["vwap_distance_threshold"]),
+                drawdown_threshold=float(profile["drawdown_threshold"]),
+                min_volume_zscore=float(profile["min_volume_zscore"]),
+                reversal_confirmation_required=bool(profile["reversal_confirmation_required"]),
+                higher_timeframe_regime_filter=bool(profile["higher_timeframe_regime_filter"]),
+            )
+        )
+        index += 1
+    return configs
+
+
+def build_trend_pullback_research_trades(
     bars: pd.DataFrame,
     settings: Settings,
     config: ResearchConfig,
@@ -308,6 +437,114 @@ def build_research_trades(
     return pd.DataFrame(trade_rows), pd.DataFrame(signal_rows)
 
 
+build_research_trades = build_trend_pullback_research_trades
+
+
+def prepare_buy_the_dip_features(bars: pd.DataFrame) -> pd.DataFrame:
+    if bars.empty:
+        return pd.DataFrame()
+    features = add_features(bars)
+    close = features["close"]
+    rolling_mean = close.rolling(20).mean()
+    rolling_std = close.rolling(20).std()
+    rolling_high = close.rolling(50).max()
+    rolling_low = close.rolling(20).min()
+    candle_range = (features["high"] - features["low"]).replace(0, np.nan)
+    lower_body = pd.concat([features["open"], features["close"]], axis=1).min(axis=1)
+    features["rolling_zscore_20"] = (close - rolling_mean) / rolling_std.replace(0, np.nan)
+    features["recent_drawdown_50"] = (rolling_high - close) / rolling_high.replace(0, np.nan)
+    features["distance_from_rolling_low_20"] = (close - rolling_low) / rolling_low.replace(0, np.nan)
+    features["lower_wick_ratio"] = (lower_body - features["low"]) / candle_range
+    features["close_position_in_candle"] = (features["close"] - features["low"]) / candle_range
+    features["rsi_not_collapsing"] = features["rsi_14"] >= (features["prev_rsi_14"] - 8.0)
+    features["reversal_confirmation"] = (
+        (features["close_open_pct"] > 0)
+        | (features["log_return_1"] > 0)
+        | ((features["lower_wick_ratio"] >= 0.30) & (features["close_position_in_candle"] >= 0.45))
+    )
+    features["severe_breakdown_mode"] = (
+        (features["log_return_20"] <= -0.035)
+        | (features["rolling_max_drawdown_50"] <= -0.08)
+        | (features["volatility_20"] >= 0.05)
+    )
+    return features.replace([np.inf, -np.inf], np.nan)
+
+
+def build_buy_the_dip_research_trades(
+    features: pd.DataFrame,
+    settings: Settings,
+    config: ResearchConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if features.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    required = [
+        "timestamp",
+        "close",
+        "open",
+        "high",
+        "low",
+        "vwap_distance",
+        "ema_20_distance",
+        "rsi_14",
+        "prev_rsi_14",
+        "rolling_zscore_20",
+        "recent_drawdown_50",
+        "volume_zscore_20",
+        "lower_wick_ratio",
+        "close_position_in_candle",
+        "reversal_confirmation",
+        "rsi_not_collapsing",
+        "severe_breakdown_mode",
+    ]
+    data = features.dropna(subset=required).reset_index(drop=True)
+    if data.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    stretch = (
+        (data["vwap_distance"] <= float(config.vwap_distance_threshold or 0.0))
+        | (data["ema_20_distance"] <= float(config.vwap_distance_threshold or 0.0))
+        | (data["rolling_zscore_20"] <= float(config.zscore_threshold or -2.0))
+        | (data["bb_close_position"] <= 0.15)
+    )
+    mask = (
+        stretch
+        & (data["rsi_14"] <= float(config.rsi_threshold or 30.0))
+        & data["rsi_not_collapsing"].astype(bool)
+        & (data["recent_drawdown_50"] >= float(config.drawdown_threshold or 0.01))
+        & (data["volume_zscore_20"] >= float(config.min_volume_zscore or 1.0))
+    )
+    if config.reversal_confirmation_required:
+        mask &= data["reversal_confirmation"].astype(bool)
+    if config.higher_timeframe_regime_filter:
+        mask &= ~data["severe_breakdown_mode"].astype(bool)
+
+    signal_rows: list[dict[str, Any]] = []
+    trade_rows: list[dict[str, Any]] = []
+    last_exit_index = -1
+    for entry_index in data.index[mask].tolist():
+        if entry_index <= last_exit_index:
+            continue
+        if entry_index >= len(data) - int(config.max_hold_bars) - 1:
+            continue
+        row = data.iloc[entry_index]
+        signal_row = _buy_the_dip_signal_row(row, config=config)
+        signal_rows.append(signal_row)
+        exit_result = resolve_research_exit(data, entry_index, config)
+        trade_rows.append(
+            {
+                **signal_row,
+                "buy_quality_label": int(exit_result["gross_return"] > 0),
+                "buy_exit_return_pct": float(exit_result["gross_return"]),
+                "buy_exit_reason": exit_result["exit_reason"],
+                "buy_hold_bars": float(exit_result["hold_bars"]),
+                "backtest_exit_high": float(exit_result["exit_high"]),
+                "backtest_exit_low": float(exit_result["exit_low"]),
+            }
+        )
+        last_exit_index = entry_index + max(1, int(exit_result["hold_bars"]))
+    return pd.DataFrame(trade_rows), pd.DataFrame(signal_rows)
+
+
 def resolve_research_exit(features: pd.DataFrame, entry_index: int, config: ResearchConfig) -> dict[str, Any]:
     entry_close = float(features.iloc[entry_index]["close"])
     take_profit_price = entry_close * (1 + config.take_profit_pct)
@@ -343,10 +580,16 @@ def paper_forward_readiness_gate(
     fallback_prediction_used: bool,
     active_model_valid: bool,
     research_result_valid: bool = True,
+    take_profit_pct: float | None = None,
+    round_trip_estimated_cost_pct: float | None = None,
+    promotion_required_return_pct: float | None = None,
+    source_used: str | None = None,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     if not research_result_valid:
         reasons.append("research_data_source_invalid")
+    if source_used is not None and source_used != "collected_market_data":
+        reasons.append("data_source_not_collected_market_data")
     if _metric_float(metrics.get("net_return_pct")) <= 0:
         reasons.append("net_return_not_positive")
     if _profit_factor_value(metrics.get("profit_factor_net")) < MIN_RESEARCH_PROFIT_FACTOR_NET:
@@ -357,6 +600,12 @@ def paper_forward_readiness_gate(
         reasons.append("max_drawdown_above_configured_limit")
     if single_trade_return_concentration(metrics.get("trade_details", [])) > MAX_SINGLE_TRADE_RETURN_SHARE:
         reasons.append("single_trade_return_concentration_too_high")
+    if take_profit_pct is not None and round_trip_estimated_cost_pct is not None:
+        if float(take_profit_pct) <= float(round_trip_estimated_cost_pct):
+            reasons.append("take_profit_not_above_round_trip_cost")
+    if take_profit_pct is not None and promotion_required_return_pct is not None:
+        if float(take_profit_pct) < float(promotion_required_return_pct):
+            reasons.append("take_profit_below_promotion_required_return")
     if fallback_prediction_used:
         reasons.append("fallback_prediction_not_allowed")
     economically_viable = not reasons
@@ -396,6 +645,22 @@ def build_research_summary(
     eligible = [] if synthetic_data_used or not research_result_valid else [
         row for row in ranked if row.get("paper_forward_eligible")
     ]
+    strategy_breakdown = build_strategy_breakdown(ranked, economically_viable=economically_viable, eligible=eligible)
+    best_by_strategy = best_configs_by_strategy(ranked)
+    buy_the_dip_rows = [row for row in ranked if row.get("strategy_name") == BUY_THE_DIP_STRATEGY]
+    buy_the_dip_economic = [row for row in economically_viable if row.get("strategy_name") == BUY_THE_DIP_STRATEGY]
+    buy_the_dip_eligible = [row for row in eligible if row.get("strategy_name") == BUY_THE_DIP_STRATEGY]
+    concise_summary = build_concise_research_summary(
+        ranked,
+        research_result_valid=research_result_valid,
+        buy_the_dip_rows=buy_the_dip_rows,
+        buy_the_dip_economic=buy_the_dip_economic,
+        buy_the_dip_eligible=buy_the_dip_eligible,
+        target_vs_cost_unsafe=(
+            float(settings.scalping_take_profit_pct) <= estimated_round_trip_execution_cost_pct(settings)
+            or float(settings.scalping_label_take_profit_pct) <= estimated_round_trip_execution_cost_pct(settings)
+        ),
+    )
     notes = [
         "Higher-timeframe research is offline analysis only and never enables trading.",
         "No configuration is auto-applied or promoted from this report.",
@@ -436,11 +701,36 @@ def build_research_summary(
             "summary_path": str(summary_path),
             "data_sources": data_source_names,
             "timeframe_data": source_report_payload,
+            "strategy_breakdown": strategy_breakdown,
+            "best_configs_by_strategy": best_by_strategy,
+            "buy_the_dip_mean_reversion_best_configs": best_by_strategy.get(BUY_THE_DIP_STRATEGY, []),
+            "rejection_reason_counts": rejection_reason_counts(ranked),
+            "take_profit_vs_cost_safe_config_count": sum(
+                1 for row in ranked if bool(row.get("take_profit_vs_cost_safe"))
+            ),
+            "economically_viable_by_strategy": {
+                strategy: int(values.get("economically_viable_count", 0))
+                for strategy, values in strategy_breakdown.items()
+            },
+            "paper_forward_eligible_by_strategy": {
+                strategy: int(values.get("paper_forward_eligible_count", 0))
+                for strategy, values in strategy_breakdown.items()
+            },
+            "concise_summary": concise_summary,
+            **concise_summary,
             "parameter_space": {
                 "timeframes": list(RESEARCH_TIMEFRAMES),
                 "take_profit_pct": list(TAKE_PROFIT_VALUES),
                 "stop_loss_pct": list(STOP_LOSS_VALUES),
                 "max_hold_bars": list(MAX_HOLD_BARS_VALUES),
+                "buy_the_dip_mean_reversion": {
+                    "timeframes": list(RESEARCH_TIMEFRAMES),
+                    "take_profit_pct": list(BUY_THE_DIP_TAKE_PROFIT_VALUES),
+                    "stop_loss_pct": list(BUY_THE_DIP_STOP_LOSS_VALUES),
+                    "max_hold_bars": list(BUY_THE_DIP_MAX_HOLD_BARS_VALUES),
+                    "signal_profiles": list(BUY_THE_DIP_SIGNAL_PROFILES),
+                    "grid_note": "Bounded deterministic profiles use the suggested thresholds without the full Cartesian explosion.",
+                },
             },
             "active_model_status": active_model_status,
             "conservative_backtest_assumptions": backtest_assumptions(settings, spread_available=True),
@@ -451,6 +741,102 @@ def build_research_summary(
             "notes": notes,
         }
     )
+
+
+def build_strategy_breakdown(
+    rows: list[dict[str, Any]],
+    *,
+    economically_viable: list[dict[str, Any]],
+    eligible: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    economic_ids = {row.get("parameter_set_id") for row in economically_viable}
+    eligible_ids = {row.get("parameter_set_id") for row in eligible}
+    strategies = sorted({str(row.get("strategy_name") or "unknown") for row in rows})
+    breakdown: dict[str, dict[str, Any]] = {}
+    for strategy in strategies:
+        strategy_rows = [row for row in rows if str(row.get("strategy_name") or "unknown") == strategy]
+        best = best_ranked_config(strategy_rows)
+        breakdown[strategy] = {
+            "configs_tested": len(strategy_rows),
+            "take_profit_vs_cost_safe_count": sum(
+                1 for row in strategy_rows if bool(row.get("take_profit_vs_cost_safe"))
+            ),
+            "economically_viable_count": sum(1 for row in strategy_rows if row.get("parameter_set_id") in economic_ids),
+            "paper_forward_eligible_count": sum(1 for row in strategy_rows if row.get("parameter_set_id") in eligible_ids),
+            "best_net_return_pct": best.get("net_return_pct") if best else None,
+            "best_profit_factor_net": best.get("profit_factor_net") if best else None,
+            "best_max_drawdown_pct": best.get("max_drawdown_pct") if best else None,
+            "rejection_reason_counts": rejection_reason_counts(strategy_rows),
+        }
+    return breakdown
+
+
+def best_configs_by_strategy(rows: list[dict[str, Any]], *, limit: int = 10) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {}
+    for strategy in sorted({str(row.get("strategy_name") or "unknown") for row in rows}):
+        strategy_rows = [row for row in rows if str(row.get("strategy_name") or "unknown") == strategy]
+        out[strategy] = sorted(
+            strategy_rows,
+            key=lambda row: (
+                bool(row.get("economically_viable")),
+                _metric_float(row.get("net_return_pct")),
+                _profit_factor_value(row.get("profit_factor_net")),
+                _metric_float(row.get("rank_score")),
+            ),
+            reverse=True,
+        )[:limit]
+    return out
+
+
+def best_ranked_config(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    return max(
+        rows,
+        key=lambda row: (
+            bool(row.get("economically_viable")),
+            _metric_float(row.get("net_return_pct")),
+            _profit_factor_value(row.get("profit_factor_net")),
+            _metric_float(row.get("rank_score")),
+        ),
+    )
+
+
+def rejection_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        raw = str(row.get("rejection_reasons") or "")
+        for reason in [part for part in raw.split(";") if part]:
+            counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def build_concise_research_summary(
+    rows: list[dict[str, Any]],
+    *,
+    research_result_valid: bool,
+    buy_the_dip_rows: list[dict[str, Any]],
+    buy_the_dip_economic: list[dict[str, Any]],
+    buy_the_dip_eligible: list[dict[str, Any]],
+    target_vs_cost_unsafe: bool,
+) -> dict[str, Any]:
+    best = best_ranked_config(buy_the_dip_rows)
+    recommendation = "keep_auto_trading_disabled"
+    if research_result_valid and not buy_the_dip_economic:
+        recommendation = "improve_strategy"
+    if buy_the_dip_economic:
+        recommendation = "manual_review_buy_the_dip_candidates"
+    return {
+        "data_ready": research_result_valid,
+        "target_vs_cost_unsafe": target_vs_cost_unsafe,
+        "buy_the_dip_configs_tested": len(buy_the_dip_rows),
+        "buy_the_dip_economically_viable_count": len(buy_the_dip_economic),
+        "buy_the_dip_paper_forward_eligible_count": len(buy_the_dip_eligible),
+        "buy_the_dip_best_net_return_pct": best.get("net_return_pct") if best else None,
+        "buy_the_dip_best_profit_factor_net": best.get("profit_factor_net") if best else None,
+        "buy_the_dip_best_max_drawdown_pct": best.get("max_drawdown_pct") if best else None,
+        "recommendation": recommendation,
+    }
 
 
 def write_research_outputs(
@@ -817,6 +1203,62 @@ def _signal_row(
         "research_stop_loss_pct": config.stop_loss_pct,
         "research_max_hold_bars": config.max_hold_bars,
     }
+
+
+def _buy_the_dip_signal_row(row: pd.Series, *, config: ResearchConfig) -> dict[str, Any]:
+    score = _buy_the_dip_score(row, config=config)
+    return {
+        "timestamp": row["timestamp"],
+        "close": float(row["close"]),
+        "orderbook_spread": float(row.get("orderbook_spread", 0.0)),
+        "quote_imbalance": float(row.get("quote_imbalance", 0.0)),
+        "scalping_spread_bps": float(row.get("scalping_spread_bps", 0.0)),
+        "scalping_quote_imbalance": float(row.get("scalping_quote_imbalance", 0.0)),
+        "strategy_name": BUY_THE_DIP_STRATEGY,
+        "entry_reason": "buy_the_dip_oversold_reversal_candidate",
+        "strategy_score": score,
+        "strategy_confidence": max(0.45, min(0.95, 0.45 + score * 0.45)),
+        "quant_score": score,
+        "quant_confidence": max(0.45, min(0.95, 0.45 + score * 0.45)),
+        "regime": "mean_reversion_research",
+        "blocked_by": None,
+        "block_reason": None,
+        "ml_buy_probability": 1.0,
+        "ml_sell_probability": 0.0,
+        "_probability": 1.0,
+        "research_timeframe": config.timeframe,
+        "research_take_profit_pct": config.take_profit_pct,
+        "research_stop_loss_pct": config.stop_loss_pct,
+        "research_max_hold_bars": config.max_hold_bars,
+        "rsi_14": float(row.get("rsi_14", 0.0)),
+        "rolling_zscore_20": float(row.get("rolling_zscore_20", 0.0)),
+        "vwap_distance": float(row.get("vwap_distance", 0.0)),
+        "ema_20_distance": float(row.get("ema_20_distance", 0.0)),
+        "recent_drawdown_50": float(row.get("recent_drawdown_50", 0.0)),
+        "volume_zscore_20": float(row.get("volume_zscore_20", 0.0)),
+        "lower_wick_ratio": float(row.get("lower_wick_ratio", 0.0)),
+        "close_position_in_candle": float(row.get("close_position_in_candle", 0.0)),
+        "reversal_confirmation": bool(row.get("reversal_confirmation", False)),
+        "higher_timeframe_regime_filter": bool(config.higher_timeframe_regime_filter),
+    }
+
+
+def _buy_the_dip_score(row: pd.Series, *, config: ResearchConfig) -> float:
+    rsi_threshold = max(1.0, float(config.rsi_threshold or 30.0))
+    zscore_threshold = abs(float(config.zscore_threshold or -2.0))
+    vwap_threshold = abs(float(config.vwap_distance_threshold or -0.005))
+    drawdown_threshold = max(0.0001, float(config.drawdown_threshold or 0.01))
+    volume_threshold = max(0.0001, float(config.min_volume_zscore or 1.0))
+    components = [
+        max(0.0, (rsi_threshold - _metric_float(row.get("rsi_14"))) / rsi_threshold),
+        max(0.0, abs(min(0.0, _metric_float(row.get("rolling_zscore_20")))) / zscore_threshold),
+        max(0.0, abs(min(0.0, _metric_float(row.get("vwap_distance")))) / vwap_threshold),
+        max(0.0, _metric_float(row.get("recent_drawdown_50")) / drawdown_threshold),
+        max(0.0, _metric_float(row.get("volume_zscore_20")) / volume_threshold),
+        max(0.0, _metric_float(row.get("lower_wick_ratio"))),
+        max(0.0, _metric_float(row.get("close_position_in_candle"))),
+    ]
+    return float(max(0.0, min(1.0, sum(min(1.0, value) for value in components) / len(components))))
 
 
 def _research_block_bucket(reason: str) -> str:
