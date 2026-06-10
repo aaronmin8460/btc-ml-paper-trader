@@ -17,10 +17,13 @@ from scripts.research_higher_timeframe import (
     BUY_THE_DIP_STRATEGY,
     UPTREND_PULLBACK_STRATEGY,
     VOLATILITY_BREAKOUT_STRATEGY,
+    VOLATILITY_FOCUS_STRATEGY,
     ResearchDataReport,
     ResearchConfig,
+    _resolve_requested_timeframes,
     aggregate_trade_diagnostics,
     build_baselines_by_timeframe,
+    build_volatility_focus_summary,
     build_trade_audit_rows,
     build_uptrend_pullback_research_trades,
     build_buy_the_dip_research_trades,
@@ -41,6 +44,7 @@ from scripts.research_higher_timeframe import (
     generate_htf_configs,
     generate_htf_trend_continuation_configs,
     generate_htf_volatility_expansion_breakout_configs,
+    generate_volatility_focus_configs,
     generate_research_configs,
     generate_trend_pullback_configs,
     generate_uptrend_pullback_configs,
@@ -52,6 +56,9 @@ from scripts.research_higher_timeframe import (
     run_higher_timeframe_research,
     strategy_baseline_comparison,
     summarize_walk_forward_metrics,
+    volatility_focus_research_gate,
+    volatility_focus_trade_diagnostics,
+    write_volatility_focus_outputs,
 )
 
 
@@ -196,6 +203,40 @@ def test_higher_timeframe_strategy_templates_use_1h_4h_daily():
     assert {config.strategy_name for config in risk_off} == {"htf_risk_off_hold_filter"}
 
 
+def test_volatility_focus_mode_defaults_to_1h_and_samples_deterministically():
+    assert _resolve_requested_timeframes(VOLATILITY_FOCUS_STRATEGY, None) == ("1H",)
+    configs = generate_volatility_focus_configs(max_configs=40)
+    second = generate_volatility_focus_configs(max_configs=40)
+
+    assert len(configs) == 40
+    assert [config.parameter_set_id for config in configs] == [config.parameter_set_id for config in second]
+    assert {config.timeframe for config in configs} == {"1H"}
+    assert {config.strategy_name for config in configs} == {
+        VOLATILITY_BREAKOUT_STRATEGY,
+        "htf_volatility_expansion_breakout",
+    }
+    assert any(config.parameter_set_id.startswith("vff_htfb") for config in configs)
+    assert any(config.parameter_set_id.startswith("vff_vbo") for config in configs)
+    explicit_15min = generate_volatility_focus_configs(max_configs=4, timeframes=("15Min",))
+    assert {config.timeframe for config in explicit_15min} == {"15Min"}
+
+
+def test_volatility_focus_strategy_generates_only_breakout_families():
+    configs = generate_research_configs(
+        strategy=VOLATILITY_FOCUS_STRATEGY,
+        max_v3_configs=20,
+        timeframes=("1H", "4H"),
+    )
+
+    assert len(configs) == 20
+    assert {config.timeframe for config in configs} <= {"1H", "4H"}
+    assert {config.strategy_name for config in configs} == {
+        VOLATILITY_BREAKOUT_STRATEGY,
+        "htf_volatility_expansion_breakout",
+    }
+    assert "15Min" not in {config.timeframe for config in configs}
+
+
 def test_paper_forward_readiness_blocks_fallback_and_invalid_model():
     settings = _settings()
 
@@ -217,6 +258,84 @@ def test_paper_forward_readiness_blocks_fallback_and_invalid_model():
     assert invalid_model["economically_viable"] is True
     assert invalid_model["paper_forward_eligible"] is False
     assert "active_model_invalid" in invalid_model["rejection_reasons"]
+
+
+def test_volatility_focus_research_gate_keeps_active_model_out_of_research_rejections():
+    gate = volatility_focus_research_gate(
+        _passing_metrics(number_of_trades=25, max_drawdown_pct=0.005),
+        _settings(),
+        _volatility_breakout_config(timeframe="1H", stop_loss_pct=0.02),
+        cost_summary={
+            "net_return_by_cost_scenario": {"current_taker": 0.02},
+            "profit_factor_by_cost_scenario": {"current_taker": 1.2},
+        },
+        source_report=ResearchDataReport(
+            timeframe="1H",
+            source_used="collected_market_data",
+            latest_timestamp="2026-06-07T09:00:00+00:00",
+            data_age_minutes=0.0,
+            row_count=500,
+            synthetic_data_used=False,
+            research_result_valid=True,
+        ),
+        synthetic_data_used=False,
+        research_result_valid=True,
+        baseline_comparison={
+            "beats_buy_hold_risk_adjusted": True,
+            "beats_dca_daily_risk_adjusted": True,
+        },
+        walk_forward={"walk_forward_passed": True, "folds_with_min_trades_count": 3},
+        concentration=0.20,
+        active_model_valid=False,
+        min_focused_trades=20,
+    )
+
+    assert gate["research_promising"] is True
+    assert gate["economically_viable"] is True
+    assert gate["paper_forward_eligible"] is False
+    assert "active_model_invalid" not in gate["research_rejection_reasons"]
+    assert "active_model_invalid" in gate["paper_forward_rejection_reasons"]
+    assert "active_model_invalid" in gate["training_rejection_reasons"]
+
+
+def test_volatility_focus_research_gate_enforces_trade_fold_cost_and_baseline_gates():
+    gate = volatility_focus_research_gate(
+        _passing_metrics(number_of_trades=12, max_drawdown_pct=0.02),
+        _settings(max_backtest_drawdown_pct=0.01),
+        _volatility_breakout_config(timeframe="1H"),
+        cost_summary={
+            "net_return_by_cost_scenario": {"current_taker": -0.01},
+            "profit_factor_by_cost_scenario": {"current_taker": 0.9},
+        },
+        source_report=ResearchDataReport(
+            timeframe="1H",
+            source_used="collected_market_data",
+            latest_timestamp="2026-06-07T09:00:00+00:00",
+            data_age_minutes=0.0,
+            row_count=500,
+            synthetic_data_used=False,
+            research_result_valid=True,
+        ),
+        synthetic_data_used=False,
+        research_result_valid=True,
+        baseline_comparison={
+            "beats_buy_hold_risk_adjusted": False,
+            "beats_dca_daily_risk_adjusted": False,
+        },
+        walk_forward={"walk_forward_passed": False, "folds_with_min_trades_count": 2},
+        concentration=0.20,
+        active_model_valid=True,
+        min_focused_trades=20,
+    )
+
+    reasons = gate["research_rejection_reasons"]
+    assert "number_of_trades_below_20" in reasons
+    assert "folds_with_min_trades_below_3" in reasons
+    assert "walk_forward_not_passed" in reasons
+    assert "current_taker_net_return_not_positive" in reasons
+    assert "current_taker_profit_factor_below_1_05" in reasons
+    assert "does_not_beat_buy_and_hold_risk_adjusted" in reasons
+    assert "does_not_beat_dca_risk_adjusted" in reasons
 
 
 def test_paper_forward_readiness_requires_economic_thresholds():
@@ -408,6 +527,55 @@ def test_cost_scenarios_and_trade_audit_cost_decomposition_do_not_modify_env():
         assert env_path.read_text(encoding="utf-8") == before
 
 
+def test_volatility_focus_trade_diagnostics_reports_mfe_mae_and_exit_mix():
+    config = _volatility_breakout_config(timeframe="1H", stop_loss_pct=0.01, max_hold_bars=12)
+    trades = pd.DataFrame(
+        [
+            {
+                "max_favorable_excursion_pct": 0.012,
+                "max_adverse_excursion_pct": -0.004,
+                "buy_exit_reason": "research_stop_loss",
+                "buy_hold_bars": 2,
+            },
+            {
+                "max_favorable_excursion_pct": 0.025,
+                "max_adverse_excursion_pct": -0.002,
+                "buy_exit_reason": "research_take_profit",
+                "buy_hold_bars": 5,
+            },
+            {
+                "max_favorable_excursion_pct": 0.004,
+                "max_adverse_excursion_pct": -0.006,
+                "buy_exit_reason": "research_max_hold",
+                "buy_hold_bars": 12,
+            },
+        ]
+    )
+
+    diagnostics = volatility_focus_trade_diagnostics(
+        trades,
+        trades,
+        {"number_of_trades": 3},
+        config,
+        walk_forward={
+            "per_fold_net_return_pct": [0.01, -0.002],
+            "per_fold_number_of_trades": [2, 1],
+            "per_fold_profit_factor_net": [1.4, 0.8],
+        },
+        cost_summary={"cost_sensitivity_classification": "signal_survives_current_taker_cost"},
+    )
+
+    assert diagnostics["total_entries"] == 3
+    assert diagnostics["total_exits"] == 3
+    assert diagnostics["average_mfe"] == pytest.approx((0.012 + 0.025 + 0.004) / 3)
+    assert diagnostics["median_mae"] == pytest.approx(-0.004)
+    assert diagnostics["pct_trades_reaching_1r_before_stop"] == pytest.approx(2 / 3)
+    assert diagnostics["pct_trades_reaching_2r_before_stop"] == pytest.approx(1 / 3)
+    assert diagnostics["pct_trades_stopped_quickly"] == pytest.approx(1 / 3)
+    assert diagnostics["pct_trades_timing_out"] == pytest.approx(1 / 3)
+    assert diagnostics["fold_by_fold_trade_counts"] == [2, 1]
+
+
 def test_trade_by_trade_audit_export_writes_csv_jsonl_and_diagnostics(tmp_path):
     settings = research_settings(_settings(order_notional_usd=25, min_training_rows=1))
     start = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
@@ -490,6 +658,90 @@ def test_research_summary_never_auto_applies_or_enables_trading(tmp_path):
     assert summary["paper_forward_eligible_config_count"] == 0
     assert "strategy_breakdown" in summary
     assert "concise_summary" in summary
+
+
+def test_volatility_focus_summary_and_output_files_include_safety_and_rejections(tmp_path):
+    settings = research_settings(_settings())
+    row = {
+        "parameter_set_id": "vff_vbo_00001",
+        "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+        "timeframe": "1H",
+        "take_profit_pct": 0.04,
+        "stop_loss_pct": 0.02,
+        "max_hold_bars": 48,
+        "breakout_lookback": 20,
+        "consolidation_lookback": 12,
+        "number_of_trades": 25,
+        "net_return_pct": 0.02,
+        "profit_factor_net": 1.2,
+        "max_drawdown_pct": 0.004,
+        "win_rate_net": 0.52,
+        "expectancy": 0.001,
+        "walk_forward_passed": True,
+        "folds_with_min_trades_count": 3,
+        "fold_by_fold_returns": [0.01, 0.005, 0.005, 0.0],
+        "fold_by_fold_trade_counts": [7, 6, 6, 6],
+        "cost_sensitivity_classification": "signal_survives_current_taker_cost",
+        "net_return_by_cost_scenario": {"current_taker": 0.02, "maker_low_slippage": 0.03, "zero_cost_sanity": 0.04},
+        "profit_factor_by_cost_scenario": {"current_taker": 1.2},
+        "research_promising": True,
+        "economically_viable": True,
+        "paper_forward_eligible": False,
+        "research_rejection_reasons": "",
+        "paper_forward_rejection_reasons": "active_model_invalid",
+        "training_rejection_reasons": "active_model_invalid;training_deferred_volatility_focus_no_ml_yet",
+        "adjusted_rank_score": 10.0,
+    }
+    reports = {
+        "1H": ResearchDataReport(
+            timeframe="1H",
+            source_used="collected_market_data",
+            latest_timestamp="2026-06-07T09:00:00+00:00",
+            data_age_minutes=0.0,
+            row_count=500,
+            synthetic_data_used=False,
+            research_result_valid=True,
+        )
+    }
+    summary = build_volatility_focus_summary(
+        [row],
+        settings,
+        base_summary={
+            "synthetic_data_used": False,
+            "research_result_valid": True,
+            "timeframes": ["1H"],
+            "baselines": {},
+        },
+        data_source_reports=reports,
+        bars_by_timeframe={"1H": _bars(latest=datetime(2026, 6, 7, 9, 0, tzinfo=UTC), count=40, step_minutes=60)},
+        min_focused_trades=20,
+        target_focused_trades=50,
+        max_focused_configs=100,
+        focused_summary_path=tmp_path / "volatility_focus_summary.json",
+        top_configs_csv_path=tmp_path / "volatility_focus_top_configs.csv",
+        rejections_path=tmp_path / "volatility_focus_rejections.json",
+        trade_audit_paths=[],
+    )
+    write_volatility_focus_outputs(
+        [row],
+        summary,
+        summary_path=tmp_path / "volatility_focus_summary.json",
+        top_configs_csv_path=tmp_path / "volatility_focus_top_configs.csv",
+        rejections_path=tmp_path / "volatility_focus_rejections.json",
+    )
+
+    assert summary["orders_placed"] == 0
+    assert summary["trading_enabled"] is False
+    assert summary["auto_trade_enabled"] is False
+    assert summary["synthetic_data_used"] is False
+    assert summary["research_promising_count"] == 1
+    assert summary["paper_forward_eligible_count"] == 0
+    assert summary["recommendation"] == "candidate_found_keep_trading_disabled"
+    assert (tmp_path / "volatility_focus_summary.json").exists()
+    top_csv = (tmp_path / "volatility_focus_top_configs.csv").read_text(encoding="utf-8")
+    assert "parameter_set_id,strategy_name,timeframe" in top_csv
+    rejections = (tmp_path / "volatility_focus_rejections.json").read_text(encoding="utf-8")
+    assert "active_model_invalid" in rejections
 
 
 def _buy_the_dip_config(**overrides) -> ResearchConfig:
@@ -722,6 +974,39 @@ def test_volatility_breakout_produces_expected_long_only_entries_on_fixture_data
     assert set(trades["entry_reason"]) == {"volatility_breakout_momentum_continuation_candidate"}
     assert set(trades["ml_sell_probability"]) == {0.0}
     assert "short" not in set(str(reason).lower() for reason in trades["entry_reason"])
+
+
+def test_volatility_focus_quality_filters_block_low_quality_breakouts():
+    features = _v3_feature_rows(strategy=VOLATILITY_BREAKOUT_STRATEGY).copy()
+    features["normalized_volume"] = 1.4
+    features["breakout_candle_atr_multiple"] = 1.4
+    features["recent_runup_pct_5"] = 0.025
+    features["log_return_1"] = 0.01
+    features["range_compression_12"] = 1.2
+    features["atr_percentile_200"] = 0.50
+    config = _volatility_breakout_config(
+        require_ema_trend_filter=True,
+        require_positive_ema20_slope=True,
+        require_close_above_ema200=True,
+        max_breakout_candle_atr_multiple=2.0,
+        min_close_position_in_candle=0.60,
+        max_recent_runup_pct=0.05,
+        min_consolidation_compression=1.0,
+        require_volume_expansion=True,
+        max_atr_percentile=0.90,
+    )
+
+    trades, _ = build_volatility_breakout_research_trades(features, _settings(), config)
+    bad_close_position = features.copy()
+    bad_close_position["close_position_in_candle"] = 0.20
+    filtered_trades, _ = build_volatility_breakout_research_trades(bad_close_position, _settings(), config)
+    bad_trend = features.copy()
+    bad_trend["ema_50_above_200"] = False
+    trend_filtered, _ = build_volatility_breakout_research_trades(bad_trend, _settings(), config)
+
+    assert not trades.empty
+    assert filtered_trades.empty
+    assert trend_filtered.empty
 
 
 def test_1h_bars_are_derived_chronologically_from_15min_data_without_partial_future_hour():
@@ -1177,6 +1462,80 @@ def test_run_higher_timeframe_research_does_not_enable_trading(tmp_path):
     assert summary["auto_trade_enabled"] is False
     assert summary["fallback_trading_allowed"] is False
     assert summary["auto_apply_best_config"] is False
+
+
+def test_run_volatility_focus_writes_summary_and_keeps_trading_disabled(tmp_path):
+    now = datetime(2026, 6, 7, 9, 0, tzinfo=UTC)
+    engine, Session = _session_factory(tmp_path)
+    _insert_collected_rows(Session, timeframe="1H", latest=now - timedelta(hours=1), count=80, step_minutes=60)
+
+    class ShouldNotFetchClient:
+        async def fetch_bars(self, *args, **kwargs):
+            raise AssertionError("fresh collected_market_data should be used before fetching client bars")
+
+    focused_path = tmp_path / "volatility_focus_summary.json"
+    try:
+        summary = asyncio.run(
+            run_higher_timeframe_research(
+                _settings(trading_enabled=True, auto_trade_enabled=True, allow_fallback_trading=True, min_training_rows=1),
+                bar_limit=80,
+                client=ShouldNotFetchClient(),
+                output_dir=tmp_path,
+                session_factory=Session,
+                now=now,
+                strategy=VOLATILITY_FOCUS_STRATEGY,
+                max_v3_configs=4,
+                save_focused_summary=focused_path,
+                export_focused_trades=True,
+                trade_log_dir=tmp_path / "trade_audits",
+                top_n_trade_configs=1,
+            )
+        )
+    finally:
+        engine.dispose()
+
+    focused = summary["volatility_focus"]
+    assert focused_path.exists()
+    assert focused["timeframes_used"] == ["1H"]
+    assert focused["orders_placed"] == 0
+    assert focused["trading_enabled"] is False
+    assert focused["auto_trade_enabled"] is False
+    assert focused["synthetic_data_used"] is False
+    assert summary["trading_enabled"] is False
+    assert summary["auto_trade_enabled"] is False
+    assert list((tmp_path / "trade_audits").glob("volatility_focus_top_*.csv"))
+    assert list((tmp_path / "trade_audits").glob("volatility_focus_top_*.jsonl"))
+
+
+def test_volatility_focus_does_not_derive_from_15min_unless_requested(tmp_path):
+    now = datetime(2026, 6, 7, 9, 0, tzinfo=UTC)
+    engine, Session = _session_factory(tmp_path)
+    requested_market_timeframes = []
+
+    class EmptyClient:
+        async def fetch_bars(self, symbol, *, timeframe=None, limit=None, force_refresh=False):
+            requested_market_timeframes.append(timeframe)
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    try:
+        summary = asyncio.run(
+            run_higher_timeframe_research(
+                _settings(min_training_rows=1),
+                bar_limit=5,
+                client=EmptyClient(),
+                output_dir=tmp_path,
+                session_factory=Session,
+                now=now,
+                strategy=VOLATILITY_FOCUS_STRATEGY,
+                max_v3_configs=2,
+                save_focused_summary=tmp_path / "volatility_focus_summary.json",
+            )
+        )
+    finally:
+        engine.dispose()
+
+    assert requested_market_timeframes == ["1Hour"]
+    assert summary["volatility_focus"]["source_used_by_timeframe"] == {"1H": "no_valid_real_data_source"}
 
 
 def test_default_research_row_limit_remains_backward_compatible(tmp_path):

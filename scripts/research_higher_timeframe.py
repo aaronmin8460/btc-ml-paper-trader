@@ -53,12 +53,19 @@ VOLATILITY_BREAKOUT_STRATEGY = "volatility_breakout"
 HTF_TREND_CONTINUATION_STRATEGY = "htf_trend_continuation"
 HTF_VOLATILITY_EXPANSION_BREAKOUT_STRATEGY = "htf_volatility_expansion_breakout"
 HTF_RISK_OFF_HOLD_FILTER_STRATEGY = "htf_risk_off_hold_filter"
+VOLATILITY_FOCUS_STRATEGY = "volatility_focus"
 V3_STRATEGIES = (UPTREND_PULLBACK_STRATEGY, VOLATILITY_BREAKOUT_STRATEGY)
 HTF_STRATEGIES = (
     HTF_TREND_CONTINUATION_STRATEGY,
     HTF_VOLATILITY_EXPANSION_BREAKOUT_STRATEGY,
     HTF_RISK_OFF_HOLD_FILTER_STRATEGY,
 )
+VOLATILITY_FOCUS_STRATEGIES = (
+    VOLATILITY_BREAKOUT_STRATEGY,
+    HTF_VOLATILITY_EXPANSION_BREAKOUT_STRATEGY,
+)
+VOLATILITY_FOCUS_DEFAULT_TIMEFRAMES = ("1H",)
+VOLATILITY_FOCUS_SUPPORTED_TIMEFRAMES = ("15Min", "1H", "4H")
 STRATEGY_CHOICES = (
     "all",
     TREND_PULLBACK_STRATEGY,
@@ -68,6 +75,7 @@ STRATEGY_CHOICES = (
     HTF_TREND_CONTINUATION_STRATEGY,
     HTF_VOLATILITY_EXPANSION_BREAKOUT_STRATEGY,
     HTF_RISK_OFF_HOLD_FILTER_STRATEGY,
+    VOLATILITY_FOCUS_STRATEGY,
 )
 TAKE_PROFIT_VALUES = (0.008, 0.01, 0.015, 0.02)
 STOP_LOSS_VALUES = (0.003, 0.005, 0.008)
@@ -85,6 +93,26 @@ HTF_TREND_STOP_LOSS_VALUES = (0.015, 0.025, 0.04, 0.06)
 HTF_BREAKOUT_TAKE_PROFIT_VALUES = (0.04, 0.06, 0.10, 0.15)
 HTF_BREAKOUT_STOP_LOSS_VALUES = (0.02, 0.03, 0.05)
 HTF_MAX_HOLD_BARS_VALUES = (12, 24, 48, 96)
+VOLATILITY_FOCUS_TAKE_PROFIT_VALUES = (0.025, 0.03, 0.035, 0.04, 0.05, 0.06, 0.08)
+VOLATILITY_FOCUS_STOP_LOSS_VALUES = (0.012, 0.015, 0.018, 0.02, 0.025, 0.03)
+VOLATILITY_FOCUS_MAX_HOLD_BARS_VALUES = (12, 24, 36, 48, 72, 96)
+VOLATILITY_FOCUS_BREAKOUT_LOOKBACK_VALUES = (12, 16, 20, 24, 36, 48)
+VOLATILITY_FOCUS_CONSOLIDATION_LOOKBACK_VALUES = (8, 12, 16, 20, 24)
+VOLATILITY_FOCUS_MIN_BODY_VS_AVG_VALUES = (0.8, 1.0, 1.2, 1.5)
+VOLATILITY_FOCUS_MIN_RECENT_RETURN_VALUES = (0.001, 0.002, 0.003, 0.004, 0.006, 0.008)
+VOLATILITY_FOCUS_MIN_TREND_STRENGTH_VALUES = (0.0, 0.02, 0.05, 0.08, 0.10)
+VOLATILITY_FOCUS_MIN_VOLUME_ZSCORE_VALUES = (-0.25, 0.0, 0.25, 0.5, 0.75, 1.0)
+VOLATILITY_FOCUS_MAX_ATR_EXPANSION_VALUES = (1.8, 2.2, 2.6, 3.0, 3.5)
+VOLATILITY_FOCUS_RECOMMENDATIONS = (
+    "no_edge_found",
+    "cost_drag_only",
+    "entry_quality_problem",
+    "exit_logic_problem",
+    "more_data_needed",
+    "candidate_found_keep_trading_disabled",
+    "refine_volatility_breakout_more",
+    "retire_volatility_breakout",
+)
 RISK_OFF_FILTER_PROFILES = (
     {
         "drawdown_threshold": 0.12,
@@ -190,6 +218,15 @@ class ResearchConfig:
     min_recent_return_pct: float | None = None
     min_trend_strength: float | None = None
     max_atr_expansion: float | None = None
+    require_ema_trend_filter: bool | None = None
+    require_positive_ema20_slope: bool | None = None
+    require_close_above_ema200: bool | None = None
+    max_breakout_candle_atr_multiple: float | None = None
+    min_close_position_in_candle: float | None = None
+    max_recent_runup_pct: float | None = None
+    min_consolidation_compression: float | None = None
+    require_volume_expansion: bool | None = None
+    max_atr_percentile: float | None = None
 
 
 @dataclass(frozen=True)
@@ -246,7 +283,17 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--higher-timeframe-audit", action="store_true", help="Prefer 1H/4H/1D audit defaults.")
     parser.add_argument("--exclude-15min", action="store_true", help="Do not evaluate 15Min configs.")
+    parser.add_argument(
+        "--volatility-focus",
+        action="store_true",
+        help="Run only focused 1H/optional 4H volatility breakout research.",
+    )
     parser.add_argument("--export-trades", action="store_true", help="Export selected config trade-by-trade audit logs.")
+    parser.add_argument(
+        "--export-focused-trades",
+        action="store_true",
+        help="Export volatility-focus top config trade audits with volatility_focus_top_* filenames.",
+    )
     parser.add_argument(
         "--trade-log-dir",
         default="logs/trade_audits",
@@ -292,6 +339,23 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-trades", type=int, default=MIN_RESEARCH_TRADES, help="Minimum total trades per config.")
     parser.add_argument(
+        "--min-focused-trades",
+        type=int,
+        default=MIN_RESEARCH_TRADES,
+        help="Minimum total trades for volatility-focus research-promising configs.",
+    )
+    parser.add_argument(
+        "--target-focused-trades",
+        type=int,
+        default=PREFERRED_RESEARCH_TRADES,
+        help="Preferred trade count for volatility-focus ranking.",
+    )
+    parser.add_argument(
+        "--save-focused-summary",
+        default="logs/volatility_focus_summary.json",
+        help="Path for the dedicated volatility focus summary JSON.",
+    )
+    parser.add_argument(
         "--min-trades-per-split",
         type=int,
         default=MIN_RESEARCH_TRADES_PER_SPLIT,
@@ -304,8 +368,10 @@ async def main() -> None:
     args = _parse_args()
     settings = research_settings(get_settings())
     bar_limit = int(os.getenv("RESEARCH_BAR_LIMIT", str(max(1500, settings.min_training_rows + 500))))
+    volatility_focus = bool(args.volatility_focus or args.strategy == VOLATILITY_FOCUS_STRATEGY)
+    strategy = VOLATILITY_FOCUS_STRATEGY if volatility_focus else args.strategy
     timeframes = _resolve_requested_timeframes(
-        args.strategy,
+        strategy,
         args.timeframes,
         higher_timeframe_audit=args.higher_timeframe_audit,
         exclude_15min=args.exclude_15min,
@@ -328,11 +394,11 @@ async def main() -> None:
         start=args.start,
         end=args.end,
         lookback_days=args.lookback_days,
-        strategy=args.strategy,
+        strategy=strategy,
         max_buy_dip_configs=args.max_buy_dip_configs,
         max_v3_configs=args.max_v3_configs,
         walk_forward_splits=args.walk_forward_splits,
-        min_trades=args.min_trades,
+        min_trades=args.min_focused_trades if volatility_focus else args.min_trades,
         min_trades_per_split=args.min_trades_per_split,
         output_dir=Path(settings.log_dir),
         allow_synthetic_fallback=_synthetic_research_mode_enabled(),
@@ -343,6 +409,11 @@ async def main() -> None:
         include_rejected_trades=args.include_rejected_trades,
         higher_timeframe_audit=args.higher_timeframe_audit,
         exclude_15min=args.exclude_15min,
+        volatility_focus=volatility_focus,
+        min_focused_trades=args.min_focused_trades,
+        target_focused_trades=args.target_focused_trades,
+        save_focused_summary=Path(args.save_focused_summary),
+        export_focused_trades=args.export_focused_trades,
     )
     print(json.dumps(report, indent=2, default=str))
 
@@ -374,8 +445,16 @@ async def run_higher_timeframe_research(
     include_rejected_trades: bool = False,
     higher_timeframe_audit: bool = False,
     exclude_15min: bool = False,
+    volatility_focus: bool = False,
+    min_focused_trades: int = MIN_RESEARCH_TRADES,
+    target_focused_trades: int = PREFERRED_RESEARCH_TRADES,
+    save_focused_summary: Path | None = None,
+    export_focused_trades: bool = False,
 ) -> dict[str, Any]:
     settings = research_settings(base_settings)
+    volatility_focus = bool(volatility_focus or strategy == VOLATILITY_FOCUS_STRATEGY)
+    if volatility_focus:
+        strategy = VOLATILITY_FOCUS_STRATEGY
     if strategy not in STRATEGY_CHOICES:
         raise ValueError(f"Unsupported research strategy: {strategy}")
     if max_buy_dip_configs <= 0:
@@ -386,6 +465,10 @@ async def run_higher_timeframe_research(
         raise ValueError("walk_forward_splits must be positive")
     if min_trades <= 0:
         raise ValueError("min_trades must be positive")
+    if min_focused_trades <= 0:
+        raise ValueError("min_focused_trades must be positive")
+    if target_focused_trades <= 0:
+        raise ValueError("target_focused_trades must be positive")
     if min_trades_per_split <= 0:
         raise ValueError("min_trades_per_split must be positive")
     if audit_mode not in {"standard", "reality"}:
@@ -427,6 +510,7 @@ async def run_higher_timeframe_research(
             now=current_time,
             start=window_start,
             end=window_end,
+            allow_15min_derivation=not volatility_focus or "15Min" in requested_timeframes,
         )
         bars_by_timeframe[timeframe] = result.bars
         data_source_reports[timeframe] = result.report
@@ -444,6 +528,9 @@ async def run_higher_timeframe_research(
         min_trades_per_split=min_trades_per_split,
         timeframes=requested_timeframes,
         audit_mode=audit_mode,
+        volatility_focus=volatility_focus,
+        min_focused_trades=min_focused_trades,
+        target_focused_trades=target_focused_trades,
     )
     output_path = output_dir or Path(settings.log_dir)
     csv_path = output_path / "higher_timeframe_research.csv"
@@ -512,6 +599,54 @@ async def run_higher_timeframe_research(
                 cost_scenarios=COST_SCENARIOS,
                 trade_audit_paths=trade_audit_paths,
             )
+    focused_trade_audit_paths: list[dict[str, Any]] = []
+    if volatility_focus:
+        if export_focused_trades:
+            focused_trade_audit_paths = export_trade_audit_logs(
+                rows,
+                bars_by_timeframe,
+                settings,
+                data_source_reports=data_source_reports,
+                strategy=VOLATILITY_FOCUS_STRATEGY,
+                max_buy_dip_configs=max_buy_dip_configs,
+                max_v3_configs=max_v3_configs,
+                walk_forward_splits=walk_forward_splits,
+                min_trades_per_split=min_trades_per_split,
+                timeframes=requested_timeframes,
+                output_dir=trade_log_dir or (output_path / "trade_audits"),
+                top_n=top_n_trade_configs,
+                include_rejected=True,
+                filename_prefix="volatility_focus_top_",
+            )
+            summary["focused_trade_audits"] = focused_trade_audit_paths
+        focused_summary_path = save_focused_summary or (output_path / "volatility_focus_summary.json")
+        focused_top_csv_path = output_path / "volatility_focus_top_configs.csv"
+        focused_rejections_path = output_path / "volatility_focus_rejections.json"
+        focused_summary = build_volatility_focus_summary(
+            rows,
+            settings,
+            base_summary=summary,
+            data_source_reports=data_source_reports,
+            bars_by_timeframe=bars_by_timeframe,
+            min_focused_trades=min_focused_trades,
+            target_focused_trades=target_focused_trades,
+            max_focused_configs=max_v3_configs,
+            focused_summary_path=focused_summary_path,
+            top_configs_csv_path=focused_top_csv_path,
+            rejections_path=focused_rejections_path,
+            trade_audit_paths=focused_trade_audit_paths,
+        )
+        write_volatility_focus_outputs(
+            rows,
+            focused_summary,
+            summary_path=focused_summary_path,
+            top_configs_csv_path=focused_top_csv_path,
+            rejections_path=focused_rejections_path,
+        )
+        summary["volatility_focus"] = focused_summary
+        summary["volatility_focus_summary_path"] = str(focused_summary_path)
+        summary["volatility_focus_top_configs_csv_path"] = str(focused_top_csv_path)
+        summary["volatility_focus_rejections_path"] = str(focused_rejections_path)
     write_research_outputs(rows, summary, csv_path=csv_path, summary_path=summary_path)
     if audit_mode == "reality":
         (output_path / "strategy_reality_audit_summary.json").write_text(
@@ -609,6 +744,8 @@ def _resolve_requested_timeframes(
 ) -> tuple[str, ...]:
     if timeframes:
         requested = tuple(dict.fromkeys(str(timeframe) for timeframe in timeframes))
+    elif strategy == VOLATILITY_FOCUS_STRATEGY:
+        requested = VOLATILITY_FOCUS_DEFAULT_TIMEFRAMES
     elif higher_timeframe_audit:
         requested = HTF_RESEARCH_TIMEFRAMES
     elif strategy in V3_STRATEGIES or strategy == "all":
@@ -619,6 +756,15 @@ def _resolve_requested_timeframes(
         requested = LEGACY_RESEARCH_TIMEFRAMES
     if exclude_15min:
         requested = tuple(timeframe for timeframe in requested if timeframe != "15Min")
+    if strategy == VOLATILITY_FOCUS_STRATEGY:
+        unsupported_focus = [
+            timeframe for timeframe in requested if timeframe not in VOLATILITY_FOCUS_SUPPORTED_TIMEFRAMES
+        ]
+        if unsupported_focus:
+            raise ValueError(
+                "Volatility focus supports only explicit 15Min plus 1H/4H timeframes: "
+                + ", ".join(unsupported_focus)
+            )
     unsupported = [timeframe for timeframe in requested if timeframe not in SUPPORTED_RESEARCH_TIMEFRAMES]
     if unsupported:
         raise ValueError(f"Unsupported research timeframe(s): {', '.join(unsupported)}")
@@ -670,11 +816,17 @@ def evaluate_research_configs(
     min_trades_per_split: int = MIN_RESEARCH_TRADES_PER_SPLIT,
     timeframes: tuple[str, ...] | list[str] | None = None,
     audit_mode: str = "standard",
+    volatility_focus: bool = False,
+    min_focused_trades: int = MIN_RESEARCH_TRADES,
+    target_focused_trades: int = PREFERRED_RESEARCH_TRADES,
 ) -> list[dict[str, Any]]:
     if settings.symbol != ALLOWED_SYMBOL:
         raise ValueError("Higher-timeframe research is BTC/USD-only.")
     if audit_mode not in {"standard", "reality"}:
         raise ValueError("audit_mode must be standard or reality")
+    volatility_focus = bool(volatility_focus or strategy == VOLATILITY_FOCUS_STRATEGY)
+    if volatility_focus:
+        strategy = VOLATILITY_FOCUS_STRATEGY
     rows: list[dict[str, Any]] = []
     source_reports = {
         timeframe: _coerce_data_report(timeframe, report)
@@ -749,7 +901,7 @@ def evaluate_research_configs(
                 config,
                 fallback_metrics=metrics,
             )
-            if audit_mode == "reality"
+            if audit_mode == "reality" or volatility_focus
             else {}
         )
         round_trip_cost = _metric_float(metrics.get("round_trip_estimated_cost_pct"))
@@ -794,16 +946,55 @@ def evaluate_research_configs(
                 paper_forward_eligible = False
                 research_promising = False
         concentration = single_trade_return_concentration(metrics.get("trade_details", []))
-        rank_details = research_rank_details(
-            metrics,
-            {
-                **readiness,
-                "economically_viable": economically_viable,
-                "paper_forward_eligible": paper_forward_eligible,
-            },
-            concentration=concentration,
-            walk_forward=walk_forward,
-        )
+        focused_gate: dict[str, Any] = {}
+        focused_diagnostics: dict[str, Any] = {}
+        if volatility_focus:
+            focused_gate = volatility_focus_research_gate(
+                metrics,
+                settings,
+                config,
+                cost_summary=cost_summary,
+                source_report=source_report,
+                synthetic_data_used=synthetic_data_used,
+                research_result_valid=source_valid,
+                baseline_comparison=baseline_comparison,
+                walk_forward=walk_forward,
+                concentration=concentration,
+                active_model_valid=active_model_valid,
+                min_focused_trades=min_focused_trades,
+            )
+            economically_viable = bool(focused_gate["economically_viable"])
+            research_promising = bool(focused_gate["research_promising"])
+            paper_forward_eligible = bool(focused_gate["paper_forward_eligible"])
+            rejection_reasons = list(focused_gate["paper_forward_rejection_reasons"])
+            focused_diagnostics = volatility_focus_trade_diagnostics(
+                trades,
+                signal_frame,
+                metrics,
+                config,
+                walk_forward=walk_forward,
+                cost_summary=cost_summary,
+            )
+            rank_details = volatility_focus_rank_details(
+                metrics,
+                focused_gate,
+                concentration=concentration,
+                walk_forward=walk_forward,
+                cost_summary=cost_summary,
+                baseline_comparison=baseline_comparison,
+                target_focused_trades=target_focused_trades,
+            )
+        else:
+            rank_details = research_rank_details(
+                metrics,
+                {
+                    **readiness,
+                    "economically_viable": economically_viable,
+                    "paper_forward_eligible": paper_forward_eligible,
+                },
+                concentration=concentration,
+                walk_forward=walk_forward,
+            )
         rows.append(
             {
                 "parameter_set_id": config.parameter_set_id,
@@ -834,6 +1025,15 @@ def evaluate_research_configs(
                 "min_recent_return_pct": config.min_recent_return_pct,
                 "min_trend_strength": config.min_trend_strength,
                 "max_atr_expansion": config.max_atr_expansion,
+                "require_ema_trend_filter": config.require_ema_trend_filter,
+                "require_positive_ema20_slope": config.require_positive_ema20_slope,
+                "require_close_above_ema200": config.require_close_above_ema200,
+                "max_breakout_candle_atr_multiple": config.max_breakout_candle_atr_multiple,
+                "min_close_position_in_candle": config.min_close_position_in_candle,
+                "max_recent_runup_pct": config.max_recent_runup_pct,
+                "min_consolidation_compression": config.min_consolidation_compression,
+                "require_volume_expansion": config.require_volume_expansion,
+                "max_atr_percentile": config.max_atr_percentile,
                 "number_of_trades": int(metrics.get("number_of_trades", 0) or 0),
                 "gross_return_pct": _metric_float(metrics.get("gross_return_pct")),
                 "net_return_pct": _metric_float(metrics.get("net_return_pct")),
@@ -879,9 +1079,23 @@ def evaluate_research_configs(
                 "research_promising": research_promising,
                 "paper_forward_eligible": paper_forward_eligible,
                 "rejection_reasons": ";".join(dict.fromkeys(rejection_reasons)),
+                "research_rejection_reasons": ";".join(
+                    dict.fromkeys(focused_gate.get("research_rejection_reasons", []))
+                ) if volatility_focus else ";".join(
+                    reason for reason in dict.fromkeys(rejection_reasons) if reason != "active_model_invalid"
+                ),
+                "paper_forward_rejection_reasons": ";".join(
+                    dict.fromkeys(focused_gate.get("paper_forward_rejection_reasons", rejection_reasons))
+                ),
+                "training_rejection_reasons": ";".join(
+                    dict.fromkeys(focused_gate.get("training_rejection_reasons", []))
+                ),
+                "training_eligible": bool(focused_gate.get("training_eligible", False)),
+                "volatility_focus": volatility_focus,
                 "rank_score": rank_details["raw_rank_score"],
                 **baseline_comparison,
                 **cost_summary,
+                **focused_diagnostics,
                 **filtered_hold,
             }
         )
@@ -913,6 +1127,8 @@ def generate_research_configs(
         )
     if strategy == HTF_RISK_OFF_HOLD_FILTER_STRATEGY:
         return generate_htf_risk_off_hold_filter_configs(max_configs=max_v3_configs, timeframes=requested_timeframes)
+    if strategy == VOLATILITY_FOCUS_STRATEGY:
+        return generate_volatility_focus_configs(max_configs=max_v3_configs, timeframes=requested_timeframes)
     legacy = (
         generate_trend_pullback_configs(timeframes=requested_timeframes)
         + generate_buy_the_dip_configs(max_configs=max_buy_dip_configs, timeframes=requested_timeframes)
@@ -1366,6 +1582,254 @@ def generate_htf_volatility_expansion_breakout_configs(
     return [raw_configs[index] for index in _evenly_spaced_indexes(len(raw_configs), max_configs)]
 
 
+def generate_volatility_focus_configs(
+    *,
+    max_configs: int = DEFAULT_MAX_V3_CONFIGS,
+    timeframes: tuple[str, ...] | list[str] | None = None,
+) -> list[ResearchConfig]:
+    requested_timeframes = tuple(
+        timeframe
+        for timeframe in (timeframes or VOLATILITY_FOCUS_DEFAULT_TIMEFRAMES)
+        if timeframe in VOLATILITY_FOCUS_SUPPORTED_TIMEFRAMES
+    )
+    raw_specs: list[dict[str, Any]] = []
+
+    def add_spec(spec: dict[str, Any]) -> None:
+        key = tuple((name, _normalise_spec_value(spec.get(name))) for name in sorted(spec))
+        if key in seen_specs:
+            return
+        seen_specs.add(key)
+        raw_specs.append(spec)
+
+    seen_specs: set[tuple[tuple[str, Any], ...]] = set()
+    for timeframe in requested_timeframes:
+        add_spec(
+            {
+                "strategy_name": HTF_VOLATILITY_EXPANSION_BREAKOUT_STRATEGY,
+                "timeframe": timeframe,
+                "take_profit_pct": 0.04,
+                "stop_loss_pct": 0.02,
+                "max_hold_bars": 96,
+                "breakout_lookback": 24,
+                "consolidation_lookback": 16,
+                "min_body_vs_avg": 1.0,
+                "min_recent_return_pct": 0.004,
+                "min_trend_strength": 0.05,
+                "min_volume_zscore": 0.5,
+                "max_atr_expansion": 2.4,
+            }
+        )
+        add_spec(
+            {
+                "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+                "timeframe": timeframe,
+                "take_profit_pct": 0.04,
+                "stop_loss_pct": 0.02,
+                "max_hold_bars": 48,
+                "breakout_lookback": 20,
+                "consolidation_lookback": 12,
+                "min_body_vs_avg": 1.0,
+                "min_recent_return_pct": 0.002,
+                "min_trend_strength": 0.0,
+                "min_volume_zscore": 0.5,
+                "max_atr_expansion": 2.6,
+            }
+        )
+
+    signal_profiles = volatility_focus_signal_profiles()
+    quality_profiles = volatility_focus_quality_filter_profiles()
+    for (
+        strategy_name,
+        timeframe,
+        take_profit_pct,
+        stop_loss_pct,
+        max_hold_bars,
+        signal_profile,
+        quality_profile,
+    ) in product(
+        VOLATILITY_FOCUS_STRATEGIES,
+        requested_timeframes,
+        VOLATILITY_FOCUS_TAKE_PROFIT_VALUES,
+        VOLATILITY_FOCUS_STOP_LOSS_VALUES,
+        VOLATILITY_FOCUS_MAX_HOLD_BARS_VALUES,
+        signal_profiles,
+        quality_profiles,
+    ):
+        add_spec(
+            {
+                "strategy_name": strategy_name,
+                "timeframe": timeframe,
+                "take_profit_pct": float(take_profit_pct),
+                "stop_loss_pct": float(stop_loss_pct),
+                "max_hold_bars": int(max_hold_bars),
+                **signal_profile,
+                **quality_profile,
+            }
+        )
+
+    if len(raw_specs) > max_configs:
+        anchors = raw_specs[: 2 * max(1, len(requested_timeframes))]
+        remaining = raw_specs[len(anchors) :]
+        desired_remaining = max(0, int(max_configs) - len(anchors))
+        sampled_remaining = (
+            [remaining[index] for index in _evenly_spaced_indexes(len(remaining), desired_remaining)]
+            if desired_remaining and remaining
+            else []
+        )
+        raw_specs = anchors[: int(max_configs)] + sampled_remaining
+
+    configs: list[ResearchConfig] = []
+    for index, spec in enumerate(raw_specs[: int(max_configs)]):
+        strategy_name = str(spec["strategy_name"])
+        prefix = "vff_vbo" if strategy_name == VOLATILITY_BREAKOUT_STRATEGY else "vff_htfb"
+        configs.append(
+            ResearchConfig(
+                parameter_set_id=f"{prefix}_{index:05d}",
+                strategy_name=strategy_name,
+                timeframe=str(spec["timeframe"]),
+                take_profit_pct=float(spec["take_profit_pct"]),
+                stop_loss_pct=float(spec["stop_loss_pct"]),
+                max_hold_bars=int(spec["max_hold_bars"]),
+                breakout_lookback=int(spec["breakout_lookback"]),
+                consolidation_lookback=int(spec["consolidation_lookback"]),
+                min_volume_zscore=float(spec["min_volume_zscore"]),
+                min_body_vs_avg=float(spec["min_body_vs_avg"]),
+                min_recent_return_pct=float(spec["min_recent_return_pct"]),
+                min_trend_strength=float(spec["min_trend_strength"]),
+                max_atr_expansion=float(spec["max_atr_expansion"]),
+                require_ema_trend_filter=bool(spec.get("require_ema_trend_filter", False)),
+                require_positive_ema20_slope=bool(spec.get("require_positive_ema20_slope", False)),
+                require_close_above_ema200=bool(spec.get("require_close_above_ema200", False)),
+                max_breakout_candle_atr_multiple=(
+                    None
+                    if spec.get("max_breakout_candle_atr_multiple") is None
+                    else float(spec["max_breakout_candle_atr_multiple"])
+                ),
+                min_close_position_in_candle=(
+                    None
+                    if spec.get("min_close_position_in_candle") is None
+                    else float(spec["min_close_position_in_candle"])
+                ),
+                max_recent_runup_pct=(
+                    None if spec.get("max_recent_runup_pct") is None else float(spec["max_recent_runup_pct"])
+                ),
+                min_consolidation_compression=(
+                    None
+                    if spec.get("min_consolidation_compression") is None
+                    else float(spec["min_consolidation_compression"])
+                ),
+                require_volume_expansion=bool(spec.get("require_volume_expansion", False)),
+                max_atr_percentile=(
+                    None if spec.get("max_atr_percentile") is None else float(spec["max_atr_percentile"])
+                ),
+            )
+        )
+    return configs
+
+
+def volatility_focus_signal_profiles() -> tuple[dict[str, Any], ...]:
+    profiles = [
+        (20, 12, 1.0, 0.002, 0.00, 0.50, 2.6),
+        (24, 16, 1.0, 0.004, 0.05, 0.50, 2.4),
+        (12, 8, 0.8, 0.001, 0.00, -0.25, 3.5),
+        (16, 8, 0.8, 0.002, 0.02, 0.00, 3.0),
+        (16, 12, 1.0, 0.003, 0.02, 0.25, 2.6),
+        (20, 16, 1.2, 0.004, 0.05, 0.50, 2.2),
+        (24, 20, 1.2, 0.006, 0.08, 0.75, 2.2),
+        (36, 20, 1.5, 0.006, 0.08, 0.75, 1.8),
+        (36, 24, 1.2, 0.008, 0.10, 1.00, 2.6),
+        (48, 24, 1.5, 0.008, 0.10, 1.00, 3.0),
+        (48, 16, 1.0, 0.003, 0.05, 0.25, 3.5),
+        (12, 24, 0.8, 0.001, 0.00, -0.25, 1.8),
+    ]
+    return tuple(
+        {
+            "breakout_lookback": int(breakout_lookback),
+            "consolidation_lookback": int(consolidation_lookback),
+            "min_body_vs_avg": float(min_body_vs_avg),
+            "min_recent_return_pct": float(min_recent_return_pct),
+            "min_trend_strength": float(min_trend_strength),
+            "min_volume_zscore": float(min_volume_zscore),
+            "max_atr_expansion": float(max_atr_expansion),
+        }
+        for (
+            breakout_lookback,
+            consolidation_lookback,
+            min_body_vs_avg,
+            min_recent_return_pct,
+            min_trend_strength,
+            min_volume_zscore,
+            max_atr_expansion,
+        ) in profiles
+    )
+
+
+def volatility_focus_quality_filter_profiles() -> tuple[dict[str, Any], ...]:
+    return (
+        {
+            "require_ema_trend_filter": False,
+            "require_positive_ema20_slope": False,
+            "require_close_above_ema200": False,
+            "max_breakout_candle_atr_multiple": None,
+            "min_close_position_in_candle": None,
+            "max_recent_runup_pct": None,
+            "min_consolidation_compression": None,
+            "require_volume_expansion": False,
+            "max_atr_percentile": None,
+        },
+        {
+            "require_ema_trend_filter": False,
+            "require_positive_ema20_slope": False,
+            "require_close_above_ema200": True,
+            "max_breakout_candle_atr_multiple": 3.0,
+            "min_close_position_in_candle": 0.50,
+            "max_recent_runup_pct": 0.10,
+            "min_consolidation_compression": 0.80,
+            "require_volume_expansion": False,
+            "max_atr_percentile": 0.97,
+        },
+        {
+            "require_ema_trend_filter": True,
+            "require_positive_ema20_slope": True,
+            "require_close_above_ema200": True,
+            "max_breakout_candle_atr_multiple": 2.5,
+            "min_close_position_in_candle": 0.60,
+            "max_recent_runup_pct": 0.08,
+            "min_consolidation_compression": 1.00,
+            "require_volume_expansion": True,
+            "max_atr_percentile": 0.95,
+        },
+        {
+            "require_ema_trend_filter": True,
+            "require_positive_ema20_slope": True,
+            "require_close_above_ema200": True,
+            "max_breakout_candle_atr_multiple": 2.2,
+            "min_close_position_in_candle": 0.65,
+            "max_recent_runup_pct": 0.06,
+            "min_consolidation_compression": 1.10,
+            "require_volume_expansion": True,
+            "max_atr_percentile": 0.92,
+        },
+        {
+            "require_ema_trend_filter": True,
+            "require_positive_ema20_slope": True,
+            "require_close_above_ema200": True,
+            "max_breakout_candle_atr_multiple": 1.8,
+            "min_close_position_in_candle": 0.70,
+            "max_recent_runup_pct": 0.04,
+            "min_consolidation_compression": 1.20,
+            "require_volume_expansion": True,
+            "max_atr_percentile": 0.90,
+        },
+    )
+
+
+def _normalise_spec_value(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, 10)
+    return value
+
+
 def generate_htf_risk_off_hold_filter_configs(
     *,
     max_configs: int = DEFAULT_MAX_V3_CONFIGS,
@@ -1523,6 +1987,10 @@ def prepare_v3_features(bars: pd.DataFrame) -> pd.DataFrame:
     upper_body = pd.concat([features["open"], features["close"]], axis=1).max(axis=1)
     body_pct = (features["close"] - features["open"]).abs() / features["close"].replace(0, np.nan)
     body_mean_20 = body_pct.rolling(20).mean()
+    atr_percentile_200 = features["atr_14"].rolling(200, min_periods=20).apply(
+        lambda values: float(np.mean(values <= values[-1])) if len(values) else np.nan,
+        raw=True,
+    )
     rolling_high_20 = close.rolling(20).max()
     rolling_high_50 = close.rolling(50).max()
     rolling_high_200 = close.rolling(200).max()
@@ -1553,19 +2021,30 @@ def prepare_v3_features(bars: pd.DataFrame) -> pd.DataFrame:
     features["recovers_prior_high"] = features["close"] > features["prev_high"]
     features["body_pct"] = body_pct
     features["body_vs_avg_20"] = body_pct / body_mean_20.replace(0, np.nan)
+    features["breakout_candle_atr_multiple"] = features["high_low_range_pct"] / features["atr_14"].replace(0, np.nan)
+    features["recent_runup_pct_5"] = close / close.rolling(5).min().replace(0, np.nan) - 1
+    features["atr_percentile_200"] = atr_percentile_200
+    features["prior_rolling_high_12"] = close.rolling(12).max().shift(1)
+    features["prior_rolling_high_16"] = close.rolling(16).max().shift(1)
     features["prior_rolling_high_20"] = rolling_high_20.shift(1)
     features["prior_rolling_high_24"] = close.rolling(24).max().shift(1)
     features["prior_rolling_high_32"] = close.rolling(32).max().shift(1)
+    features["prior_rolling_high_36"] = close.rolling(36).max().shift(1)
     features["prior_rolling_high_48"] = close.rolling(48).max().shift(1)
     features["prior_rolling_high_64"] = close.rolling(64).max().shift(1)
     features["prior_rolling_high_96"] = close.rolling(96).max().shift(1)
     features["rolling_low_20"] = rolling_low_20
+    features["range_width_8"] = (close.rolling(8).max() - close.rolling(8).min()) / close.replace(0, np.nan)
     features["range_width_12"] = (close.rolling(12).max() - close.rolling(12).min()) / close.replace(0, np.nan)
     features["range_width_16"] = (close.rolling(16).max() - close.rolling(16).min()) / close.replace(0, np.nan)
     features["range_width_20"] = (close.rolling(20).max() - close.rolling(20).min()) / close.replace(0, np.nan)
     features["range_width_24"] = (close.rolling(24).max() - close.rolling(24).min()) / close.replace(0, np.nan)
     features["range_width_32"] = (close.rolling(32).max() - close.rolling(32).min()) / close.replace(0, np.nan)
     features["range_width_48"] = (close.rolling(48).max() - close.rolling(48).min()) / close.replace(0, np.nan)
+    for lookback in (8, 12, 16, 20, 24):
+        features[f"range_compression_{lookback}"] = features["range_width_48"] / features[
+            f"range_width_{lookback}"
+        ].replace(0, np.nan)
     features["atr_expansion_20"] = features["atr_14"] / atr_mean_20.replace(0, np.nan)
     features["atr_downside_explosion"] = (features["log_return_3"] < -0.025) & (features["atr_expansion_20"] > 2.0)
     features["extreme_crash_candle"] = (
@@ -1736,6 +2215,9 @@ def build_volatility_breakout_research_trades(
         range_column,
         "extreme_crash_candle",
     ]
+    required = list(dict.fromkeys(required + volatility_breakout_quality_required_columns(config)))
+    if any(column not in features for column in required):
+        return pd.DataFrame(), pd.DataFrame()
     data = features.dropna(subset=required).reset_index(drop=True)
     if data.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -1755,6 +2237,7 @@ def build_volatility_breakout_research_trades(
     trend_strength = data["trend_strength_20"].abs() >= float(config.min_trend_strength or 0.0)
     not_choppy = data[range_column] <= max(0.12, float(config.take_profit_pct) * 5)
     mask = breakout & momentum & volume_volatility & trend_strength & not_choppy & ~data["extreme_crash_candle"].astype(bool)
+    mask = apply_volatility_breakout_quality_filters(data, mask, config)
     return _build_research_trades_from_mask(
         data,
         mask,
@@ -1864,6 +2347,9 @@ def build_htf_volatility_expansion_breakout_research_trades(
         high_column,
         range_column,
     ]
+    required = list(dict.fromkeys(required + volatility_breakout_quality_required_columns(config)))
+    if any(column not in features for column in required):
+        return pd.DataFrame(), pd.DataFrame()
     data = features.dropna(subset=required).reset_index(drop=True)
     if data.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -1885,6 +2371,7 @@ def build_htf_volatility_expansion_breakout_research_trades(
     compression = data[range_column] <= max(0.10, float(config.take_profit_pct) * 4)
     trend_strength = data["trend_strength_20"].abs() >= float(config.min_trend_strength or 0.05)
     mask = breakout & trend_support & expansion & compression & trend_strength & ~data["extreme_crash_candle"].astype(bool)
+    mask = apply_volatility_breakout_quality_filters(data, mask, config)
     return _build_research_trades_from_mask(
         data,
         mask,
@@ -1893,6 +2380,64 @@ def build_htf_volatility_expansion_breakout_research_trades(
         entry_reason="htf_volatility_expansion_breakout",
         regime="higher_timeframe_volatility_expansion",
     )
+
+
+def volatility_breakout_quality_required_columns(config: ResearchConfig) -> list[str]:
+    required: list[str] = []
+    if config.require_ema_trend_filter:
+        required.extend(["ema_20", "ema_50", "ema_50_above_200"])
+    if config.require_positive_ema20_slope:
+        required.append("ema_20_slope_5")
+    if config.require_close_above_ema200:
+        required.append("close_above_ema_200")
+    if config.max_breakout_candle_atr_multiple is not None:
+        required.append("breakout_candle_atr_multiple")
+    if config.min_close_position_in_candle is not None:
+        required.append("close_position_in_candle")
+    if config.max_recent_runup_pct is not None:
+        required.extend(["recent_runup_pct_5", "log_return_1"])
+    if config.min_consolidation_compression is not None:
+        required.append(f"range_compression_{int(config.consolidation_lookback or 20)}")
+    if config.require_volume_expansion:
+        required.extend(["normalized_volume", "volume_zscore_20"])
+    if config.max_atr_percentile is not None:
+        required.append("atr_percentile_200")
+    return list(dict.fromkeys(required))
+
+
+def apply_volatility_breakout_quality_filters(
+    data: pd.DataFrame,
+    mask: pd.Series,
+    config: ResearchConfig,
+) -> pd.Series:
+    filtered = mask.copy()
+    if config.require_ema_trend_filter:
+        filtered &= (
+            data["ema_50_above_200"].astype(bool)
+            & (data["ema_20"] > data["ema_50"])
+        )
+    if config.require_positive_ema20_slope:
+        filtered &= data["ema_20_slope_5"] > 0
+    if config.require_close_above_ema200:
+        filtered &= data["close_above_ema_200"].astype(bool)
+    if config.max_breakout_candle_atr_multiple is not None:
+        filtered &= data["breakout_candle_atr_multiple"] <= float(config.max_breakout_candle_atr_multiple)
+    if config.min_close_position_in_candle is not None:
+        filtered &= data["close_position_in_candle"] >= float(config.min_close_position_in_candle)
+    if config.max_recent_runup_pct is not None:
+        max_runup = float(config.max_recent_runup_pct)
+        filtered &= (data["recent_runup_pct_5"] <= max_runup) & (data["log_return_1"] <= max_runup)
+    if config.min_consolidation_compression is not None:
+        compression_column = f"range_compression_{int(config.consolidation_lookback or 20)}"
+        filtered &= data[compression_column] >= float(config.min_consolidation_compression)
+    if config.require_volume_expansion:
+        filtered &= (
+            (data["normalized_volume"] >= 1.0)
+            & (data["volume_zscore_20"] >= float(config.min_volume_zscore or 0.0))
+        )
+    if config.max_atr_percentile is not None:
+        filtered &= data["atr_percentile_200"] <= float(config.max_atr_percentile)
+    return filtered
 
 
 def _build_research_trades_from_mask(
@@ -2558,6 +3103,182 @@ def paper_forward_readiness_gate(
     }
 
 
+def volatility_focus_research_gate(
+    metrics: dict[str, Any],
+    settings: Settings,
+    config: ResearchConfig,
+    *,
+    cost_summary: dict[str, Any],
+    source_report: ResearchDataReport | None,
+    synthetic_data_used: bool,
+    research_result_valid: bool,
+    baseline_comparison: dict[str, Any],
+    walk_forward: dict[str, Any],
+    concentration: float,
+    active_model_valid: bool,
+    min_focused_trades: int,
+) -> dict[str, Any]:
+    research_reasons: list[str] = []
+    if not research_result_valid:
+        research_reasons.append("research_data_source_invalid")
+    if synthetic_data_used:
+        research_reasons.append("synthetic_data_used")
+    if source_report is None or source_report.source_used != "collected_market_data":
+        research_reasons.append("data_source_not_collected_market_data")
+    if config.timeframe not in {"1H", "4H"}:
+        research_reasons.append("timeframe_not_1h_or_valid_4h")
+    if config.timeframe == "4H" and source_report is not None and not source_report.research_result_valid:
+        research_reasons.append("valid_4h_rows_missing")
+
+    trade_count = int(metrics.get("number_of_trades", 0) or 0)
+    if trade_count < int(min_focused_trades):
+        research_reasons.append(f"number_of_trades_below_{int(min_focused_trades)}")
+    if int(walk_forward.get("folds_with_min_trades_count", 0) or 0) < 3:
+        research_reasons.append("folds_with_min_trades_below_3")
+    if not bool(walk_forward.get("walk_forward_passed")):
+        research_reasons.append("walk_forward_not_passed")
+
+    current_taker_net = _metric_float((cost_summary.get("net_return_by_cost_scenario") or {}).get("current_taker"))
+    current_taker_pf = _profit_factor_value(
+        (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("current_taker")
+    )
+    if current_taker_net <= 0:
+        research_reasons.append("current_taker_net_return_not_positive")
+    if current_taker_pf < MIN_RESEARCH_PROFIT_FACTOR_NET:
+        research_reasons.append("current_taker_profit_factor_below_1_05")
+    if _metric_float(metrics.get("max_drawdown_pct")) > float(settings.max_backtest_drawdown_pct):
+        research_reasons.append("max_drawdown_above_configured_limit")
+    if not bool(baseline_comparison.get("beats_buy_hold_risk_adjusted")):
+        research_reasons.append("does_not_beat_buy_and_hold_risk_adjusted")
+    if not bool(baseline_comparison.get("beats_dca_daily_risk_adjusted")):
+        research_reasons.append("does_not_beat_dca_risk_adjusted")
+    if _metric_float(concentration) > MAX_SINGLE_TRADE_RETURN_SHARE:
+        research_reasons.append("single_trade_return_concentration_too_high")
+
+    research_reasons = list(dict.fromkeys(research_reasons))
+    research_promising = not research_reasons
+    paper_reasons = list(research_reasons)
+    if not active_model_valid:
+        paper_reasons.append("active_model_invalid")
+    training_reasons = list(research_reasons)
+    if not active_model_valid:
+        training_reasons.append("active_model_invalid")
+    training_reasons.append("training_deferred_volatility_focus_no_ml_yet")
+    return {
+        "research_promising": research_promising,
+        "economically_viable": research_promising,
+        "paper_forward_eligible": research_promising and active_model_valid,
+        "training_eligible": False,
+        "research_rejection_reasons": research_reasons,
+        "paper_forward_rejection_reasons": list(dict.fromkeys(paper_reasons)),
+        "training_rejection_reasons": list(dict.fromkeys(training_reasons)),
+    }
+
+
+def volatility_focus_trade_diagnostics(
+    trades: pd.DataFrame,
+    signal_frame: pd.DataFrame,
+    metrics: dict[str, Any],
+    config: ResearchConfig,
+    *,
+    walk_forward: dict[str, Any],
+    cost_summary: dict[str, Any],
+) -> dict[str, Any]:
+    if trades.empty:
+        mfe = np.asarray([], dtype=float)
+        mae = np.asarray([], dtype=float)
+        bars_held = np.asarray([], dtype=float)
+        exit_reasons: list[str] = []
+    else:
+        mfe = np.asarray(
+            [_metric_float(value) for value in trades.get("max_favorable_excursion_pct", pd.Series(dtype=float))],
+            dtype=float,
+        )
+        mae = np.asarray(
+            [_metric_float(value) for value in trades.get("max_adverse_excursion_pct", pd.Series(dtype=float))],
+            dtype=float,
+        )
+        bars_held = np.asarray(
+            [_metric_float(value) for value in trades.get("buy_hold_bars", pd.Series(dtype=float))],
+            dtype=float,
+        )
+        exit_reasons = [str(value) for value in trades.get("buy_exit_reason", pd.Series(dtype=object)).tolist()]
+    trade_count = int(metrics.get("number_of_trades", 0) or 0)
+    stop_risk = max(1e-12, float(config.stop_loss_pct))
+    quick_stop_bars = max(1.0, min(3.0, float(config.max_hold_bars) * 0.25))
+    stopped = np.asarray(
+        [reason in {"research_stop_loss", "ambiguous_stop_first"} for reason in exit_reasons],
+        dtype=bool,
+    )
+    timed_out = np.asarray([reason == "research_max_hold" for reason in exit_reasons], dtype=bool)
+    took_profit = np.asarray([reason == "research_take_profit" for reason in exit_reasons], dtype=bool)
+    stopped_quickly = stopped & (bars_held <= quick_stop_bars) if len(bars_held) else np.asarray([], dtype=bool)
+    return {
+        "total_entries": int(len(signal_frame)),
+        "total_exits": int(len(trades)),
+        "trade_count": trade_count,
+        "average_mfe": float(mfe.mean()) if len(mfe) else 0.0,
+        "average_mae": float(mae.mean()) if len(mae) else 0.0,
+        "median_mfe": float(np.median(mfe)) if len(mfe) else 0.0,
+        "median_mae": float(np.median(mae)) if len(mae) else 0.0,
+        "pct_trades_reaching_1r_before_stop": float((mfe >= stop_risk).mean()) if len(mfe) else 0.0,
+        "pct_trades_reaching_2r_before_stop": float((mfe >= stop_risk * 2).mean()) if len(mfe) else 0.0,
+        "pct_trades_stopped_quickly": float(stopped_quickly.mean()) if len(stopped_quickly) else 0.0,
+        "pct_trades_timing_out": float(timed_out.mean()) if len(timed_out) else 0.0,
+        "pct_trades_exiting_by_take_profit": float(took_profit.mean()) if len(took_profit) else 0.0,
+        "pct_trades_exiting_by_stop_loss": float(stopped.mean()) if len(stopped) else 0.0,
+        "average_bars_held": float(bars_held.mean()) if len(bars_held) else 0.0,
+        "median_bars_held": float(np.median(bars_held)) if len(bars_held) else 0.0,
+        "fold_by_fold_returns": walk_forward.get("per_fold_net_return_pct", []),
+        "fold_by_fold_trade_counts": walk_forward.get("per_fold_number_of_trades", []),
+        "fold_by_fold_profit_factor": walk_forward.get("per_fold_profit_factor_net", []),
+        "cost_sensitivity_classification": cost_summary.get("cost_sensitivity_classification"),
+    }
+
+
+def volatility_focus_rank_details(
+    metrics: dict[str, Any],
+    focused_gate: dict[str, Any],
+    *,
+    concentration: float,
+    walk_forward: dict[str, Any],
+    cost_summary: dict[str, Any],
+    baseline_comparison: dict[str, Any],
+    target_focused_trades: int,
+) -> dict[str, Any]:
+    readiness = {
+        "economically_viable": focused_gate.get("economically_viable"),
+        "paper_forward_eligible": focused_gate.get("paper_forward_eligible"),
+    }
+    base = research_rank_details(metrics, readiness, concentration=concentration, walk_forward=walk_forward)
+    current_net = _metric_float((cost_summary.get("net_return_by_cost_scenario") or {}).get("current_taker"))
+    current_pf = min(
+        5.0,
+        _profit_factor_value((cost_summary.get("profit_factor_by_cost_scenario") or {}).get("current_taker")),
+    )
+    trades = int(metrics.get("number_of_trades", 0) or 0)
+    target = max(1, int(target_focused_trades))
+    trade_score = max(0.0, min(1.0, trades / target))
+    baseline_edge = _metric_float(baseline_comparison.get("strategy_return_over_drawdown")) - _metric_float(
+        baseline_comparison.get("baseline_return_over_drawdown")
+    )
+    adjusted = _metric_float(base["adjusted_rank_score"])
+    adjusted += current_net * 250_000
+    adjusted += current_pf * 3_000
+    adjusted += trade_score * 30_000
+    adjusted += int(walk_forward.get("folds_with_min_trades_count", 0) or 0) * 5_000
+    adjusted += baseline_edge * 10_000
+    if not focused_gate.get("research_promising"):
+        adjusted -= 250_000
+    reasons = [base.get("reason_ranked_lower_if_any")]
+    reasons.extend(focused_gate.get("research_rejection_reasons", []))
+    base["adjusted_rank_score"] = adjusted
+    base["reason_ranked_lower_if_any"] = ";".join(
+        dict.fromkeys(reason for reason in reasons if reason)
+    ) or None
+    return base
+
+
 def build_research_summary(
     rows: list[dict[str, Any]],
     settings: Settings,
@@ -2841,6 +3562,294 @@ def build_strategy_reality_audit_summary(
         }
     )
     return _json_safe(updated)
+
+
+def build_volatility_focus_summary(
+    rows: list[dict[str, Any]],
+    settings: Settings,
+    *,
+    base_summary: dict[str, Any],
+    data_source_reports: dict[str, ResearchDataReport | dict[str, Any]],
+    bars_by_timeframe: dict[str, pd.DataFrame],
+    min_focused_trades: int,
+    target_focused_trades: int,
+    max_focused_configs: int,
+    focused_summary_path: Path,
+    top_configs_csv_path: Path,
+    rejections_path: Path,
+    trade_audit_paths: list[dict[str, Any]],
+) -> dict[str, Any]:
+    ranked = sorted(rows, key=_rank_sort_key, reverse=True)
+    source_reports = _summary_source_reports(data_source_reports=data_source_reports, data_sources=None)
+    synthetic_data_used = bool(base_summary.get("synthetic_data_used")) or any(
+        bool(row.get("synthetic_data_used")) for row in ranked
+    )
+    research_result_valid = bool(base_summary.get("research_result_valid")) and not synthetic_data_used
+    eligible_rows = [] if synthetic_data_used or not research_result_valid else ranked
+    current_profitable = [
+        row
+        for row in eligible_rows
+        if _metric_float((row.get("net_return_by_cost_scenario") or {}).get("current_taker")) > 0
+    ]
+    maker_profitable = [
+        row
+        for row in eligible_rows
+        if _metric_float((row.get("net_return_by_cost_scenario") or {}).get("maker_current")) > 0
+    ]
+    low_profitable = [
+        row
+        for row in eligible_rows
+        if _metric_float((row.get("net_return_by_cost_scenario") or {}).get("maker_low_slippage")) > 0
+    ]
+    zero_profitable = [
+        row
+        for row in eligible_rows
+        if _metric_float((row.get("net_return_by_cost_scenario") or {}).get("zero_cost_sanity")) > 0
+    ]
+    walk_forward_rows = [row for row in eligible_rows if row.get("walk_forward_passed")]
+    research_promising_rows = [row for row in eligible_rows if row.get("research_promising")]
+    economically_viable_rows = [row for row in eligible_rows if row.get("economically_viable")]
+    paper_forward_rows = [row for row in eligible_rows if row.get("paper_forward_eligible")]
+    diagnosis = volatility_focus_diagnosis(ranked, research_result_valid=research_result_valid)
+    recommendation = volatility_focus_recommendation(
+        ranked,
+        research_result_valid=research_result_valid,
+        synthetic_data_used=synthetic_data_used,
+        diagnosis=diagnosis,
+        max_focused_configs=max_focused_configs,
+    )
+    summary = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "symbol": settings.symbol,
+        "paper_trading_only": settings.paper_trading_only,
+        "trading_enabled": settings.trading_enabled,
+        "auto_trade_enabled": settings.auto_trade_enabled,
+        "fallback_trading_allowed": settings.allow_fallback_trading,
+        "btc_usd_only": settings.symbol == ALLOWED_SYMBOL,
+        "long_only": True,
+        "orders_placed": 0,
+        "synthetic_data_used": synthetic_data_used,
+        "research_result_valid": research_result_valid,
+        "data_ready": research_result_valid,
+        "timeframes_used": list(base_summary.get("timeframes") or bars_by_timeframe.keys()),
+        "source_used_by_timeframe": {
+            timeframe: report.source_used for timeframe, report in source_reports.items()
+        },
+        "row_count": {
+            timeframe: report.row_count for timeframe, report in source_reports.items()
+        },
+        "baselines": base_summary.get("baselines") or build_baselines_by_timeframe(bars_by_timeframe, settings),
+        "cost_scenarios_tested": list(COST_SCENARIOS),
+        "configs_tested": len(ranked),
+        "max_focused_configs": int(max_focused_configs),
+        "min_focused_trades": int(min_focused_trades),
+        "target_focused_trades": int(target_focused_trades),
+        "configs_with_20_plus_trades": sum(1 for row in ranked if int(row.get("number_of_trades", 0) or 0) >= 20),
+        "configs_with_50_plus_trades": sum(1 for row in ranked if int(row.get("number_of_trades", 0) or 0) >= 50),
+        "profitable_current_cost_configs": len(current_profitable),
+        "profitable_maker_cost_configs": len(maker_profitable),
+        "profitable_low_cost_configs": len(low_profitable),
+        "profitable_zero_cost_configs": len(zero_profitable),
+        "walk_forward_passed_count": len(walk_forward_rows),
+        "research_promising_count": len(research_promising_rows),
+        "economically_viable_count": len(economically_viable_rows),
+        "paper_forward_eligible_count": len(paper_forward_rows),
+        "best_current_cost_config": best_config_for_cost_scenario(eligible_rows, "current_taker"),
+        "best_low_cost_config": best_config_for_cost_scenario(eligible_rows, "maker_low_slippage"),
+        "best_zero_cost_config": best_config_for_cost_scenario(eligible_rows, "zero_cost_sanity"),
+        "best_walk_forward_config": best_ranked_config(walk_forward_rows),
+        "top_configs": ranked[:10],
+        "rejection_reason_counts": {
+            "research": rejection_reason_counts_for_field(ranked, "research_rejection_reasons"),
+            "paper_forward": rejection_reason_counts_for_field(ranked, "paper_forward_rejection_reasons"),
+            "training": rejection_reason_counts_for_field(ranked, "training_rejection_reasons"),
+            "combined": rejection_reason_counts(ranked),
+        },
+        "diagnosis": diagnosis,
+        "recommendation": recommendation,
+        "focused_summary_path": str(focused_summary_path),
+        "top_configs_csv_path": str(top_configs_csv_path),
+        "rejections_path": str(rejections_path),
+        "trade_audits": trade_audit_paths,
+        "notes": [
+            "Volatility focus is offline research only.",
+            "It does not enable trading, auto trading, fallback trading, shorting, leverage, or model promotion.",
+            "research_rejection_reasons intentionally excludes active_model_invalid.",
+        ],
+    }
+    return _json_safe(summary)
+
+
+def write_volatility_focus_outputs(
+    rows: list[dict[str, Any]],
+    focused_summary: dict[str, Any],
+    *,
+    summary_path: Path,
+    top_configs_csv_path: Path,
+    rejections_path: Path,
+) -> None:
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    top_configs_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    rejections_path.parent.mkdir(parents=True, exist_ok=True)
+    ranked = sorted(rows, key=_rank_sort_key, reverse=True)
+    top_rows = ranked[:50]
+    top_fields = [
+        "parameter_set_id",
+        "strategy_name",
+        "timeframe",
+        "take_profit_pct",
+        "stop_loss_pct",
+        "max_hold_bars",
+        "breakout_lookback",
+        "consolidation_lookback",
+        "min_body_vs_avg",
+        "min_recent_return_pct",
+        "min_trend_strength",
+        "min_volume_zscore",
+        "max_atr_expansion",
+        "number_of_trades",
+        "net_return_pct",
+        "profit_factor_net",
+        "max_drawdown_pct",
+        "win_rate_net",
+        "expectancy",
+        "average_mfe",
+        "average_mae",
+        "pct_trades_reaching_1r_before_stop",
+        "pct_trades_reaching_2r_before_stop",
+        "pct_trades_timing_out",
+        "pct_trades_exiting_by_take_profit",
+        "pct_trades_exiting_by_stop_loss",
+        "average_bars_held",
+        "walk_forward_passed",
+        "folds_with_min_trades_count",
+        "fold_by_fold_returns",
+        "fold_by_fold_trade_counts",
+        "cost_sensitivity_classification",
+        "research_promising",
+        "economically_viable",
+        "paper_forward_eligible",
+        "research_rejection_reasons",
+        "paper_forward_rejection_reasons",
+        "training_rejection_reasons",
+        "adjusted_rank_score",
+    ]
+    with top_configs_csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=top_fields)
+        writer.writeheader()
+        for row in top_rows:
+            writer.writerow({field: _csv_value(row.get(field)) for field in top_fields})
+    rejections = {
+        "generated_at": focused_summary.get("generated_at"),
+        "configs_tested": focused_summary.get("configs_tested"),
+        "rejection_reason_counts": focused_summary.get("rejection_reason_counts"),
+        "rejected_configs": [
+            {
+                "parameter_set_id": row.get("parameter_set_id"),
+                "strategy_name": row.get("strategy_name"),
+                "timeframe": row.get("timeframe"),
+                "number_of_trades": row.get("number_of_trades"),
+                "net_return_pct": row.get("net_return_pct"),
+                "research_rejection_reasons": row.get("research_rejection_reasons"),
+                "paper_forward_rejection_reasons": row.get("paper_forward_rejection_reasons"),
+                "training_rejection_reasons": row.get("training_rejection_reasons"),
+            }
+            for row in ranked
+            if row.get("research_rejection_reasons")
+            or row.get("paper_forward_rejection_reasons")
+            or row.get("training_rejection_reasons")
+        ][:250],
+    }
+    summary_path.write_text(json.dumps(_json_safe(focused_summary), indent=2, allow_nan=False), encoding="utf-8")
+    rejections_path.write_text(json.dumps(_json_safe(rejections), indent=2, allow_nan=False), encoding="utf-8")
+
+
+def rejection_reason_counts_for_field(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        raw = str(row.get(field) or "")
+        for reason in [part for part in raw.split(";") if part]:
+            counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def volatility_focus_diagnosis(rows: list[dict[str, Any]], *, research_result_valid: bool) -> dict[str, Any]:
+    if not research_result_valid:
+        return {
+            "primary_failure_mode": "more_data_needed",
+            "cost_drag_observed": False,
+            "entry_quality_problem": False,
+            "exit_logic_problem": False,
+            "one_fold_dominates": False,
+        }
+    rows_20 = [row for row in rows if int(row.get("number_of_trades", 0) or 0) >= 20]
+    zero_profitable = [
+        row for row in rows if _metric_float((row.get("net_return_by_cost_scenario") or {}).get("zero_cost_sanity")) > 0
+    ]
+    current_profitable = [
+        row for row in rows if _metric_float((row.get("net_return_by_cost_scenario") or {}).get("current_taker")) > 0
+    ]
+    avg_reach_1r = float(np.mean([_metric_float(row.get("pct_trades_reaching_1r_before_stop")) for row in rows_20])) if rows_20 else 0.0
+    avg_timeout = float(np.mean([_metric_float(row.get("pct_trades_timing_out")) for row in rows_20])) if rows_20 else 0.0
+    avg_stop = float(np.mean([_metric_float(row.get("pct_trades_exiting_by_stop_loss")) for row in rows_20])) if rows_20 else 0.0
+    one_fold_dominates = any(
+        max([_metric_float(value) for value in (row.get("fold_by_fold_returns") or [])], default=0.0)
+        > max(0.0, _metric_float(row.get("net_return_pct"))) * 0.80
+        for row in rows_20
+        if _metric_float(row.get("net_return_pct")) > 0
+    )
+    cost_drag = bool(zero_profitable and not current_profitable)
+    exit_problem = bool(rows_20 and avg_reach_1r >= 0.40 and avg_timeout >= 0.35)
+    entry_problem = bool(rows_20 and avg_reach_1r < 0.30 and avg_stop >= 0.35)
+    if not rows_20:
+        primary = "more_data_needed"
+    elif cost_drag:
+        primary = "cost_drag_only"
+    elif exit_problem:
+        primary = "exit_logic_problem"
+    elif entry_problem:
+        primary = "entry_quality_problem"
+    else:
+        primary = "refine_volatility_breakout_more"
+    return {
+        "primary_failure_mode": primary,
+        "cost_drag_observed": cost_drag,
+        "entry_quality_problem": entry_problem,
+        "exit_logic_problem": exit_problem,
+        "one_fold_dominates": one_fold_dominates,
+        "average_pct_reaching_1r_for_20_plus_trade_configs": avg_reach_1r,
+        "average_timeout_pct_for_20_plus_trade_configs": avg_timeout,
+        "average_stop_loss_exit_pct_for_20_plus_trade_configs": avg_stop,
+    }
+
+
+def volatility_focus_recommendation(
+    rows: list[dict[str, Any]],
+    *,
+    research_result_valid: bool,
+    synthetic_data_used: bool,
+    diagnosis: dict[str, Any],
+    max_focused_configs: int,
+) -> str:
+    if synthetic_data_used or not research_result_valid:
+        return "more_data_needed"
+    if any(row.get("research_promising") for row in rows):
+        return "candidate_found_keep_trading_disabled"
+    rows_20 = [row for row in rows if int(row.get("number_of_trades", 0) or 0) >= 20]
+    if not rows_20:
+        return "more_data_needed"
+    primary = str(diagnosis.get("primary_failure_mode") or "")
+    if primary in VOLATILITY_FOCUS_RECOMMENDATIONS:
+        return primary
+    zero_profitable = any(
+        _metric_float((row.get("net_return_by_cost_scenario") or {}).get("zero_cost_sanity")) > 0
+        for row in rows
+    )
+    if not zero_profitable and len(rows) >= int(max_focused_configs):
+        return "retire_volatility_breakout"
+    if not zero_profitable:
+        return "no_edge_found"
+    return "refine_volatility_breakout_more"
 
 
 def reality_audit_recommendation(summary: dict[str, Any], rows: list[dict[str, Any]]) -> str:
@@ -3178,6 +4187,7 @@ def export_trade_audit_logs(
     output_dir: Path,
     top_n: int,
     include_rejected: bool,
+    filename_prefix: str = "",
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     ranked = sorted(rows, key=_rank_sort_key, reverse=True)
@@ -3209,7 +4219,7 @@ def export_trade_audit_logs(
         if not bars.empty
     }
     audit_outputs: list[dict[str, Any]] = []
-    for row in selected_rows:
+    for selected_index, row in enumerate(selected_rows, start=1):
         config = configs.get(str(row.get("parameter_set_id")))
         if config is None:
             continue
@@ -3238,7 +4248,9 @@ def export_trade_audit_logs(
             folds=folds,
         )
         diagnostics = aggregate_trade_diagnostics(audit_rows)
-        stem = _safe_filename(f"{config.timeframe}_{config.strategy_name}_{config.parameter_set_id}")
+        stem = _safe_filename(
+            f"{filename_prefix}{selected_index:02d}_{config.timeframe}_{config.strategy_name}_{config.parameter_set_id}"
+        )
         csv_path = output_dir / f"{stem}.csv"
         jsonl_path = output_dir / f"{stem}.jsonl"
         write_trade_audit_files(audit_rows, csv_path=csv_path, jsonl_path=jsonl_path)
@@ -3422,6 +4434,9 @@ def signal_features_at_entry(row: pd.Series) -> dict[str, Any]:
                 "confirmation",
                 "breakout",
                 "consolidation",
+                "recent",
+                "close_position",
+                "require_",
                 "research",
                 "quant",
                 "strategy_",
@@ -3639,6 +4654,7 @@ async def _fetch_or_derive_research_bars(
     now: datetime | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
+    allow_15min_derivation: bool = True,
 ) -> ResearchBarsResult:
     result = await _fetch_research_bars(
         client,
@@ -3668,7 +4684,12 @@ async def _fetch_or_derive_research_bars(
     source_bars = pd.DataFrame()
     source_report: ResearchDataReport | None = None
     source_timeframe: str | None = None
-    for candidate_source in derivation_sources[timeframe]:
+    candidate_sources = tuple(
+        source for source in derivation_sources[timeframe] if allow_15min_derivation or source != "15Min"
+    )
+    if not candidate_sources:
+        return result
+    for candidate_source in candidate_sources:
         ratio = _source_bars_per_target_bar(candidate_source, timeframe)
         candidate_limit = max(int(row_limits.get(candidate_source, limit * ratio)), limit * ratio)
         if candidate_source in existing_bars_by_timeframe and candidate_source in existing_reports_by_timeframe:
@@ -3688,6 +4709,7 @@ async def _fetch_or_derive_research_bars(
                 now=now,
                 start=start,
                 end=end,
+                allow_15min_derivation=allow_15min_derivation,
             )
             candidate_bars = candidate_result.bars
             candidate_report = candidate_result.report
@@ -4311,12 +5333,22 @@ def _v3_signal_row(
         "atr_expansion_20": float(row.get("atr_expansion_20", 0.0)),
         "pullback_from_high_50": float(row.get("pullback_from_high_50", 0.0)),
         "body_vs_avg_20": float(row.get("body_vs_avg_20", 0.0)),
+        "close_position_in_candle": float(row.get("close_position_in_candle", 0.0)),
+        "breakout_candle_atr_multiple": float(row.get("breakout_candle_atr_multiple", 0.0)),
+        "recent_runup_pct_5": float(row.get("recent_runup_pct_5", 0.0)),
+        "atr_percentile_200": float(row.get("atr_percentile_200", 0.0)),
         "ema_20_slope_5": float(row.get("ema_20_slope_5", 0.0)),
         "ema_50_slope_5": float(row.get("ema_50_slope_5", 0.0)),
+        "close_above_ema_200": bool(row.get("close_above_ema_200", False)),
+        "ema_50_above_200": bool(row.get("ema_50_above_200", False)),
         "support": config.support,
         "confirmation": config.confirmation,
         "breakout_lookback": config.breakout_lookback,
         "consolidation_lookback": config.consolidation_lookback,
+        "require_ema_trend_filter": bool(config.require_ema_trend_filter),
+        "require_positive_ema20_slope": bool(config.require_positive_ema20_slope),
+        "require_close_above_ema200": bool(config.require_close_above_ema200),
+        "require_volume_expansion": bool(config.require_volume_expansion),
     }
 
 
