@@ -972,9 +972,9 @@ python scripts/research_higher_timeframe.py \
   --json
 ```
 
-It tests BTC/USD higher-timeframe candidates with conservative fee/slippage/spread-aware backtesting. V3 supports `uptrend_pullback` and `volatility_breakout` on `15Min` and `1H`; if raw `1H` bars are unavailable, complete hourly bars are derived chronologically from real `15Min` `collected_market_data`. Research output is written to `logs/higher_timeframe_research.csv` and `logs/higher_timeframe_research_summary.json`. No config is auto-applied, no model is auto-promoted, and trading remains disabled.
+It tests BTC/USD higher-timeframe candidates with conservative fee/slippage/spread-aware backtesting. Reality audit mode adds buy-and-hold/DCA baselines, current/maker/low/zero-cost scenario comparison, optional trade-by-trade CSV/JSONL logs, and `logs/strategy_reality_audit_summary.json`. V5 supports `15Min`, `1H`, `4H`, and `1D`; if raw higher-timeframe bars are unavailable, complete candles are derived chronologically from real lower-timeframe `collected_market_data`. Research output is written to `logs/higher_timeframe_research.csv` and `logs/higher_timeframe_research_summary.json`. No config is auto-applied, no model is auto-promoted, and trading remains disabled.
 
-Buy-the-Dip v2 is retained only as a historical rejected strategy. It was evaluated on real roughly 180-day BTC/USD data, generated enough trades, and failed after conservative execution costs. Do not train on it or connect it to paper-forward.
+Buy-the-Dip v2 and the current 15Min-heavy strategy group are retained only as historical rejected research unless a future reality audit proves otherwise under all gates, including walk-forward and risk-adjusted baseline comparison. Do not train on them or connect them to paper-forward from the current evidence.
 
 ## Logs
 

@@ -22,3 +22,48 @@ Strategy Research v3 focuses on higher-timeframe long-only BTC/USD candidates th
 The v3 framework supports `15Min` and `1H` research. If raw `1H` bars are unavailable, the research script derives complete hourly bars chronologically from real `15Min` `collected_market_data` and drops incomplete hours. Research decisions remain invalid if synthetic data is used or if the source is not real collected data.
 
 Walk-forward validation is chronological only. A config that works in one segment but fails across the rest is rejected.
+
+## Strategy Reality Audit V5
+
+Reality audit mode is the next research step. It does not add trading permission. It audits why existing configs lose, compares every result against buy-and-hold and DCA baselines, runs current/maker/low/zero-cost scenarios in one pass, and can export trade-by-trade CSV/JSONL logs.
+
+Example:
+
+```bash
+.venv/bin/python scripts/research_higher_timeframe.py \
+  --audit-mode reality \
+  --strategy all \
+  --timeframes 1H 4H 1D \
+  --max-rows-1h 4000 \
+  --max-rows-4h 1200 \
+  --max-rows-1d 300 \
+  --max-v3-configs 1000 \
+  --walk-forward-splits 4 \
+  --export-trades \
+  --json
+```
+
+Reality audit outputs include:
+
+- `logs/higher_timeframe_research.csv`
+- `logs/higher_timeframe_research_summary.json`
+- `logs/strategy_reality_audit_summary.json`
+- `logs/trade_audits/*.csv`
+- `logs/trade_audits/*.jsonl`
+
+The current 15Min-heavy families remain historical research strategies and are treated as rejected unless a future reality audit proves otherwise under the full gates: enough trades, positive net return, acceptable profit factor/drawdown, chronological walk-forward pass, and at least one relevant baseline beaten on a risk-adjusted basis.
+
+Rejected-by-default 15Min families:
+
+- 15Min Buy-the-Dip / Mean Reversion v2
+- 15Min Trend Pullback
+- 15Min Uptrend Pullback if it remains below minimum trade threshold or fails walk-forward
+- 15Min Volatility Breakout if it remains net negative
+
+The added higher-timeframe templates are still long-only BTC/USD research only:
+
+- `htf_trend_continuation`
+- `htf_volatility_expansion_breakout`
+- `htf_risk_off_hold_filter`
+
+`htf_risk_off_hold_filter` is an exposure/regime filter, not a trainable entry strategy.

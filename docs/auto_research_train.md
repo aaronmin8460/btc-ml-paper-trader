@@ -153,7 +153,9 @@ Use v3 for new research:
   --json
 ```
 
-V3 supports `uptrend_pullback` and `volatility_breakout` on `15Min` and `1H`. If raw `1H` bars are unavailable, complete hourly bars are derived chronologically from real `15Min` `collected_market_data`.
+V5 reality audit mode reports `strategy_reality_audit_available`, `fifteen_min_rejected`, `rejected_strategy_families`, `best_htf_strategy`, `best_htf_config`, `baseline_comparison_available`, and `training_skipped_reason` in the auto research/train summary. Training remains blocked unless existing gates and the reality-audit gates pass.
+
+V3/V5 supports `uptrend_pullback`, `volatility_breakout`, and conservative higher-timeframe templates on `15Min`, `1H`, `4H`, and `1D`. If raw higher-timeframe bars are unavailable, complete candles are derived chronologically from real lower-timeframe `collected_market_data`.
 
 ## Paper-Forward Is Not Trading Permission
 

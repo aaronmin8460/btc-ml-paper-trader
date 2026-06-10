@@ -297,6 +297,38 @@ def test_auto_research_train_preserves_buy_the_dip_research_summary_fields():
     assert diagnostics["economically_viable_config_count"] == 1
 
 
+def test_auto_research_train_normalizes_reality_audit_fields():
+    summary = art.normalize_research_summary(
+        {
+            "audit_mode": "reality",
+            "synthetic_data_used": False,
+            "research_result_valid": True,
+            "paper_forward_eligible_config_count": 0,
+            "economically_viable_config_count": 0,
+            "fifteen_min_rejected": True,
+            "rejected_strategy_families": ["15Min trend_pullback"],
+            "baselines": {"1H": {"buy_and_hold_return_pct": 0.1}},
+            "all_results": [
+                {
+                    "parameter_set_id": "htf",
+                    "strategy_name": "htf_volatility_expansion_breakout",
+                    "research_promising": False,
+                    "beats_any_relevant_baseline_risk_adjusted": False,
+                    "strategy_return_over_drawdown": 0.1,
+                    "baseline_return_over_drawdown": 0.2,
+                }
+            ],
+        },
+        status="run",
+    )
+
+    assert summary["strategy_reality_audit_available"] is True
+    assert summary["fifteen_min_rejected"] is True
+    assert summary["rejected_strategy_families"] == ["15Min trend_pullback"]
+    assert summary["baseline_comparison_available"] is True
+    assert summary["best_htf_strategy"] == "htf_volatility_expansion_breakout"
+
+
 def test_auto_research_train_reports_buy_the_dip_v2_trainability_fields():
     report = {
         "training_was_run": False,
@@ -309,10 +341,15 @@ def test_auto_research_train_reports_buy_the_dip_v2_trainability_fields():
             "buy_the_dip_profitable_20_plus_trade_configs": 1,
             "buy_the_dip_economically_viable_count": 0,
             "buy_the_dip_rejected": True,
+            "strategy_reality_audit_available": True,
+            "fifteen_min_rejected": True,
+            "rejected_strategy_families": ["15Min buy_the_dip_mean_reversion"],
+            "baseline_comparison_available": True,
             "buy_the_dip_best_config_20_plus_trades": {"parameter_set_id": "btd_20_plus"},
             "strategy_breakdown": {
                 "uptrend_pullback": {"configs_tested": 120, "research_promising_count": 0},
                 "volatility_breakout": {"configs_tested": 80, "research_promising_count": 0},
+                "htf_trend_continuation": {"configs_tested": 10, "research_promising_configs": 0},
             },
             "all_results": [
                 {
@@ -321,7 +358,16 @@ def test_auto_research_train_reports_buy_the_dip_v2_trainability_fields():
                     "adjusted_rank_score": -100.0,
                     "net_return_pct": -0.01,
                     "number_of_trades": 24,
-                }
+                },
+                {
+                    "parameter_set_id": "htf_best",
+                    "strategy_name": "htf_trend_continuation",
+                    "adjusted_rank_score": -50.0,
+                    "net_return_pct": -0.005,
+                    "number_of_trades": 12,
+                    "strategy_return_over_drawdown": -0.2,
+                    "baseline_return_over_drawdown": 0.1,
+                },
             ],
         },
     }
@@ -340,6 +386,13 @@ def test_auto_research_train_reports_buy_the_dip_v2_trainability_fields():
     assert summary["volatility_breakout_promising_count"] == 0
     assert summary["best_v3_strategy"] == "uptrend_pullback"
     assert summary["best_v3_config"]["parameter_set_id"] == "utp_best"
+    assert summary["strategy_reality_audit_available"] is True
+    assert summary["fifteen_min_rejected"] is True
+    assert summary["rejected_strategy_families"] == ["15Min buy_the_dip_mean_reversion"]
+    assert summary["baseline_comparison_available"] is True
+    assert summary["best_htf_strategy"] == "htf_trend_continuation"
+    assert summary["best_htf_config"]["parameter_set_id"] == "htf_best"
+    assert "target_vs_cost_unsafe" in summary["training_skipped_reason"]
     assert summary["training_skipped_no_trainable_strategy_exists_yet"] is True
     assert summary["training_skipped_because_no_viable_trainable_strategy_exists"] is True
 
@@ -365,13 +418,18 @@ def test_auto_research_train_blocks_training_without_promising_v3_strategy(tmp_p
             "buy_the_dip_economically_viable_count": 1,
             "uptrend_pullback_promising_count": 0,
             "volatility_breakout_promising_count": 0,
+            "strategy_reality_audit_available": True,
+            "baseline_comparison_available": True,
+            "fifteen_min_rejected": True,
             "all_results": [],
         },
     )
 
     assert gates["all_gates_passed"] is False
     assert "no_viable_trainable_strategy_exists" in gates["blocked_reasons"]
+    assert "fifteen_min_strategy_family_rejected" in gates["blocked_reasons"]
     assert gates["gates"]["v3_trainable_strategy_exists"]["passed"] is False
+    assert gates["gates"]["fifteen_min_not_rejected_for_training_timeframe"]["passed"] is False
 
 
 def test_systemd_service_does_not_start_paper_trader_service():

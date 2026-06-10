@@ -620,6 +620,7 @@ async def run_research_pipeline(
             session_factory=session_factory,
             allow_synthetic_fallback=False,
             now=now,
+            audit_mode="reality",
         )
         return normalize_research_summary(summary, status="run")
     except Exception as exc:
@@ -639,6 +640,9 @@ def normalize_research_summary(summary: dict[str, Any], *, status: str) -> dict[
         paper_forward_count = 0
         economic_count = 0
     out = dict(summary)
+    baselines = summary.get("baselines") or {}
+    all_results = summary.get("all_results") or []
+    best_htf = _best_htf_config(summary)
     out.update(
         {
             "status": status,
@@ -647,6 +651,17 @@ def normalize_research_summary(summary: dict[str, Any], *, status: str) -> dict[
             "paper_forward_eligible_config_count": paper_forward_count,
             "economically_viable_config_count": economic_count,
             "invalid_for_trading_decisions": (not research_result_valid) or synthetic_data_used,
+            "strategy_reality_audit_available": bool(summary.get("audit_mode") == "reality")
+            or bool(summary.get("strategy_reality_audit_summary_path")),
+            "fifteen_min_rejected": bool(summary.get("fifteen_min_rejected")),
+            "rejected_strategy_families": list(summary.get("rejected_strategy_families") or []),
+            "best_htf_strategy": best_htf.get("strategy_name") if best_htf else None,
+            "best_htf_config": best_htf,
+            "baseline_comparison_available": bool(baselines)
+            or any(
+                isinstance(row, dict) and "buy_and_hold_return_pct" in row
+                for row in all_results
+            ),
         }
     )
     return out
@@ -703,6 +718,10 @@ def evaluate_training_gates(
     strict_promotion_logic_available = True
     economic_count = int(research_summary.get("economically_viable_config_count", 0) or 0)
     v3_promising_count = _v3_promising_count(research_summary)
+    reality_audit_available = bool(research_summary.get("strategy_reality_audit_available"))
+    baseline_comparison_available = bool(research_summary.get("baseline_comparison_available"))
+    fifteen_min_rejected = bool(research_summary.get("fifteen_min_rejected"))
+    trainable_reality_candidate_count = _trainable_reality_candidate_count(research_summary)
 
     gates = {
         "run_mode": {
@@ -758,6 +777,22 @@ def evaluate_training_gates(
             "passed": v3_promising_count > 0,
             "reason": None if v3_promising_count > 0 else "no_viable_trainable_strategy_exists",
             "v3_promising_count": v3_promising_count,
+        },
+        "strategy_reality_audit": {
+            "passed": reality_audit_available and baseline_comparison_available and trainable_reality_candidate_count > 0,
+            "reason": None
+            if reality_audit_available and baseline_comparison_available and trainable_reality_candidate_count > 0
+            else "strategy_reality_audit_gate_failed",
+            "strategy_reality_audit_available": reality_audit_available,
+            "baseline_comparison_available": baseline_comparison_available,
+            "trainable_reality_candidate_count": trainable_reality_candidate_count,
+        },
+        "fifteen_min_not_rejected_for_training_timeframe": {
+            "passed": training_timeframe != "15Min" or not fifteen_min_rejected,
+            "reason": None
+            if training_timeframe != "15Min" or not fifteen_min_rejected
+            else "fifteen_min_strategy_family_rejected",
+            "fifteen_min_rejected": fifteen_min_rejected,
         },
         "fallback_prediction_not_used": {
             "passed": not fallback_prediction_used,
@@ -917,6 +952,7 @@ def build_strategy_training_summary(report: dict[str, Any]) -> dict[str, Any]:
     strategy_breakdown = research_summary.get("strategy_breakdown") or {}
     uptrend_summary = strategy_breakdown.get("uptrend_pullback") or {}
     breakout_summary = strategy_breakdown.get("volatility_breakout") or {}
+    best_htf = research_summary.get("best_htf_config") or _best_htf_config(research_summary)
     uptrend_promising = _summary_int(
         research_summary,
         "uptrend_pullback_promising_count",
@@ -934,10 +970,24 @@ def build_strategy_training_summary(report: dict[str, Any]) -> dict[str, Any]:
     )
     no_trainable_strategy = (
         report.get("training_was_run") is False
-        and (uptrend_promising + breakout_promising) == 0
+        and (uptrend_promising + breakout_promising + _htf_promising_count(research_summary)) == 0
     )
+    training_skipped_reason = None
+    if report.get("training_was_run") is False:
+        training_skipped_reason = (
+            ";".join(blocked_reasons)
+            if blocked_reasons
+            else "dry_run" if report.get("mode") == "dry-run" else "no_trainable_strategy"
+        )
     return {
         "current_scalping_training_blocked_by_target_vs_cost": current_scalping_blocked,
+        "strategy_reality_audit_available": bool(research_summary.get("strategy_reality_audit_available")),
+        "fifteen_min_rejected": bool(research_summary.get("fifteen_min_rejected")),
+        "rejected_strategy_families": list(research_summary.get("rejected_strategy_families") or []),
+        "best_htf_strategy": (best_htf or {}).get("strategy_name") if isinstance(best_htf, dict) else None,
+        "best_htf_config": best_htf,
+        "baseline_comparison_available": bool(research_summary.get("baseline_comparison_available")),
+        "training_skipped_reason": training_skipped_reason,
         "buy_the_dip_research_available": bool(configs_tested and research_summary.get("research_result_valid")),
         "buy_the_dip_rejected": bool(research_summary.get("buy_the_dip_rejected"))
         or bool((research_summary.get("concise_summary") or {}).get("buy_the_dip_rejected")),
@@ -1139,6 +1189,30 @@ def _v3_promising_count(research_summary: dict[str, Any]) -> int:
     )
 
 
+def _htf_promising_count(research_summary: dict[str, Any]) -> int:
+    strategy_breakdown = research_summary.get("strategy_breakdown") or {}
+    return sum(
+        _summary_int(strategy_breakdown.get(strategy) or {}, "research_promising_configs", 0)
+        or _summary_int(strategy_breakdown.get(strategy) or {}, "research_promising_count", 0)
+        for strategy in (
+            "htf_trend_continuation",
+            "htf_volatility_expansion_breakout",
+        )
+    )
+
+
+def _trainable_reality_candidate_count(research_summary: dict[str, Any]) -> int:
+    count = 0
+    for row in research_summary.get("all_results") or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("strategy_name") == "htf_risk_off_hold_filter":
+            continue
+        if row.get("research_promising") and row.get("beats_any_relevant_baseline_risk_adjusted"):
+            count += 1
+    return count
+
+
 def _best_v3_config(research_summary: dict[str, Any]) -> dict[str, Any] | None:
     candidates = [
         row
@@ -1159,6 +1233,37 @@ def _best_v3_config(research_summary: dict[str, Any]) -> dict[str, Any] | None:
             _safe_float(row.get("adjusted_rank_score", row.get("rank_score", 0.0))),
             _safe_float(row.get("net_return_pct")),
             int(row.get("number_of_trades", 0) or 0),
+        ),
+    )
+
+
+def _best_htf_config(research_summary: dict[str, Any]) -> dict[str, Any] | None:
+    htf_names = {
+        "htf_trend_continuation",
+        "htf_volatility_expansion_breakout",
+        "htf_risk_off_hold_filter",
+    }
+    candidates = [
+        row
+        for row in (research_summary.get("all_results") or [])
+        if isinstance(row, dict) and row.get("strategy_name") in htf_names
+    ]
+    if not candidates:
+        best_by_strategy = research_summary.get("best_configs_by_strategy") or {}
+        for strategy in htf_names:
+            rows = best_by_strategy.get(strategy) or []
+            candidates.extend(row for row in rows if isinstance(row, dict))
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda row: (
+            bool(row.get("research_promising")),
+            bool(row.get("beats_any_relevant_baseline_risk_adjusted")),
+            _safe_float(row.get("strategy_return_over_drawdown"))
+            - _safe_float(row.get("baseline_return_over_drawdown")),
+            _safe_float(row.get("adjusted_rank_score", row.get("rank_score", 0.0))),
+            _safe_float(row.get("net_return_pct")),
         ),
     )
 

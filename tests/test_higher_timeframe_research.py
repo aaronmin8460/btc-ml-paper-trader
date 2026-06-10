@@ -19,16 +19,28 @@ from scripts.research_higher_timeframe import (
     VOLATILITY_BREAKOUT_STRATEGY,
     ResearchDataReport,
     ResearchConfig,
+    aggregate_trade_diagnostics,
+    build_baselines_by_timeframe,
+    build_trade_audit_rows,
     build_uptrend_pullback_research_trades,
     build_buy_the_dip_research_trades,
     build_volatility_breakout_research_trades,
     build_research_summary,
+    classify_cost_sensitivity,
     chronological_walk_forward_splits,
+    derive_1d_bars_from_lower_timeframe,
     derive_1h_bars_from_15min,
+    derive_4h_bars_from_lower_timeframe,
+    evaluate_cost_scenarios_for_config,
     evaluate_research_configs,
+    export_trade_audit_logs,
     _fetch_research_bars,
     generate_buy_the_dip_configs,
     generate_buy_the_dip_signal_profiles,
+    generate_htf_risk_off_hold_filter_configs,
+    generate_htf_configs,
+    generate_htf_trend_continuation_configs,
+    generate_htf_volatility_expansion_breakout_configs,
     generate_research_configs,
     generate_trend_pullback_configs,
     generate_uptrend_pullback_configs,
@@ -38,6 +50,7 @@ from scripts.research_higher_timeframe import (
     research_rank_details,
     research_settings,
     run_higher_timeframe_research,
+    strategy_baseline_comparison,
     summarize_walk_forward_metrics,
 )
 
@@ -151,7 +164,10 @@ def test_research_config_space_matches_requested_values():
     buy_the_dip_configs = generate_buy_the_dip_configs()
     uptrend_configs = generate_uptrend_pullback_configs()
     breakout_configs = generate_volatility_breakout_configs()
-    assert len(all_configs) == 48 + len(buy_the_dip_configs) + len(uptrend_configs) + len(breakout_configs)
+    htf_default_configs = generate_htf_configs(timeframes=("15Min", "1H"))
+    assert len(all_configs) == (
+        48 + len(buy_the_dip_configs) + len(uptrend_configs) + len(breakout_configs) + len(htf_default_configs)
+    )
     assert {config.strategy_name for config in configs} == {"trend_pullback"}
     assert {config.strategy_name for config in buy_the_dip_configs} == {BUY_THE_DIP_STRATEGY}
     assert {config.strategy_name for config in uptrend_configs} == {UPTREND_PULLBACK_STRATEGY}
@@ -164,6 +180,20 @@ def test_research_config_space_matches_requested_values():
     assert {config.take_profit_pct for config in buy_the_dip_configs} == {0.0086, 0.01, 0.0125, 0.015, 0.02, 0.025}
     assert len(generate_buy_the_dip_signal_profiles()) > len(BUY_THE_DIP_SIGNAL_PROFILES)
     assert any(config.timeframe == "15Min" for config in generate_buy_the_dip_configs(max_configs=120))
+
+
+def test_higher_timeframe_strategy_templates_use_1h_4h_daily():
+    trend = generate_htf_trend_continuation_configs(max_configs=1000)
+    breakout = generate_htf_volatility_expansion_breakout_configs(max_configs=1000)
+    risk_off = generate_htf_risk_off_hold_filter_configs(max_configs=1000)
+
+    assert {config.timeframe for config in trend} == {"1H", "4H", "1D"}
+    assert {config.take_profit_pct for config in trend} == {0.03, 0.05, 0.08, 0.12}
+    assert {config.stop_loss_pct for config in trend} == {0.015, 0.025, 0.04, 0.06}
+    assert {config.timeframe for config in breakout} == {"1H", "4H", "1D"}
+    assert {config.take_profit_pct for config in breakout} == {0.04, 0.06, 0.10, 0.15}
+    assert {config.stop_loss_pct for config in breakout} == {0.02, 0.03, 0.05}
+    assert {config.strategy_name for config in risk_off} == {"htf_risk_off_hold_filter"}
 
 
 def test_paper_forward_readiness_blocks_fallback_and_invalid_model():
@@ -263,6 +293,183 @@ def test_paper_forward_readiness_rejects_high_single_trade_concentration():
 
     assert result["economically_viable"] is False
     assert "single_trade_return_concentration_too_high" in result["rejection_reasons"]
+
+
+def test_baselines_cover_buy_hold_dca_and_strategy_comparison():
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=8, freq="12h", tz="UTC"),
+            "open": [100, 90, 95, 92, 100, 105, 110, 114],
+            "high": [101, 96, 96, 101, 106, 111, 115, 121],
+            "low": [99, 89, 91, 91, 99, 104, 109, 113],
+            "close": [100, 90, 95, 92, 100, 105, 110, 120],
+            "volume": [1.0] * 8,
+        }
+    )
+    baselines = build_baselines_by_timeframe({"1H": bars}, _settings(order_notional_usd=25))
+    baseline = baselines["1H"]
+    comparison = strategy_baseline_comparison(
+        {"net_return_pct": 0.25, "max_drawdown_pct": 0.02},
+        baseline,
+    )
+
+    assert baseline["cash_return_pct"] == 0.0
+    assert baseline["buy_and_hold_return_pct"] == pytest.approx(0.20)
+    assert baseline["dca_daily_return_pct"] > 0
+    assert baseline["dca_weekly_return_pct"] > 0
+    assert comparison["strategy_excess_return_vs_buy_hold"] == pytest.approx(0.05)
+    assert comparison["beats_any_relevant_baseline_risk_adjusted"] is True
+
+
+def test_cost_scenarios_and_trade_audit_cost_decomposition_do_not_modify_env():
+    env_path = Path(".env")
+    before = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+    settings = research_settings(_settings(order_type="market", scalping_mode_enabled=True))
+    config = ResearchConfig(
+        parameter_set_id="audit_cost",
+        strategy_name="unit_test_strategy",
+        timeframe="15Min",
+        take_profit_pct=0.004,
+        stop_loss_pct=0.01,
+        max_hold_bars=4,
+    )
+    trades = pd.DataFrame(
+        [
+            {
+                "timestamp": datetime(2026, 6, 1, 0, 0, tzinfo=UTC),
+                "entry_timestamp": datetime(2026, 6, 1, 0, 0, tzinfo=UTC),
+                "exit_timestamp": datetime(2026, 6, 1, 1, 0, tzinfo=UTC),
+                "close": 100.0,
+                "entry_price": 100.0,
+                "exit_price": 100.4,
+                "buy_quality_label": 1,
+                "buy_exit_return_pct": 0.004,
+                "buy_exit_reason": "research_take_profit",
+                "buy_hold_bars": 4,
+                "strategy_name": "unit_test_strategy",
+                "entry_reason": "unit_test",
+                "regime": "unit",
+                "max_favorable_excursion_pct": 0.006,
+                "max_adverse_excursion_pct": -0.001,
+            }
+        ]
+    )
+
+    cost_summary = evaluate_cost_scenarios_for_config(trades, trades, settings, config)
+    metrics = evaluate_cost_scenarios_for_config(
+        trades,
+        trades,
+        settings,
+        config,
+    )
+    audit_rows = build_trade_audit_rows(
+        config,
+        trades,
+        {
+            "trade_details": [
+                {
+                    "gross_return_pct": 0.004,
+                    "net_return_pct": metrics["net_return_by_cost_scenario"]["current_taker"],
+                    "fee_amount": settings.order_notional_usd * 0.005,
+                    "slippage_amount": settings.order_notional_usd * 0.002,
+                    "spread_cost": 0.0,
+                    "exit_reason": "research_take_profit",
+                    "hold_bars": 4,
+                }
+            ]
+        },
+        result_row={"rejection_reasons": "unit_test"},
+        settings=settings,
+        folds=[],
+    )
+
+    assert cost_summary["profitable_under_zero_cost"] is True
+    assert cost_summary["profitable_under_maker_low_slippage"] is True
+    assert cost_summary["profitable_under_current_taker"] is False
+    assert cost_summary["cost_sensitivity_classification"] == "signal_positive_low_cost_only"
+    assert classify_cost_sensitivity(
+        profitable_zero=False,
+        profitable_low=False,
+        profitable_maker=False,
+        profitable_taker=False,
+    ) == "signal_negative_even_zero_cost"
+    assert audit_rows[0]["was_gross_winner"] is True
+    assert audit_rows[0]["was_net_winner"] is False
+    assert audit_rows[0]["gross_winner_became_net_loser"] is True
+    assert audit_rows[0]["fee_cost_pct"] == pytest.approx(0.005)
+    assert audit_rows[0]["slippage_cost_pct"] == pytest.approx(0.002)
+    assert audit_rows[0]["total_cost_pct"] == pytest.approx(0.007)
+    diagnostics = aggregate_trade_diagnostics(audit_rows)
+    assert diagnostics["total_trades"] == 1
+    assert diagnostics["gross_winners"] == 1
+    assert diagnostics["net_winners"] == 0
+    assert diagnostics["trades_by_exit_reason"] == {"research_take_profit": 1}
+    if before is not None:
+        assert env_path.read_text(encoding="utf-8") == before
+
+
+def test_trade_by_trade_audit_export_writes_csv_jsonl_and_diagnostics(tmp_path):
+    settings = research_settings(_settings(order_notional_usd=25, min_training_rows=1))
+    start = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+    bars = pd.DataFrame(
+        {
+            "timestamp": [start + timedelta(minutes=15 * i) for i in range(80)],
+            "open": [100 + i * 0.1 for i in range(80)],
+            "high": [101 + i * 0.1 for i in range(80)],
+            "low": [99 + i * 0.1 for i in range(80)],
+            "close": [100 + i * 0.1 for i in range(80)],
+            "volume": [10.0] * 80,
+        }
+    )
+    row = {
+        "parameter_set_id": "btd_00000",
+        "strategy_name": BUY_THE_DIP_STRATEGY,
+        "timeframe": "15Min",
+        "number_of_trades": 1,
+        "net_return_pct": -0.001,
+        "profit_factor_net": 0.0,
+        "max_drawdown_pct": 0.001,
+        "rank_score": 1.0,
+        "adjusted_rank_score": 1.0,
+        "rejection_reasons": "unit_test_rejected",
+    }
+
+    outputs = export_trade_audit_logs(
+        [row],
+        {"15Min": bars},
+        settings,
+        data_source_reports={
+            "15Min": ResearchDataReport(
+                timeframe="15Min",
+                source_used="collected_market_data",
+                latest_timestamp=bars["timestamp"].iloc[-1].isoformat(),
+                data_age_minutes=0.0,
+                row_count=len(bars),
+                synthetic_data_used=False,
+                research_result_valid=True,
+            )
+        },
+        strategy=BUY_THE_DIP_STRATEGY,
+        max_buy_dip_configs=1,
+        max_v3_configs=1,
+        walk_forward_splits=4,
+        min_trades_per_split=1,
+        timeframes=("15Min",),
+        output_dir=tmp_path / "audits",
+        top_n=1,
+        include_rejected=True,
+    )
+
+    assert len(outputs) == 1
+    csv_path = Path(outputs[0]["csv_path"])
+    jsonl_path = Path(outputs[0]["jsonl_path"])
+    assert csv_path.exists()
+    assert jsonl_path.exists()
+    assert "strategy_name,parameter_set_id,timeframe,entry_timestamp" in csv_path.read_text(encoding="utf-8")
+    assert "aggregate_diagnostics" in outputs[0]
+    assert (tmp_path / "audits" / "trade_audit_diagnostics.json").exists()
+    if jsonl_path.read_text(encoding="utf-8").strip():
+        assert "gross_winner_became_net_loser" in jsonl_path.read_text(encoding="utf-8")
 
 
 def test_research_summary_never_auto_applies_or_enables_trading(tmp_path):
@@ -544,6 +751,60 @@ def test_1h_bars_are_derived_chronologically_from_15min_data_without_partial_fut
     assert len(derived) == 2
 
 
+def test_4h_bars_are_derived_without_future_leakage_or_incomplete_candles():
+    start = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+    rows = []
+    for index in list(range(8)) + list(range(10, 12)):
+        timestamp = start + timedelta(hours=index)
+        price = 100.0 + index
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "open": price,
+                "high": price + 2,
+                "low": price - 2,
+                "close": price + 0.5,
+                "volume": 1.0,
+            }
+        )
+
+    derived = derive_4h_bars_from_lower_timeframe(pd.DataFrame(rows), source_timeframe="1H")
+
+    assert list(derived["timestamp"]) == [pd.Timestamp(start), pd.Timestamp(start + timedelta(hours=4))]
+    assert derived.iloc[0]["open"] == 100.0
+    assert derived.iloc[0]["high"] == 105.0
+    assert derived.iloc[0]["low"] == 98.0
+    assert derived.iloc[0]["close"] == 103.5
+    assert len(derived) == 2
+
+
+def test_daily_bars_are_derived_without_future_leakage_or_incomplete_candles():
+    start = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+    rows = []
+    for index in list(range(24)) + list(range(24, 36)):
+        timestamp = start + timedelta(hours=index)
+        price = 100.0 + index
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "open": price,
+                "high": price + 1,
+                "low": price - 1,
+                "close": price + 0.25,
+                "volume": 2.0,
+            }
+        )
+
+    derived = derive_1d_bars_from_lower_timeframe(pd.DataFrame(rows), source_timeframe="1H")
+
+    assert list(derived["timestamp"]) == [pd.Timestamp(start)]
+    assert derived.iloc[0]["open"] == 100.0
+    assert derived.iloc[0]["high"] == 124.0
+    assert derived.iloc[0]["low"] == 99.0
+    assert derived.iloc[0]["close"] == 123.25
+    assert derived.iloc[0]["volume"] == 48.0
+
+
 def test_walk_forward_splits_are_chronological_and_not_random():
     bars = _bars(latest=datetime(2026, 6, 1, 10, 0, tzinfo=UTC), count=24, step_minutes=15)
 
@@ -612,6 +873,59 @@ def test_buy_the_dip_reports_take_profit_cost_safety_in_summary(tmp_path):
     assert summary["strategy_breakdown"][BUY_THE_DIP_STRATEGY]["take_profit_vs_cost_safe_count"] == 0
     assert summary["buy_the_dip_configs_tested"] == 1
     assert summary["buy_the_dip_economically_viable_count"] == 0
+
+
+def test_reality_summary_marks_weak_15min_families_rejected(tmp_path):
+    settings = research_settings(_settings())
+    rows = [
+        {
+            "parameter_set_id": "btd_rejected",
+            "strategy_name": BUY_THE_DIP_STRATEGY,
+            "timeframe": "15Min",
+            "number_of_trades": 25,
+            "net_return_pct": -0.01,
+            "profit_factor_net": 0.8,
+            "max_drawdown_pct": 0.02,
+            "walk_forward_passed": False,
+            "research_promising": False,
+            "economically_viable": False,
+            "paper_forward_eligible": False,
+            "beats_any_relevant_baseline_risk_adjusted": False,
+            "rejection_reasons": "net_return_not_positive;walk_forward_not_passed",
+            "rank_score": -1.0,
+            "adjusted_rank_score": -1.0,
+        }
+    ]
+    bars = {
+        "15Min": _bars(latest=datetime(2026, 6, 7, 9, 30, tzinfo=UTC), count=40, step_minutes=15)
+    }
+    reports = {
+        "15Min": ResearchDataReport(
+            timeframe="15Min",
+            source_used="collected_market_data",
+            latest_timestamp="2026-06-07T09:30:00+00:00",
+            data_age_minutes=0.0,
+            row_count=40,
+            synthetic_data_used=False,
+            research_result_valid=True,
+        )
+    }
+    summary = build_research_summary(
+        rows,
+        settings,
+        data_source_reports=reports,
+        csv_path=tmp_path / "research.csv",
+        summary_path=tmp_path / "research.json",
+        active_model_status={"active_model_valid": True},
+        requested_timeframes=("15Min",),
+        audit_mode="reality",
+        bars_by_timeframe=bars,
+    )
+
+    assert summary["fifteen_min_rejected"] is True
+    assert summary["buy_the_dip_rejected"] is True
+    assert "15Min buy_the_dip_mean_reversion" in summary["rejected_strategy_families"]
+    assert "walk_forward_not_passed" in summary["fifteen_min_rejection_reason"]
 
 
 def test_one_trade_config_is_statistically_weak_and_ranked_below_reliable_config(tmp_path):
