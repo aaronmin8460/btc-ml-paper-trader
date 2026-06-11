@@ -187,6 +187,8 @@ class Settings(BaseSettings):
     max_trade_fraction: float = 0.40
     min_backtest_net_return_pct: float = 0.001
     max_backtest_drawdown_pct: float = 0.01
+    max_research_drawdown_pct: float = 0.10
+    max_paper_forward_drawdown_pct: float = 0.10
     min_backtest_profit_factor: float = 1.2
     min_backtest_trades: int = 30
     max_backtest_ambiguous_candle_ratio: float = 0.10
@@ -284,6 +286,8 @@ class Settings(BaseSettings):
         "max_account_drawdown_pct",
         "min_backtest_net_return_pct",
         "max_backtest_drawdown_pct",
+        "max_research_drawdown_pct",
+        "max_paper_forward_drawdown_pct",
         "min_backtest_profit_factor",
         "min_backtest_trades",
         "max_backtest_ambiguous_candle_ratio",

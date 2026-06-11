@@ -1152,143 +1152,144 @@ def evaluate_research_configs(
                 concentration=concentration,
                 walk_forward=walk_forward,
             )
-        rows.append(
-            {
-                "parameter_set_id": config.parameter_set_id,
-                "track_id": config.track_id,
-                "strategy_name": config.strategy_name,
-                "timeframe": config.timeframe,
-                "exit_mode": config.exit_mode,
-                "take_profit_pct": config.take_profit_pct,
-                "stop_loss_pct": config.stop_loss_pct,
-                "max_hold_bars": config.max_hold_bars,
-                "rsi_threshold": config.rsi_threshold,
-                "zscore_threshold": config.zscore_threshold,
-                "vwap_distance_threshold": config.vwap_distance_threshold,
-                "drawdown_threshold": config.drawdown_threshold,
-                "min_volume_zscore": config.min_volume_zscore,
-                "reversal_confirmation_required": config.reversal_confirmation_required,
-                "higher_timeframe_regime_filter": config.higher_timeframe_regime_filter,
-                "support": config.support,
-                "support_distance_pct": config.support_distance_pct,
-                "pullback_min_pct": config.pullback_min_pct,
-                "pullback_max_pct": config.pullback_max_pct,
-                "rsi_min": config.rsi_min,
-                "rsi_max": config.rsi_max,
-                "confirmation": config.confirmation,
-                "min_lower_wick_ratio": config.min_lower_wick_ratio,
-                "min_volume_recovery": config.min_volume_recovery,
-                "breakout_lookback": config.breakout_lookback,
-                "consolidation_lookback": config.consolidation_lookback,
-                "min_body_vs_avg": config.min_body_vs_avg,
-                "min_recent_return_pct": config.min_recent_return_pct,
-                "min_trend_strength": config.min_trend_strength,
-                "max_atr_expansion": config.max_atr_expansion,
-                "require_ema_trend_filter": config.require_ema_trend_filter,
-                "require_positive_ema20_slope": config.require_positive_ema20_slope,
-                "require_close_above_ema200": config.require_close_above_ema200,
-                "max_breakout_candle_atr_multiple": config.max_breakout_candle_atr_multiple,
-                "min_close_position_in_candle": config.min_close_position_in_candle,
-                "max_recent_runup_pct": config.max_recent_runup_pct,
-                "min_consolidation_compression": config.min_consolidation_compression,
-                "require_volume_expansion": config.require_volume_expansion,
-                "max_atr_percentile": config.max_atr_percentile,
-                "number_of_trades": int(metrics.get("number_of_trades", 0) or 0),
-                "gross_return_pct": _metric_float(metrics.get("gross_return_pct")),
-                "net_return_pct": _metric_float(metrics.get("net_return_pct")),
-                "profit_factor_net": _profit_factor_value(metrics.get("profit_factor_net")),
-                "max_drawdown_pct": _metric_float(metrics.get("max_drawdown_pct")),
-                "win_rate_net": _metric_float(metrics.get("win_rate_net")),
-                "expectancy": _metric_float(metrics.get("expectancy")),
-                "round_trip_estimated_cost_pct": round_trip_cost,
-                "promotion_required_return_pct": promotion_required,
-                "take_profit_vs_cost_safe": take_profit_vs_cost_safe,
-                "take_profit_vs_promotion_safe": take_profit_vs_promotion_safe,
-                "gross_winners_became_net_losers": int(metrics.get("gross_winners_became_net_losers", 0) or 0),
-                "single_trade_return_concentration": concentration,
-                "fold_count": int(walk_forward["fold_count"]),
-                "per_fold_net_return_pct": walk_forward["per_fold_net_return_pct"],
-                "per_fold_profit_factor_net": walk_forward["per_fold_profit_factor_net"],
-                "per_fold_number_of_trades": walk_forward["per_fold_number_of_trades"],
-                "per_fold_max_drawdown_pct": walk_forward["per_fold_max_drawdown_pct"],
-                "folds_profitable_count": int(walk_forward["folds_profitable_count"]),
-                "folds_with_min_trades_count": int(walk_forward["folds_with_min_trades_count"]),
-                "worst_fold_net_return_pct": _metric_float(walk_forward["worst_fold_net_return_pct"]),
-                "median_fold_net_return_pct": _metric_float(walk_forward["median_fold_net_return_pct"]),
-                "walk_forward_passed": bool(walk_forward["walk_forward_passed"]),
-                "current_taker_net_return_pct": _metric_float(
-                    (cost_summary.get("net_return_by_cost_scenario") or {}).get("current_taker")
-                ),
-                "maker_current_net_return_pct": _metric_float(
-                    (cost_summary.get("net_return_by_cost_scenario") or {}).get("maker_current")
-                ),
-                "maker_low_slippage_net_return_pct": _metric_float(
-                    (cost_summary.get("net_return_by_cost_scenario") or {}).get("maker_low_slippage")
-                ),
-                "zero_cost_net_return_pct": _metric_float(
-                    (cost_summary.get("net_return_by_cost_scenario") or {}).get("zero_cost_sanity")
-                ),
-                "current_taker_profit_factor": _profit_factor_value(
-                    (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("current_taker")
-                ),
-                "maker_current_profit_factor": _profit_factor_value(
-                    (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("maker_current")
-                ),
-                "maker_low_slippage_profit_factor": _profit_factor_value(
-                    (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("maker_low_slippage")
-                ),
-                "zero_cost_profit_factor": _profit_factor_value(
-                    (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("zero_cost_sanity")
-                ),
-                "statistically_weak": rank_details["statistically_weak"],
-                "trade_count_score": rank_details["trade_count_score"],
-                "concentration_penalty": rank_details["concentration_penalty"],
-                "reliability_score": rank_details["reliability_score"],
-                "profit_factor_reliable": rank_details["profit_factor_reliable"],
-                "adjusted_rank_score": rank_details["adjusted_rank_score"],
-                "reason_ranked_lower_if_any": rank_details["reason_ranked_lower_if_any"],
-                "source_used": source_report.source_used if source_report is not None else "unknown",
-                "latest_timestamp": source_report.latest_timestamp if source_report is not None else None,
-                "data_age_minutes": source_report.data_age_minutes if source_report is not None else None,
-                "row_count": source_report.row_count if source_report is not None else int(len(bars)),
-                "synthetic_data_used": synthetic_data_used,
-                "research_result_valid": source_valid,
-                "data_rejection_reason": source_report.rejection_reason if source_report is not None else None,
-                "rejected_sources": list(source_report.rejected_sources) if source_report is not None else [],
-                "fallback_prediction_used": synthetic_data_used,
-                "active_model_valid": bool(active_model_valid),
-                "active_model_status": (active_model_status or {}).get("active_model_status"),
-                "economically_viable": economically_viable,
-                "research_promising": research_promising,
-                "paper_forward_eligible": paper_forward_eligible,
-                "rejection_reasons": ";".join(dict.fromkeys(rejection_reasons)),
-                "research_rejection_reasons": ";".join(
-                    dict.fromkeys(focused_gate.get("research_rejection_reasons", []))
-                ) if volatility_focus else ";".join(
-                    reason for reason in dict.fromkeys(rejection_reasons) if reason != "active_model_invalid"
-                ),
-                "paper_forward_rejection_reasons": ";".join(
-                    dict.fromkeys(focused_gate.get("paper_forward_rejection_reasons", rejection_reasons))
-                ),
-                "training_rejection_reasons": ";".join(
-                    dict.fromkeys(focused_gate.get("training_rejection_reasons", []))
-                ),
-                "training_eligible": bool(focused_gate.get("training_eligible", False)),
-                "maker_research_promising": bool(maker_gate.get("maker_research_promising", False)),
-                "maker_economically_viable": bool(maker_gate.get("maker_economically_viable", False)),
-                "maker_only_candidate": bool(maker_gate.get("maker_only_candidate", False)),
-                "maker_rejection_reasons": ";".join(
-                    dict.fromkeys(maker_gate.get("maker_rejection_reasons", []))
-                ),
-                "volatility_focus": volatility_focus,
-                "rank_score": rank_details["raw_rank_score"],
-                **baseline_comparison,
-                **cost_summary,
-                **focused_diagnostics,
-                **maker_diagnostics,
-                **filtered_hold,
-            }
-        )
+        result_row = {
+            "parameter_set_id": config.parameter_set_id,
+            "track_id": config.track_id,
+            "strategy_name": config.strategy_name,
+            "timeframe": config.timeframe,
+            "exit_mode": config.exit_mode,
+            "take_profit_pct": config.take_profit_pct,
+            "stop_loss_pct": config.stop_loss_pct,
+            "max_hold_bars": config.max_hold_bars,
+            "rsi_threshold": config.rsi_threshold,
+            "zscore_threshold": config.zscore_threshold,
+            "vwap_distance_threshold": config.vwap_distance_threshold,
+            "drawdown_threshold": config.drawdown_threshold,
+            "min_volume_zscore": config.min_volume_zscore,
+            "reversal_confirmation_required": config.reversal_confirmation_required,
+            "higher_timeframe_regime_filter": config.higher_timeframe_regime_filter,
+            "support": config.support,
+            "support_distance_pct": config.support_distance_pct,
+            "pullback_min_pct": config.pullback_min_pct,
+            "pullback_max_pct": config.pullback_max_pct,
+            "rsi_min": config.rsi_min,
+            "rsi_max": config.rsi_max,
+            "confirmation": config.confirmation,
+            "min_lower_wick_ratio": config.min_lower_wick_ratio,
+            "min_volume_recovery": config.min_volume_recovery,
+            "breakout_lookback": config.breakout_lookback,
+            "consolidation_lookback": config.consolidation_lookback,
+            "min_body_vs_avg": config.min_body_vs_avg,
+            "min_recent_return_pct": config.min_recent_return_pct,
+            "min_trend_strength": config.min_trend_strength,
+            "max_atr_expansion": config.max_atr_expansion,
+            "require_ema_trend_filter": config.require_ema_trend_filter,
+            "require_positive_ema20_slope": config.require_positive_ema20_slope,
+            "require_close_above_ema200": config.require_close_above_ema200,
+            "max_breakout_candle_atr_multiple": config.max_breakout_candle_atr_multiple,
+            "min_close_position_in_candle": config.min_close_position_in_candle,
+            "max_recent_runup_pct": config.max_recent_runup_pct,
+            "min_consolidation_compression": config.min_consolidation_compression,
+            "require_volume_expansion": config.require_volume_expansion,
+            "max_atr_percentile": config.max_atr_percentile,
+            "number_of_trades": int(metrics.get("number_of_trades", 0) or 0),
+            "gross_return_pct": _metric_float(metrics.get("gross_return_pct")),
+            "net_return_pct": _metric_float(metrics.get("net_return_pct")),
+            "profit_factor_net": _profit_factor_value(metrics.get("profit_factor_net")),
+            "max_drawdown_pct": _metric_float(metrics.get("max_drawdown_pct")),
+            "win_rate_net": _metric_float(metrics.get("win_rate_net")),
+            "expectancy": _metric_float(metrics.get("expectancy")),
+            "round_trip_estimated_cost_pct": round_trip_cost,
+            "promotion_required_return_pct": promotion_required,
+            "take_profit_vs_cost_safe": take_profit_vs_cost_safe,
+            "take_profit_vs_promotion_safe": take_profit_vs_promotion_safe,
+            "gross_winners_became_net_losers": int(metrics.get("gross_winners_became_net_losers", 0) or 0),
+            "single_trade_return_concentration": concentration,
+            "fold_count": int(walk_forward["fold_count"]),
+            "per_fold_net_return_pct": walk_forward["per_fold_net_return_pct"],
+            "per_fold_profit_factor_net": walk_forward["per_fold_profit_factor_net"],
+            "per_fold_number_of_trades": walk_forward["per_fold_number_of_trades"],
+            "per_fold_max_drawdown_pct": walk_forward["per_fold_max_drawdown_pct"],
+            "folds_profitable_count": int(walk_forward["folds_profitable_count"]),
+            "folds_with_min_trades_count": int(walk_forward["folds_with_min_trades_count"]),
+            "worst_fold_net_return_pct": _metric_float(walk_forward["worst_fold_net_return_pct"]),
+            "median_fold_net_return_pct": _metric_float(walk_forward["median_fold_net_return_pct"]),
+            "walk_forward_passed": bool(walk_forward["walk_forward_passed"]),
+            "current_taker_net_return_pct": _metric_float(
+                (cost_summary.get("net_return_by_cost_scenario") or {}).get("current_taker")
+            ),
+            "maker_current_net_return_pct": _metric_float(
+                (cost_summary.get("net_return_by_cost_scenario") or {}).get("maker_current")
+            ),
+            "maker_low_slippage_net_return_pct": _metric_float(
+                (cost_summary.get("net_return_by_cost_scenario") or {}).get("maker_low_slippage")
+            ),
+            "zero_cost_net_return_pct": _metric_float(
+                (cost_summary.get("net_return_by_cost_scenario") or {}).get("zero_cost_sanity")
+            ),
+            "current_taker_profit_factor": _profit_factor_value(
+                (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("current_taker")
+            ),
+            "maker_current_profit_factor": _profit_factor_value(
+                (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("maker_current")
+            ),
+            "maker_low_slippage_profit_factor": _profit_factor_value(
+                (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("maker_low_slippage")
+            ),
+            "zero_cost_profit_factor": _profit_factor_value(
+                (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("zero_cost_sanity")
+            ),
+            "statistically_weak": rank_details["statistically_weak"],
+            "trade_count_score": rank_details["trade_count_score"],
+            "concentration_penalty": rank_details["concentration_penalty"],
+            "reliability_score": rank_details["reliability_score"],
+            "profit_factor_reliable": rank_details["profit_factor_reliable"],
+            "adjusted_rank_score": rank_details["adjusted_rank_score"],
+            "reason_ranked_lower_if_any": rank_details["reason_ranked_lower_if_any"],
+            "source_used": source_report.source_used if source_report is not None else "unknown",
+            "latest_timestamp": source_report.latest_timestamp if source_report is not None else None,
+            "data_age_minutes": source_report.data_age_minutes if source_report is not None else None,
+            "row_count": source_report.row_count if source_report is not None else int(len(bars)),
+            "synthetic_data_used": synthetic_data_used,
+            "research_result_valid": source_valid,
+            "data_rejection_reason": source_report.rejection_reason if source_report is not None else None,
+            "rejected_sources": list(source_report.rejected_sources) if source_report is not None else [],
+            "fallback_prediction_used": synthetic_data_used,
+            "active_model_valid": bool(active_model_valid),
+            "active_model_status": (active_model_status or {}).get("active_model_status"),
+            "economically_viable": economically_viable,
+            "research_promising": research_promising,
+            "paper_forward_eligible": paper_forward_eligible,
+            "rejection_reasons": ";".join(dict.fromkeys(rejection_reasons)),
+            "research_rejection_reasons": ";".join(
+                dict.fromkeys(focused_gate.get("research_rejection_reasons", []))
+            ) if volatility_focus else ";".join(
+                reason for reason in dict.fromkeys(rejection_reasons) if reason != "active_model_invalid"
+            ),
+            "paper_forward_rejection_reasons": ";".join(
+                dict.fromkeys(focused_gate.get("paper_forward_rejection_reasons", rejection_reasons))
+            ),
+            "training_rejection_reasons": ";".join(
+                dict.fromkeys(focused_gate.get("training_rejection_reasons", []))
+            ),
+            "training_eligible": bool(focused_gate.get("training_eligible", False)),
+            "maker_research_promising": bool(maker_gate.get("maker_research_promising", False)),
+            "maker_economically_viable": bool(maker_gate.get("maker_economically_viable", False)),
+            "maker_only_candidate": bool(maker_gate.get("maker_only_candidate", False)),
+            "maker_rejection_reasons": ";".join(
+                dict.fromkeys(maker_gate.get("maker_rejection_reasons", []))
+            ),
+            "volatility_focus": volatility_focus,
+            "rank_score": rank_details["raw_rank_score"],
+            **baseline_comparison,
+            **cost_summary,
+            **focused_diagnostics,
+            **maker_diagnostics,
+            **filtered_hold,
+        }
+        if volatility_focus:
+            result_row.update(volatility_focus_candidate_status_fields(result_row, settings))
+        rows.append(result_row)
     return rows
 
 
@@ -3896,6 +3897,149 @@ def volatility_focus_maker_execution_diagnostics(settings: Settings, cost_summar
     }
 
 
+def volatility_focus_candidate_status_fields(row: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    research_reasons = volatility_focus_maker_only_research_rejection_reasons(row, settings)
+    maker_only_research_candidate = not research_reasons
+    requires_post_only_validation = bool(
+        row.get("post_only_required")
+        and row.get("no_market_fallback_required")
+        and row.get("unfilled_cancel_required")
+    )
+    paper_reasons: list[str] = []
+    if not maker_only_research_candidate:
+        paper_reasons.append("maker_only_research_candidate_false")
+    if _metric_float(row.get("max_drawdown_pct")) > float(settings.max_paper_forward_drawdown_pct):
+        paper_reasons.append("max_drawdown_above_paper_forward_limit")
+    required_execution_fields = (
+        "estimated_fill_rate_required_to_remain_profitable",
+        "max_allowed_taker_fallback_rate_before_net_negative",
+        "maker_vs_taker_net_gap",
+    )
+    for field in required_execution_fields:
+        if field not in row or row.get(field) is None:
+            paper_reasons.append(f"{field}_missing")
+    if not requires_post_only_validation:
+        paper_reasons.append("requires_post_only_paper_forward_validation_not_true")
+    paper_reasons = list(dict.fromkeys(paper_reasons))
+    maker_only_paper_forward_candidate = not paper_reasons
+    strict_paper_forward_eligible = bool(row.get("paper_forward_eligible"))
+    why_not_strict = (
+        []
+        if strict_paper_forward_eligible
+        else _semicolon_values(row.get("paper_forward_rejection_reasons")) or ["strict_paper_forward_gate_not_passed"]
+    )
+    why_not_live = [
+        "research_output_not_live_tradable",
+        "trading_disabled",
+        "auto_trading_disabled",
+        "fallback_trading_disabled",
+        "market_taker_execution_not_safe_for_maker_only_candidate",
+        "requires_post_only_maker_fill_validation",
+        "requires_paper_forward_validation_before_real_money_use",
+        "requires_explicit_user_approval_before_any_trading",
+    ]
+    if not strict_paper_forward_eligible:
+        why_not_live.append("strict_paper_forward_eligible_false")
+    if not maker_only_paper_forward_candidate:
+        why_not_live.append("maker_only_paper_forward_candidate_false")
+    next_required_validation = [
+        "post_only_maker_fill_simulation",
+        "paper_forward_validation_with_no_market_fallback",
+        "explicit_user_approval_before_any_paper_forward_run",
+        "paper_forward_results_review_before_any_real_money_use",
+    ]
+    if not bool(row.get("research_result_valid")) or bool(row.get("synthetic_data_used")):
+        next_required_validation.insert(0, "rerun_on_fresh_real_non_synthetic_data")
+    if not maker_only_research_candidate:
+        next_required_validation.insert(0, "resolve_maker_only_research_candidate_blockers")
+    return {
+        "strict_research_promising": bool(row.get("research_promising")),
+        "maker_only_research_candidate": maker_only_research_candidate,
+        "maker_only_paper_forward_candidate": maker_only_paper_forward_candidate,
+        "strict_paper_forward_eligible": strict_paper_forward_eligible,
+        "live_tradable": False,
+        "requires_post_only_paper_forward_validation": requires_post_only_validation,
+        "maker_only_research_rejection_reasons": ";".join(research_reasons),
+        "maker_only_paper_forward_rejection_reasons": ";".join(paper_reasons),
+        "why_not_live_tradable": why_not_live,
+        "why_not_strict_paper_forward_eligible": why_not_strict,
+        "next_required_validation": list(dict.fromkeys(next_required_validation)),
+    }
+
+
+def volatility_focus_maker_only_research_rejection_reasons(row: dict[str, Any], settings: Settings) -> list[str]:
+    reasons: list[str] = []
+    trades = int(row.get("number_of_trades", 0) or 0)
+    fold_count = int(row.get("fold_count", 4) or 4)
+    folds_with_min_trades = int(row.get("folds_with_min_trades_count", 0) or 0)
+    if not bool(row.get("research_result_valid")):
+        reasons.append("research_data_source_invalid")
+    if bool(row.get("synthetic_data_used")):
+        reasons.append("synthetic_data_used")
+    if settings.symbol != ALLOWED_SYMBOL:
+        reasons.append("symbol_not_btc_usd")
+    if row.get("timeframe") != "1H":
+        reasons.append("timeframe_not_1h")
+    if row.get("strategy_name") != VOLATILITY_BREAKOUT_STRATEGY:
+        reasons.append("strategy_not_volatility_breakout")
+    if bool(settings.trading_enabled):
+        reasons.append("trading_enabled")
+    if bool(settings.auto_trade_enabled):
+        reasons.append("auto_trade_enabled")
+    if bool(settings.allow_fallback_trading):
+        reasons.append("fallback_trading_allowed")
+    if trades < MIN_RESEARCH_TRADES:
+        reasons.append("number_of_trades_below_20")
+    if not bool(row.get("walk_forward_passed")):
+        reasons.append("walk_forward_not_passed")
+    if folds_with_min_trades != fold_count:
+        reasons.append("folds_with_min_trades_below_required")
+    if _metric_float(row.get("maker_current_net_return_pct")) <= 0:
+        reasons.append("maker_current_net_return_not_positive")
+    if _profit_factor_value(row.get("maker_current_profit_factor")) < MIN_RESEARCH_PROFIT_FACTOR_NET:
+        reasons.append("maker_current_profit_factor_below_1_05")
+    if _metric_float(row.get("max_drawdown_pct")) > float(settings.max_research_drawdown_pct):
+        reasons.append("max_drawdown_above_research_limit")
+    if not bool(row.get("beats_buy_hold_risk_adjusted")):
+        reasons.append("does_not_beat_buy_and_hold_risk_adjusted")
+    if not bool(row.get("beats_dca_daily_risk_adjusted")):
+        reasons.append("does_not_beat_dca_risk_adjusted")
+    if bool(row.get("statistically_weak")):
+        reasons.append("statistically_weak")
+    if not bool(row.get("profit_factor_reliable")):
+        reasons.append("profit_factor_not_reliable")
+    if not bool(row.get("post_only_required")):
+        reasons.append("post_only_required_not_true")
+    if not bool(row.get("no_market_fallback_required")):
+        reasons.append("no_market_fallback_required_not_true")
+    if not bool(row.get("unfilled_cancel_required")):
+        reasons.append("unfilled_cancel_required_not_true")
+    return list(dict.fromkeys(reasons))
+
+
+def volatility_focus_candidate_gate_explanation(settings: Settings) -> dict[str, Any]:
+    return {
+        "strict_research_promising": (
+            "Existing strict/current-taker research gates; keeps MAX_BACKTEST_DRAWDOWN_PCT unchanged."
+        ),
+        "maker_only_research_candidate": (
+            "Maker-only research classification using MAX_RESEARCH_DRAWDOWN_PCT only; not a promotion, "
+            "not paper-forward eligibility, and not live tradability."
+        ),
+        "maker_only_paper_forward_candidate": (
+            "Research candidate plus paper-forward drawdown and maker execution diagnostics; still requires "
+            "post-only maker fill validation and explicit user approval."
+        ),
+        "strict_paper_forward_eligible": (
+            "Existing strict paper-forward eligibility controlled by MAX_BACKTEST_DRAWDOWN_PCT and active model checks."
+        ),
+        "live_tradable": "Always false for Volatility Focus research output.",
+        "max_backtest_drawdown_pct": float(settings.max_backtest_drawdown_pct),
+        "max_research_drawdown_pct": float(settings.max_research_drawdown_pct),
+        "max_paper_forward_drawdown_pct": float(settings.max_paper_forward_drawdown_pct),
+    }
+
+
 def volatility_focus_trade_diagnostics(
     trades: pd.DataFrame,
     signal_frame: pd.DataFrame,
@@ -4314,6 +4458,8 @@ def build_volatility_focus_summary(
     rejections_path: Path,
     trade_audit_paths: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    for row in rows:
+        row.update(volatility_focus_candidate_status_fields(row, settings))
     v9_mode = _volatility_focus_v9_mode(rows)
     rank_key = _maker_rank_sort_key if v9_mode else _rank_sort_key
     ranked = sorted(rows, key=rank_key, reverse=True)
@@ -4347,6 +4493,15 @@ def build_volatility_focus_summary(
     research_promising_rows = [row for row in eligible_rows if row.get("research_promising")]
     economically_viable_rows = [row for row in eligible_rows if row.get("economically_viable")]
     paper_forward_rows = [row for row in eligible_rows if row.get("paper_forward_eligible")]
+    strict_research_promising_rows = [row for row in eligible_rows if row.get("strict_research_promising")]
+    maker_only_research_candidate_rows = [
+        row for row in eligible_rows if row.get("maker_only_research_candidate")
+    ]
+    maker_only_paper_forward_candidate_rows = [
+        row for row in eligible_rows if row.get("maker_only_paper_forward_candidate")
+    ]
+    strict_paper_forward_rows = [row for row in eligible_rows if row.get("strict_paper_forward_eligible")]
+    live_tradable_rows = [row for row in eligible_rows if row.get("live_tradable")]
     all_track_a_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_A]
     all_track_b_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_B]
     all_track_m_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_M]
@@ -4397,6 +4552,13 @@ def build_volatility_focus_summary(
         for row in v9_twenty_plus_rows
         if _metric_float(row.get("max_drawdown_pct")) <= float(settings.max_backtest_drawdown_pct)
     ]
+    best_maker_only_research_candidate = best_maker_ranked_config(maker_only_research_candidate_rows)
+    best_maker_only_paper_forward_candidate = best_maker_ranked_config(maker_only_paper_forward_candidate_rows)
+    summary_reference_candidate = (
+        best_maker_only_research_candidate
+        or best_maker_only_paper_forward_candidate
+        or best_maker_ranked_config(v9_twenty_plus_rows)
+    )
     diagnosis = volatility_focus_diagnosis(ranked, research_result_valid=research_result_valid)
     v7_failure = volatility_focus_v7_failure_analysis(eligible_rows if research_result_valid else ranked)
     v8_blockers = {
@@ -4445,6 +4607,9 @@ def build_volatility_focus_summary(
         "baselines": base_summary.get("baselines") or build_baselines_by_timeframe(bars_by_timeframe, settings),
         "cost_scenarios_tested": list(COST_SCENARIOS),
         "configs_tested": len(ranked),
+        "max_backtest_drawdown_pct": float(settings.max_backtest_drawdown_pct),
+        "max_research_drawdown_pct": float(settings.max_research_drawdown_pct),
+        "max_paper_forward_drawdown_pct": float(settings.max_paper_forward_drawdown_pct),
         "max_focused_configs": int(max_focused_configs),
         "min_focused_trades": int(min_focused_trades),
         "target_focused_trades": int(target_focused_trades),
@@ -4457,12 +4622,17 @@ def build_volatility_focus_summary(
         "profitable_zero_cost_configs": len(zero_profitable),
         "walk_forward_passed_count": len(walk_forward_rows),
         "research_promising_count": len(research_promising_rows),
+        "strict_research_promising_count": len(strict_research_promising_rows),
         "current_taker_research_promising_count": len(research_promising_rows),
         "maker_research_promising_count": len(maker_research_promising_rows),
         "economically_viable_count": len(economically_viable_rows),
         "maker_economically_viable_count": len(maker_economically_viable_rows),
         "maker_only_candidate_count": len(maker_only_rows),
+        "maker_only_research_candidate_count": len(maker_only_research_candidate_rows),
+        "maker_only_paper_forward_candidate_count": len(maker_only_paper_forward_candidate_rows),
         "paper_forward_eligible_count": len(paper_forward_rows),
+        "strict_paper_forward_eligible_count": len(strict_paper_forward_rows),
+        "live_tradable_count": len(live_tradable_rows),
         "best_current_cost_config": best_config_for_cost_scenario(eligible_rows, "current_taker"),
         "best_current_taker_candidate": best_config_for_cost_scenario(eligible_rows, "current_taker"),
         "best_low_cost_config": best_config_for_cost_scenario(eligible_rows, "maker_low_slippage"),
@@ -4473,6 +4643,8 @@ def build_volatility_focus_summary(
         "best_maker_candidate": best_maker_ranked_config(track_m_rows or eligible_rows),
         "best_maker_candidate_with_20_plus_trades": best_maker_ranked_config(maker_twenty_plus_rows),
         "best_maker_walk_forward_candidate": best_maker_ranked_config(maker_walk_forward_rows),
+        "best_maker_only_research_candidate": best_maker_only_research_candidate,
+        "best_maker_only_paper_forward_candidate": best_maker_only_paper_forward_candidate,
         "best_v9_maker_candidate": best_maker_ranked_config(v9_twenty_plus_rows),
         "best_v9_drawdown_reduced_candidate": best_maker_ranked_config(v9_drawdown_reduced_rows),
         "best_taker_swing_candidate": best_ranked_config(track_t_rows or all_track_t_rows),
@@ -4502,6 +4674,23 @@ def build_volatility_focus_summary(
         "terminal_line_failed": v9_terminal["terminal_line_failed"],
         "terminal_recommendation": v9_terminal["terminal_recommendation"],
         "exact_blockers": v9_terminal["exact_blockers"],
+        "candidate_gate_explanation": volatility_focus_candidate_gate_explanation(settings),
+        "why_not_live_tradable": (
+            summary_reference_candidate.get("why_not_live_tradable") if summary_reference_candidate else [
+                "no_maker_only_research_candidate"
+            ]
+        ),
+        "why_not_strict_paper_forward_eligible": (
+            summary_reference_candidate.get("why_not_strict_paper_forward_eligible") if summary_reference_candidate else [
+                "no_maker_only_research_candidate"
+            ]
+        ),
+        "next_required_validation": (
+            summary_reference_candidate.get("next_required_validation") if summary_reference_candidate else [
+                "rerun_on_fresh_real_non_synthetic_data",
+                "resolve_maker_only_research_candidate_blockers",
+            ]
+        ),
         "top_configs": ranked[:10],
         "rejection_reason_counts": {
             "research": rejection_reason_counts_for_field(ranked, "research_rejection_reasons"),
@@ -4598,11 +4787,17 @@ def write_volatility_focus_outputs(
         "beats_dca_daily_risk_adjusted",
         "cost_sensitivity_classification",
         "research_promising",
+        "strict_research_promising",
         "economically_viable",
         "maker_research_promising",
         "maker_economically_viable",
         "maker_only_candidate",
+        "maker_only_research_candidate",
+        "maker_only_paper_forward_candidate",
         "paper_forward_eligible",
+        "strict_paper_forward_eligible",
+        "live_tradable",
+        "requires_post_only_paper_forward_validation",
         "estimated_fill_rate_required_to_remain_profitable",
         "maker_vs_taker_net_gap",
         "max_allowed_taker_fallback_rate_before_net_negative",
@@ -4613,8 +4808,13 @@ def write_volatility_focus_outputs(
         "unfilled_cancel_required",
         "research_rejection_reasons",
         "maker_rejection_reasons",
+        "maker_only_research_rejection_reasons",
+        "maker_only_paper_forward_rejection_reasons",
         "paper_forward_rejection_reasons",
         "training_rejection_reasons",
+        "why_not_live_tradable",
+        "why_not_strict_paper_forward_eligible",
+        "next_required_validation",
         "adjusted_rank_score",
     ]
     with top_configs_csv_path.open("w", encoding="utf-8", newline="") as handle:
@@ -4646,8 +4846,14 @@ def write_volatility_focus_outputs(
                 "maker_research_promising": row.get("maker_research_promising"),
                 "maker_economically_viable": row.get("maker_economically_viable"),
                 "maker_only_candidate": row.get("maker_only_candidate"),
+                "maker_only_research_candidate": row.get("maker_only_research_candidate"),
+                "maker_only_paper_forward_candidate": row.get("maker_only_paper_forward_candidate"),
+                "strict_paper_forward_eligible": row.get("strict_paper_forward_eligible"),
+                "live_tradable": row.get("live_tradable"),
                 "research_rejection_reasons": row.get("research_rejection_reasons"),
                 "maker_rejection_reasons": row.get("maker_rejection_reasons"),
+                "maker_only_research_rejection_reasons": row.get("maker_only_research_rejection_reasons"),
+                "maker_only_paper_forward_rejection_reasons": row.get("maker_only_paper_forward_rejection_reasons"),
                 "paper_forward_rejection_reasons": row.get("paper_forward_rejection_reasons"),
                 "training_rejection_reasons": row.get("training_rejection_reasons"),
             }
@@ -5022,7 +5228,7 @@ def volatility_focus_v9_terminal_state(
             "terminal_recommendation": None,
             "exact_blockers": {},
         }
-    passed = [row for row in rows if bool(row.get("maker_research_promising"))]
+    passed = [row for row in rows if bool(row.get("maker_only_research_candidate"))]
     exact_blockers = volatility_focus_v9_exact_blockers(
         rows,
         settings,
@@ -5079,11 +5285,13 @@ def volatility_focus_v9_exact_blockers(
             row
             for row in rows
             if int(row.get("number_of_trades", 0) or 0) >= MIN_RESEARCH_TRADES
-            and _metric_float(row.get("max_drawdown_pct")) <= float(settings.max_backtest_drawdown_pct)
+            and _metric_float(row.get("max_drawdown_pct")) <= float(settings.max_research_drawdown_pct)
         ]
     )
     return {
-        "configured_drawdown_limit_pct": float(settings.max_backtest_drawdown_pct),
+        "configured_drawdown_limit_pct": float(settings.max_research_drawdown_pct),
+        "strict_backtest_drawdown_limit_pct": float(settings.max_backtest_drawdown_pct),
+        "paper_forward_drawdown_limit_pct": float(settings.max_paper_forward_drawdown_pct),
         "required_min_trades": MIN_RESEARCH_TRADES,
         "required_profit_factor": MIN_RESEARCH_PROFIT_FACTOR_NET,
         "required_folds_with_min_trades": 4,
@@ -5127,7 +5335,7 @@ def volatility_focus_v9_blockers_for_row(
     fold_count = int(row.get("fold_count", 4) or 4)
     folds_with_min_trades = int(row.get("folds_with_min_trades_count", 0) or 0)
     max_drawdown = _metric_float(row.get("max_drawdown_pct"))
-    if max_drawdown > float(settings.max_backtest_drawdown_pct):
+    if max_drawdown > float(settings.max_research_drawdown_pct):
         blockers.append("max_drawdown_above_configured_limit")
     if maker_net <= 0:
         blockers.append("maker_current_net_return_not_positive")
@@ -5162,6 +5370,8 @@ def volatility_focus_v9_blockers_for_row(
 
 
 def _volatility_focus_v9_terminal_blocker_from_reason(reason: str) -> str | None:
+    if reason == "max_drawdown_above_configured_limit":
+        return None
     if reason in VOLATILITY_FOCUS_V9_TERMINAL_BLOCKERS:
         return reason
     if reason == "folds_with_min_trades_not_all_4":
@@ -5196,14 +5406,13 @@ def _maker_rank_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
     folds_with_min_trades = int(row.get("folds_with_min_trades_count", 0) or 0)
     concentration = _metric_float(row.get("single_trade_return_concentration"))
     drawdown = _metric_float(row.get("max_drawdown_pct"))
-    maker_reasons = set(_semicolon_values(row.get("maker_rejection_reasons")))
     return (
+        bool(row.get("maker_only_research_candidate", row.get("maker_research_promising"))),
         maker_net > 0,
         maker_pf >= MIN_RESEARCH_PROFIT_FACTOR_NET,
         trades >= MIN_RESEARCH_TRADES,
         bool(row.get("walk_forward_passed")),
         folds_with_min_trades >= min(4, fold_count),
-        "max_drawdown_above_configured_limit" not in maker_reasons,
         bool(row.get("beats_buy_hold_risk_adjusted")),
         bool(row.get("beats_dca_daily_risk_adjusted")),
         -concentration,
@@ -6794,13 +7003,19 @@ def _csv_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
         "worst_fold_net_return_pct",
         "median_fold_net_return_pct",
         "research_promising",
+        "strict_research_promising",
         "maker_research_promising",
         "maker_economically_viable",
         "maker_only_candidate",
+        "maker_only_research_candidate",
+        "maker_only_paper_forward_candidate",
         "fallback_prediction_used",
         "active_model_valid",
         "economically_viable",
         "paper_forward_eligible",
+        "strict_paper_forward_eligible",
+        "live_tradable",
+        "requires_post_only_paper_forward_validation",
         "estimated_fill_rate_required_to_remain_profitable",
         "maker_vs_taker_net_gap",
         "max_allowed_taker_fallback_rate_before_net_negative",
@@ -6811,6 +7026,8 @@ def _csv_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
         "unfilled_cancel_required",
         "rejection_reasons",
         "maker_rejection_reasons",
+        "maker_only_research_rejection_reasons",
+        "maker_only_paper_forward_rejection_reasons",
         "rank_score",
     ]
     extras = sorted({key for row in rows for key in row} - set(preferred))

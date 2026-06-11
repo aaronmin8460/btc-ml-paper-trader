@@ -1068,6 +1068,186 @@ def test_volatility_focus_v9_terminal_recommends_abandon_when_no_maker_gate_pass
     assert summary["exact_blockers"]["best_v9_maker_candidate_blockers"] == ["max_drawdown_above_configured_limit"]
 
 
+def test_volatility_focus_gate_split_allows_research_candidate_without_strict_eligibility(tmp_path):
+    settings = research_settings(
+        _settings(
+            max_backtest_drawdown_pct=0.01,
+            max_research_drawdown_pct=0.10,
+            max_paper_forward_drawdown_pct=0.10,
+        )
+    )
+    config = _volatility_breakout_config(
+        parameter_set_id="v9m_00021",
+        track_id=VOLATILITY_FOCUS_TRACK_M9,
+        timeframe="1H",
+        take_profit_pct=0.045,
+        stop_loss_pct=0.02,
+        max_hold_bars=48,
+        breakout_lookback=20,
+        consolidation_lookback=12,
+        min_body_vs_avg=1.2,
+        min_recent_return_pct=0.003,
+        min_trend_strength=0.0,
+        max_atr_expansion=3.0,
+        min_volume_zscore=0.25,
+    )
+    metrics = _passing_metrics(number_of_trades=21, max_drawdown_pct=0.0998975)
+    cost_summary = {
+        "net_return_by_cost_scenario": {
+            "current_taker": -0.01,
+            "maker_current": 0.04218,
+            "maker_low_slippage": 0.05058,
+            "zero_cost_sanity": 0.12639,
+        },
+        "profit_factor_by_cost_scenario": {
+            "current_taker": 0.94,
+            "maker_current": 1.2335,
+            "maker_low_slippage": 1.2870,
+            "zero_cost_sanity": 1.76,
+        },
+    }
+    source_report = ResearchDataReport(
+        timeframe="1H",
+        source_used="collected_market_data_derived_from_15min",
+        latest_timestamp="2026-06-07T09:00:00+00:00",
+        data_age_minutes=0.0,
+        row_count=3998,
+        synthetic_data_used=False,
+        research_result_valid=True,
+    )
+    baseline = {
+        "beats_buy_hold_risk_adjusted": True,
+        "beats_dca_daily_risk_adjusted": True,
+    }
+    walk_forward = {
+        "fold_count": 4,
+        "walk_forward_passed": True,
+        "folds_profitable_count": 3,
+        "folds_with_min_trades_count": 4,
+        "per_fold_number_of_trades": [5, 5, 6, 5],
+        "per_fold_net_return_pct": [0.02, 0.01, -0.02, 0.015],
+        "per_fold_profit_factor_net": [1.4, 1.2, 0.8, 1.3],
+        "worst_fold_net_return_pct": -0.02,
+        "median_fold_net_return_pct": 0.0125,
+    }
+
+    strict_maker_gate = volatility_focus_maker_research_gate(
+        metrics,
+        settings,
+        config,
+        cost_summary=cost_summary,
+        source_report=source_report,
+        synthetic_data_used=False,
+        research_result_valid=True,
+        baseline_comparison=baseline,
+        walk_forward=walk_forward,
+        min_focused_trades=20,
+    )
+
+    assert settings.max_backtest_drawdown_pct == 0.01
+    assert strict_maker_gate["maker_research_promising"] is False
+    assert "max_drawdown_above_configured_limit" in strict_maker_gate["maker_rejection_reasons"]
+
+    row = {
+        "parameter_set_id": "v9m_00021",
+        "track_id": VOLATILITY_FOCUS_TRACK_M9,
+        "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+        "timeframe": "1H",
+        "exit_mode": "fixed_tp_sl_timeout",
+        "take_profit_pct": 0.045,
+        "stop_loss_pct": 0.02,
+        "max_hold_bars": 48,
+        "breakout_lookback": 20,
+        "consolidation_lookback": 12,
+        "min_body_vs_avg": 1.2,
+        "min_recent_return_pct": 0.003,
+        "min_trend_strength": 0.0,
+        "min_volume_zscore": 0.25,
+        "max_atr_expansion": 3.0,
+        "number_of_trades": 21,
+        "gross_return_pct": 0.12639,
+        "net_return_pct": -0.01,
+        "profit_factor_net": 0.94,
+        "max_drawdown_pct": 0.0998975,
+        "win_rate_net": 0.52,
+        "expectancy": 0.001,
+        **walk_forward,
+        "net_return_by_cost_scenario": cost_summary["net_return_by_cost_scenario"],
+        "profit_factor_by_cost_scenario": cost_summary["profit_factor_by_cost_scenario"],
+        "current_taker_net_return_pct": -0.01,
+        "maker_current_net_return_pct": 0.04218,
+        "maker_low_slippage_net_return_pct": 0.05058,
+        "zero_cost_net_return_pct": 0.12639,
+        "current_taker_profit_factor": 0.94,
+        "maker_current_profit_factor": 1.2335,
+        "maker_low_slippage_profit_factor": 1.2870,
+        "zero_cost_profit_factor": 1.76,
+        "single_trade_return_concentration": 0.35,
+        "statistically_weak": False,
+        "profit_factor_reliable": True,
+        "beats_buy_hold_risk_adjusted": True,
+        "beats_dca_daily_risk_adjusted": True,
+        "research_promising": False,
+        "economically_viable": False,
+        "maker_research_promising": False,
+        "maker_economically_viable": False,
+        "maker_only_candidate": False,
+        "paper_forward_eligible": False,
+        "estimated_fill_rate_required_to_remain_profitable": 0.2,
+        "maker_vs_taker_net_gap": 0.05218,
+        "max_allowed_taker_fallback_rate_before_net_negative": 0.8,
+        "no_market_fallback_required": True,
+        "post_only_required": True,
+        "unfilled_cancel_required": True,
+        "source_used": "collected_market_data_derived_from_15min",
+        "synthetic_data_used": False,
+        "research_result_valid": True,
+        "research_rejection_reasons": "current_taker_net_return_not_positive;max_drawdown_above_configured_limit",
+        "maker_rejection_reasons": "max_drawdown_above_configured_limit",
+        "paper_forward_rejection_reasons": "current_taker_net_return_not_positive;max_drawdown_above_configured_limit",
+        "training_rejection_reasons": "training_deferred_volatility_focus_no_ml_yet",
+        "adjusted_rank_score": 10.0,
+    }
+
+    summary = build_volatility_focus_summary(
+        [row],
+        settings,
+        base_summary={
+            "synthetic_data_used": False,
+            "research_result_valid": True,
+            "timeframes": ["1H"],
+            "baselines": {},
+        },
+        data_source_reports={"1H": source_report},
+        bars_by_timeframe={"1H": _bars(latest=datetime(2026, 6, 7, 9, 0, tzinfo=UTC), count=40, step_minutes=60)},
+        min_focused_trades=20,
+        target_focused_trades=50,
+        max_focused_configs=3000,
+        focused_summary_path=tmp_path / "volatility_focus_gate_split_summary.json",
+        top_configs_csv_path=tmp_path / "volatility_focus_gate_split_top_configs.csv",
+        rejections_path=tmp_path / "volatility_focus_gate_split_rejections.json",
+        trade_audit_paths=[],
+    )
+
+    assert summary["max_backtest_drawdown_pct"] == 0.01
+    assert summary["max_research_drawdown_pct"] == 0.10
+    assert summary["max_paper_forward_drawdown_pct"] == 0.10
+    assert summary["maker_only_research_candidate_count"] == 1
+    assert summary["maker_only_paper_forward_candidate_count"] == 1
+    assert summary["strict_paper_forward_eligible_count"] == 0
+    assert summary["live_tradable_count"] == 0
+    assert summary["best_maker_only_research_candidate"]["parameter_set_id"] == "v9m_00021"
+    assert summary["best_maker_only_research_candidate"]["maker_only_research_candidate"] is True
+    assert summary["best_maker_only_research_candidate"]["strict_paper_forward_eligible"] is False
+    assert summary["best_maker_only_research_candidate"]["live_tradable"] is False
+    assert summary["fallback_trading_allowed"] is False
+    assert "market_taker_execution_not_safe_for_maker_only_candidate" in summary["why_not_live_tradable"]
+    assert "post_only_maker_fill_simulation" in summary["next_required_validation"]
+    assert "paper_forward_validation_with_no_market_fallback" in summary["next_required_validation"]
+    assert summary["terminal_line_failed"] is False
+    assert summary["terminal_recommendation"] == "maker_only_research_candidate_found_but_not_live_tradable"
+
+
 def _buy_the_dip_config(**overrides) -> ResearchConfig:
     values = {
         "parameter_set_id": "btd_test",

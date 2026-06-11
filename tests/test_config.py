@@ -150,6 +150,8 @@ def test_scalping_settings_load_conservative_defaults():
     assert settings.require_account_data_for_trading is False
     assert settings.min_backtest_net_return_pct == 0.001
     assert settings.max_backtest_drawdown_pct == 0.01
+    assert settings.max_research_drawdown_pct == 0.10
+    assert settings.max_paper_forward_drawdown_pct == 0.10
     assert settings.min_backtest_profit_factor == 1.2
     assert settings.min_backtest_trades == 30
     assert settings.max_backtest_ambiguous_candle_ratio == 0.10
