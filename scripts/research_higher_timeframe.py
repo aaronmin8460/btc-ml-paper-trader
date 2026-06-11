@@ -105,18 +105,36 @@ VOLATILITY_FOCUS_MIN_VOLUME_ZSCORE_VALUES = (-0.25, 0.0, 0.25, 0.5, 0.75, 1.0)
 VOLATILITY_FOCUS_MAX_ATR_EXPANSION_VALUES = (1.8, 2.2, 2.6, 3.0, 3.5)
 VOLATILITY_FOCUS_V7_MIN_CONFIGS = 4000
 VOLATILITY_FOCUS_V7_BASE_CONFIGS = 1000
+VOLATILITY_FOCUS_V8_MIN_CONFIGS = 5000
 VOLATILITY_FOCUS_TRACK_A = "A_vff_vbo_00808_expansion"
 VOLATILITY_FOCUS_TRACK_B = "B_vff_vbo_00001_exit_fix"
+VOLATILITY_FOCUS_TRACK_M = "M_vff_vbo_00001_maker_only"
+VOLATILITY_FOCUS_TRACK_T = "T_taker_survival_swing_breakout"
 EXIT_MODE_FIXED = "fixed_tp_sl_timeout"
 EXIT_MODE_BREAK_EVEN_1R = "break_even_stop_after_1r"
 EXIT_MODE_TRAILING_1R = "trailing_stop_after_1r"
 EXIT_MODE_MFE_PROTECT_1R_50 = "mfe_protection_1r_50"
 EXIT_MODE_TIME_STOP_MOMENTUM_WEAK = "time_stop_momentum_weak"
+EXIT_MODE_BREAK_EVEN_AFTER_1R = "break_even_after_1r"
+EXIT_MODE_TRAILING_AFTER_1R = "trailing_after_1r"
+EXIT_MODE_MFE_PROTECTION_EXIT = "mfe_protection_exit"
 VOLATILITY_FOCUS_V7_EXIT_MODES = (
     EXIT_MODE_FIXED,
     EXIT_MODE_BREAK_EVEN_1R,
     EXIT_MODE_TRAILING_1R,
     EXIT_MODE_MFE_PROTECT_1R_50,
+    EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+)
+VOLATILITY_FOCUS_V8_MAKER_EXIT_MODES = (
+    EXIT_MODE_FIXED,
+    EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+    EXIT_MODE_MFE_PROTECTION_EXIT,
+)
+VOLATILITY_FOCUS_V8_TAKER_EXIT_MODES = (
+    EXIT_MODE_FIXED,
+    EXIT_MODE_BREAK_EVEN_AFTER_1R,
+    EXIT_MODE_TRAILING_AFTER_1R,
+    EXIT_MODE_MFE_PROTECTION_EXIT,
     EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
 )
 VOLATILITY_FOCUS_RECOMMENDATIONS = (
@@ -999,7 +1017,9 @@ def evaluate_research_configs(
                 research_promising = False
         concentration = single_trade_return_concentration(metrics.get("trade_details", []))
         focused_gate: dict[str, Any] = {}
+        maker_gate: dict[str, Any] = {}
         focused_diagnostics: dict[str, Any] = {}
+        maker_diagnostics: dict[str, Any] = {}
         if volatility_focus:
             focused_gate = volatility_focus_research_gate(
                 metrics,
@@ -1015,10 +1035,26 @@ def evaluate_research_configs(
                 active_model_valid=active_model_valid,
                 min_focused_trades=min_focused_trades,
             )
+            maker_gate = volatility_focus_maker_research_gate(
+                metrics,
+                settings,
+                config,
+                cost_summary=cost_summary,
+                source_report=source_report,
+                synthetic_data_used=synthetic_data_used,
+                research_result_valid=source_valid,
+                baseline_comparison=baseline_comparison,
+                walk_forward=walk_forward,
+                min_focused_trades=min_focused_trades,
+            )
+            maker_gate["maker_only_candidate"] = bool(maker_gate["maker_research_promising"]) and not bool(
+                focused_gate["research_promising"]
+            )
             economically_viable = bool(focused_gate["economically_viable"])
             research_promising = bool(focused_gate["research_promising"])
             paper_forward_eligible = bool(focused_gate["paper_forward_eligible"])
             rejection_reasons = list(focused_gate["paper_forward_rejection_reasons"])
+            maker_diagnostics = volatility_focus_maker_execution_diagnostics(settings, cost_summary)
             focused_diagnostics = volatility_focus_trade_diagnostics(
                 trades,
                 signal_frame,
@@ -1123,6 +1159,18 @@ def evaluate_research_configs(
                 "zero_cost_net_return_pct": _metric_float(
                     (cost_summary.get("net_return_by_cost_scenario") or {}).get("zero_cost_sanity")
                 ),
+                "current_taker_profit_factor": _profit_factor_value(
+                    (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("current_taker")
+                ),
+                "maker_current_profit_factor": _profit_factor_value(
+                    (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("maker_current")
+                ),
+                "maker_low_slippage_profit_factor": _profit_factor_value(
+                    (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("maker_low_slippage")
+                ),
+                "zero_cost_profit_factor": _profit_factor_value(
+                    (cost_summary.get("profit_factor_by_cost_scenario") or {}).get("zero_cost_sanity")
+                ),
                 "statistically_weak": rank_details["statistically_weak"],
                 "trade_count_score": rank_details["trade_count_score"],
                 "concentration_penalty": rank_details["concentration_penalty"],
@@ -1157,11 +1205,18 @@ def evaluate_research_configs(
                     dict.fromkeys(focused_gate.get("training_rejection_reasons", []))
                 ),
                 "training_eligible": bool(focused_gate.get("training_eligible", False)),
+                "maker_research_promising": bool(maker_gate.get("maker_research_promising", False)),
+                "maker_economically_viable": bool(maker_gate.get("maker_economically_viable", False)),
+                "maker_only_candidate": bool(maker_gate.get("maker_only_candidate", False)),
+                "maker_rejection_reasons": ";".join(
+                    dict.fromkeys(maker_gate.get("maker_rejection_reasons", []))
+                ),
                 "volatility_focus": volatility_focus,
                 "rank_score": rank_details["raw_rank_score"],
                 **baseline_comparison,
                 **cost_summary,
                 **focused_diagnostics,
+                **maker_diagnostics,
                 **filtered_hold,
             }
         )
@@ -1733,7 +1788,9 @@ def generate_volatility_focus_configs(
             }
         )
 
-    if _volatility_focus_v7_enabled(max_configs, requested_timeframes):
+    if _volatility_focus_v8_enabled(max_configs, requested_timeframes):
+        raw_specs = generate_volatility_focus_v8_targeted_specs(max_specs=int(max_configs))
+    elif _volatility_focus_v7_enabled(max_configs, requested_timeframes):
         base_budget = min(VOLATILITY_FOCUS_V7_BASE_CONFIGS, max(0, int(max_configs) // 4))
         targeted_budget = max(0, int(max_configs) - base_budget)
         raw_specs = generate_volatility_focus_v7_targeted_specs(max_specs=targeted_budget)
@@ -1755,6 +1812,10 @@ def generate_volatility_focus_configs(
 
 def _volatility_focus_v7_enabled(max_configs: int, requested_timeframes: tuple[str, ...]) -> bool:
     return int(max_configs) >= VOLATILITY_FOCUS_V7_MIN_CONFIGS and requested_timeframes == ("1H",)
+
+
+def _volatility_focus_v8_enabled(max_configs: int, requested_timeframes: tuple[str, ...]) -> bool:
+    return int(max_configs) >= VOLATILITY_FOCUS_V8_MIN_CONFIGS and requested_timeframes == ("1H",)
 
 
 def _sample_volatility_focus_specs(
@@ -1859,11 +1920,54 @@ def generate_volatility_focus_v7_targeted_specs(*, max_specs: int) -> list[dict[
     return track_a + track_b
 
 
+def generate_volatility_focus_v8_targeted_specs(*, max_specs: int) -> list[dict[str, Any]]:
+    if max_specs <= 0:
+        return []
+    track_m_budget = int(max_specs) // 2
+    track_m = _sample_volatility_focus_v7_track_specs(
+        track_id=VOLATILITY_FOCUS_TRACK_M,
+        desired=track_m_budget,
+        parameter_prefix="v8m",
+        exit_modes=VOLATILITY_FOCUS_V8_MAKER_EXIT_MODES,
+        quality_profiles=(_volatility_focus_v7_quality_profiles()[0],),
+        take_profit_values=(0.045, 0.05, 0.055, 0.06, 0.065),
+        stop_loss_values=(0.02, 0.018, 0.022, 0.025),
+        max_hold_values=(48, 60, 72, 96),
+        breakout_values=(20, 16, 24),
+        consolidation_values=(12, 8, 16),
+        body_values=(0.8, 1.0, 1.2),
+        recent_values=(0.003, 0.002, 0.004),
+        trend_values=(0.0, 0.03, 0.05),
+        atr_values=(2.2, 2.6, 3.0),
+        volume_values=(0.25, 0.0, 0.5),
+    )
+    track_t = _sample_volatility_focus_v7_track_specs(
+        track_id=VOLATILITY_FOCUS_TRACK_T,
+        desired=max(0, int(max_specs) - len(track_m)),
+        parameter_prefix="v8t",
+        exit_modes=VOLATILITY_FOCUS_V8_TAKER_EXIT_MODES,
+        quality_profiles=(_volatility_focus_v7_quality_profiles()[0],),
+        take_profit_values=(0.07, 0.08, 0.09, 0.10, 0.12),
+        stop_loss_values=(0.018, 0.02, 0.025, 0.03),
+        max_hold_values=(96, 120, 144, 168),
+        breakout_values=(16, 20, 24, 36),
+        consolidation_values=(12, 16, 20, 24),
+        body_values=(0.8, 1.0, 1.2),
+        recent_values=(0.002, 0.003, 0.004, 0.006),
+        trend_values=(0.0, 0.03, 0.05),
+        atr_values=(2.2, 2.6, 3.0, 3.5),
+        volume_values=(0.0, 0.25, 0.5),
+    )
+    return track_m + track_t
+
+
 def _sample_volatility_focus_v7_track_specs(
     *,
     track_id: str,
     desired: int,
     parameter_prefix: str,
+    exit_modes: tuple[str, ...] = VOLATILITY_FOCUS_V7_EXIT_MODES,
+    quality_profiles: tuple[dict[str, Any], ...] | None = None,
     take_profit_values: tuple[float, ...],
     stop_loss_values: tuple[float, ...],
     max_hold_values: tuple[int, ...],
@@ -1877,8 +1981,9 @@ def _sample_volatility_focus_v7_track_specs(
 ) -> list[dict[str, Any]]:
     if desired <= 0:
         return []
+    quality_profiles = quality_profiles or _volatility_focus_v7_quality_profiles()
     dimensions = (
-        VOLATILITY_FOCUS_V7_EXIT_MODES,
+        exit_modes,
         take_profit_values,
         stop_loss_values,
         max_hold_values,
@@ -1889,10 +1994,10 @@ def _sample_volatility_focus_v7_track_specs(
         trend_values,
         atr_values,
         volume_values,
-        _volatility_focus_v7_quality_profiles(),
+        quality_profiles,
     )
     total = math.prod(len(dimension) for dimension in dimensions)
-    sampled_indexes = _evenly_spaced_indexes(total, max(1, int(desired) - len(VOLATILITY_FOCUS_V7_EXIT_MODES)))
+    sampled_indexes = _evenly_spaced_indexes(total, max(1, int(desired) - len(exit_modes)))
     specs: list[dict[str, Any]] = []
     seen: set[tuple[tuple[str, Any], ...]] = set()
     anchor_values = (
@@ -1906,9 +2011,9 @@ def _sample_volatility_focus_v7_track_specs(
         trend_values[0],
         atr_values[0],
         volume_values[0],
-        _volatility_focus_v7_quality_profiles()[0],
+        quality_profiles[0],
     )
-    for exit_mode in VOLATILITY_FOCUS_V7_EXIT_MODES:
+    for exit_mode in exit_modes:
         _append_volatility_focus_v7_track_spec(
             specs,
             seen,
@@ -2887,7 +2992,7 @@ def resolve_research_exit(features: pd.DataFrame, entry_index: int, config: Rese
     initial_stop_loss_price = entry_close * (1 - config.stop_loss_pct)
     stop_loss_price = initial_stop_loss_price
     max_exit_index = min(len(features) - 1, entry_index + config.max_hold_bars)
-    exit_mode = config.exit_mode or EXIT_MODE_FIXED
+    exit_mode = _normalise_exit_mode(config.exit_mode or EXIT_MODE_FIXED)
     one_r_price = entry_close * (1 + config.stop_loss_pct)
     one_r_reached = False
     high_watermark = entry_close
@@ -2995,11 +3100,21 @@ def resolve_research_exit(features: pd.DataFrame, entry_index: int, config: Rese
 
 
 def _dynamic_stop_exit_reason(exit_mode: str) -> str:
+    exit_mode = _normalise_exit_mode(exit_mode)
     if exit_mode == EXIT_MODE_BREAK_EVEN_1R:
         return "research_break_even_stop"
     if exit_mode == EXIT_MODE_TRAILING_1R:
         return "research_trailing_stop"
     return "research_stop_loss"
+
+
+def _normalise_exit_mode(exit_mode: str) -> str:
+    aliases = {
+        EXIT_MODE_BREAK_EVEN_AFTER_1R: EXIT_MODE_BREAK_EVEN_1R,
+        EXIT_MODE_TRAILING_AFTER_1R: EXIT_MODE_TRAILING_1R,
+        EXIT_MODE_MFE_PROTECTION_EXIT: EXIT_MODE_MFE_PROTECT_1R_50,
+    }
+    return aliases.get(str(exit_mode), str(exit_mode))
 
 
 def _momentum_weak_for_time_stop(row: pd.Series) -> bool:
@@ -3534,6 +3649,89 @@ def volatility_focus_research_gate(
     }
 
 
+def volatility_focus_maker_research_gate(
+    metrics: dict[str, Any],
+    settings: Settings,
+    config: ResearchConfig,
+    *,
+    cost_summary: dict[str, Any],
+    source_report: ResearchDataReport | None,
+    synthetic_data_used: bool,
+    research_result_valid: bool,
+    baseline_comparison: dict[str, Any],
+    walk_forward: dict[str, Any],
+    min_focused_trades: int,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    if not research_result_valid:
+        reasons.append("research_data_source_invalid")
+    if synthetic_data_used:
+        reasons.append("synthetic_data_used")
+    if source_report is None or not _is_collected_market_data_source(source_report.source_used):
+        reasons.append("data_source_not_collected_market_data")
+    if settings.symbol != ALLOWED_SYMBOL:
+        reasons.append("symbol_not_btc_usd")
+    if config.timeframe != "1H":
+        reasons.append("timeframe_not_1h")
+    if config.strategy_name != VOLATILITY_BREAKOUT_STRATEGY:
+        reasons.append("strategy_not_volatility_breakout")
+
+    trade_count = int(metrics.get("number_of_trades", 0) or 0)
+    if trade_count < int(min_focused_trades):
+        reasons.append(f"number_of_trades_below_{int(min_focused_trades)}")
+    if int(walk_forward.get("folds_with_min_trades_count", 0) or 0) != int(walk_forward.get("fold_count", 4) or 4):
+        reasons.append("folds_with_min_trades_not_all_4")
+    if not bool(walk_forward.get("walk_forward_passed")):
+        reasons.append("walk_forward_not_passed")
+
+    maker_net = _metric_float((cost_summary.get("net_return_by_cost_scenario") or {}).get("maker_current"))
+    maker_pf = _profit_factor_value((cost_summary.get("profit_factor_by_cost_scenario") or {}).get("maker_current"))
+    if maker_net <= 0:
+        reasons.append("maker_current_net_return_not_positive")
+    if maker_pf < MIN_RESEARCH_PROFIT_FACTOR_NET:
+        reasons.append("maker_current_profit_factor_below_1_05")
+    if _metric_float(metrics.get("max_drawdown_pct")) > float(settings.max_backtest_drawdown_pct):
+        reasons.append("max_drawdown_above_configured_limit")
+    if not bool(baseline_comparison.get("beats_buy_hold_risk_adjusted")):
+        reasons.append("does_not_beat_buy_and_hold_risk_adjusted")
+    if not bool(baseline_comparison.get("beats_dca_daily_risk_adjusted")):
+        reasons.append("does_not_beat_dca_risk_adjusted")
+
+    reasons = list(dict.fromkeys(reasons))
+    maker_research_promising = not reasons
+    return {
+        "maker_research_promising": maker_research_promising,
+        "maker_economically_viable": maker_research_promising,
+        "maker_rejection_reasons": reasons,
+    }
+
+
+def volatility_focus_maker_execution_diagnostics(settings: Settings, cost_summary: dict[str, Any]) -> dict[str, Any]:
+    net_by_scenario = cost_summary.get("net_return_by_cost_scenario") or {}
+    maker_net = _metric_float(net_by_scenario.get("maker_current"))
+    taker_net = _metric_float(net_by_scenario.get("current_taker"))
+    maker_taker_gap = maker_net - taker_net
+    if maker_net > 0 and taker_net < 0 and maker_taker_gap > 0:
+        fill_rate_required = max(0.0, min(1.0, -taker_net / maker_taker_gap))
+        max_taker_fallback_rate = max(0.0, min(1.0, maker_net / maker_taker_gap))
+    elif maker_net > 0 and taker_net >= 0:
+        fill_rate_required = 0.0
+        max_taker_fallback_rate = 1.0
+    else:
+        fill_rate_required = 1.0
+        max_taker_fallback_rate = 0.0
+    return {
+        "estimated_fill_rate_required_to_remain_profitable": fill_rate_required,
+        "maker_vs_taker_net_gap": maker_taker_gap,
+        "max_allowed_taker_fallback_rate_before_net_negative": max_taker_fallback_rate,
+        "spread_bps_assumption": _metric_float(getattr(settings, "max_spread_bps", 0.0)),
+        "slippage_bps_assumption": _metric_float(getattr(settings, "slippage_bps", 0.0)),
+        "no_market_fallback_required": True,
+        "post_only_required": True,
+        "unfilled_cancel_required": True,
+    }
+
+
 def volatility_focus_trade_diagnostics(
     trades: pd.DataFrame,
     signal_frame: pd.DataFrame,
@@ -3985,8 +4183,19 @@ def build_volatility_focus_summary(
     paper_forward_rows = [row for row in eligible_rows if row.get("paper_forward_eligible")]
     all_track_a_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_A]
     all_track_b_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_B]
+    all_track_m_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_M]
+    all_track_t_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_T]
     track_a_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_A]
     track_b_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_B]
+    track_m_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_M]
+    track_t_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_T]
+    maker_research_promising_rows = [row for row in eligible_rows if row.get("maker_research_promising")]
+    maker_economically_viable_rows = [row for row in eligible_rows if row.get("maker_economically_viable")]
+    maker_only_rows = [row for row in eligible_rows if row.get("maker_only_candidate")]
+    maker_twenty_plus_rows = [
+        row for row in eligible_rows if int(row.get("number_of_trades", 0) or 0) >= MIN_RESEARCH_TRADES
+    ]
+    maker_walk_forward_rows = [row for row in maker_twenty_plus_rows if bool(row.get("walk_forward_passed"))]
     twenty_plus_current_positive = [
         row
         for row in eligible_rows
@@ -4006,6 +4215,16 @@ def build_volatility_focus_summary(
     ]
     diagnosis = volatility_focus_diagnosis(ranked, research_result_valid=research_result_valid)
     v7_failure = volatility_focus_v7_failure_analysis(eligible_rows if research_result_valid else ranked)
+    v8_blockers = {
+        "current_taker": volatility_focus_blocker_summary(
+            eligible_rows if research_result_valid else ranked,
+            "research_rejection_reasons",
+        ),
+        "maker": volatility_focus_blocker_summary(
+            eligible_rows if research_result_valid else ranked,
+            "maker_rejection_reasons",
+        ),
+    }
     recommendation = volatility_focus_recommendation(
         ranked,
         research_result_valid=research_result_valid,
@@ -4047,26 +4266,46 @@ def build_volatility_focus_summary(
         "profitable_zero_cost_configs": len(zero_profitable),
         "walk_forward_passed_count": len(walk_forward_rows),
         "research_promising_count": len(research_promising_rows),
+        "current_taker_research_promising_count": len(research_promising_rows),
+        "maker_research_promising_count": len(maker_research_promising_rows),
         "economically_viable_count": len(economically_viable_rows),
+        "maker_economically_viable_count": len(maker_economically_viable_rows),
+        "maker_only_candidate_count": len(maker_only_rows),
         "paper_forward_eligible_count": len(paper_forward_rows),
         "best_current_cost_config": best_config_for_cost_scenario(eligible_rows, "current_taker"),
+        "best_current_taker_candidate": best_config_for_cost_scenario(eligible_rows, "current_taker"),
         "best_low_cost_config": best_config_for_cost_scenario(eligible_rows, "maker_low_slippage"),
         "best_zero_cost_config": best_config_for_cost_scenario(eligible_rows, "zero_cost_sanity"),
         "best_walk_forward_config": best_ranked_config(walk_forward_rows),
         "candidate_a_best": best_ranked_config(track_a_rows or all_track_a_rows),
         "candidate_b_best": best_ranked_config(track_b_rows or all_track_b_rows),
+        "best_maker_candidate": best_maker_ranked_config(track_m_rows or eligible_rows),
+        "best_maker_candidate_with_20_plus_trades": best_maker_ranked_config(maker_twenty_plus_rows),
+        "best_maker_walk_forward_candidate": best_maker_ranked_config(maker_walk_forward_rows),
+        "best_taker_swing_candidate": best_ranked_config(track_t_rows or all_track_t_rows),
         "best_20_plus_current_cost_positive": best_ranked_config(twenty_plus_current_positive),
         "best_walk_forward_current_cost_positive": best_ranked_config(walk_forward_current_positive),
         "best_all_research_gates_passed": best_ranked_config(all_research_gates_passed),
+        "best_all_current_taker_research_gates_passed": best_ranked_config(all_research_gates_passed),
+        "best_all_maker_research_gates_passed": best_maker_ranked_config(maker_research_promising_rows),
         "any_config_passed_all_research_gates": bool(all_research_gates_passed),
+        "any_current_taker_config_passed_all_research_gates": bool(all_research_gates_passed),
+        "any_maker_only_config_passed_maker_research_gates": bool(maker_only_rows),
+        "any_maker_config_passed_maker_research_gates": bool(maker_research_promising_rows),
         "volatility_focus_v7_failure_analysis": v7_failure,
+        "volatility_focus_v8_blockers": v8_blockers,
         "volatility_focus_v7_track_counts": {
             VOLATILITY_FOCUS_TRACK_A: len(all_track_a_rows),
             VOLATILITY_FOCUS_TRACK_B: len(all_track_b_rows),
         },
+        "volatility_focus_v8_track_counts": {
+            VOLATILITY_FOCUS_TRACK_M: len(all_track_m_rows),
+            VOLATILITY_FOCUS_TRACK_T: len(all_track_t_rows),
+        },
         "top_configs": ranked[:10],
         "rejection_reason_counts": {
             "research": rejection_reason_counts_for_field(ranked, "research_rejection_reasons"),
+            "maker": rejection_reason_counts_for_field(ranked, "maker_rejection_reasons"),
             "paper_forward": rejection_reason_counts_for_field(ranked, "paper_forward_rejection_reasons"),
             "training": rejection_reason_counts_for_field(ranked, "training_rejection_reasons"),
             "combined": rejection_reason_counts(ranked),
@@ -4120,6 +4359,10 @@ def write_volatility_focus_outputs(
         "maker_current_net_return_pct",
         "maker_low_slippage_net_return_pct",
         "zero_cost_net_return_pct",
+        "current_taker_profit_factor",
+        "maker_current_profit_factor",
+        "maker_low_slippage_profit_factor",
+        "zero_cost_profit_factor",
         "net_return_pct",
         "profit_factor_net",
         "max_drawdown_pct",
@@ -4142,11 +4385,25 @@ def write_volatility_focus_outputs(
         "fold_by_fold_returns",
         "fold_by_fold_trade_counts",
         "fold_by_fold_profit_factor",
+        "beats_buy_hold_risk_adjusted",
+        "beats_dca_daily_risk_adjusted",
         "cost_sensitivity_classification",
         "research_promising",
         "economically_viable",
+        "maker_research_promising",
+        "maker_economically_viable",
+        "maker_only_candidate",
         "paper_forward_eligible",
+        "estimated_fill_rate_required_to_remain_profitable",
+        "maker_vs_taker_net_gap",
+        "max_allowed_taker_fallback_rate_before_net_negative",
+        "spread_bps_assumption",
+        "slippage_bps_assumption",
+        "no_market_fallback_required",
+        "post_only_required",
+        "unfilled_cancel_required",
         "research_rejection_reasons",
+        "maker_rejection_reasons",
         "paper_forward_rejection_reasons",
         "training_rejection_reasons",
         "adjusted_rank_score",
@@ -4172,13 +4429,22 @@ def write_volatility_focus_outputs(
                 "maker_current_net_return_pct": row.get("maker_current_net_return_pct"),
                 "maker_low_slippage_net_return_pct": row.get("maker_low_slippage_net_return_pct"),
                 "zero_cost_net_return_pct": row.get("zero_cost_net_return_pct"),
+                "current_taker_profit_factor": row.get("current_taker_profit_factor"),
+                "maker_current_profit_factor": row.get("maker_current_profit_factor"),
                 "net_return_pct": row.get("net_return_pct"),
+                "max_drawdown_pct": row.get("max_drawdown_pct"),
+                "walk_forward_passed": row.get("walk_forward_passed"),
+                "maker_research_promising": row.get("maker_research_promising"),
+                "maker_economically_viable": row.get("maker_economically_viable"),
+                "maker_only_candidate": row.get("maker_only_candidate"),
                 "research_rejection_reasons": row.get("research_rejection_reasons"),
+                "maker_rejection_reasons": row.get("maker_rejection_reasons"),
                 "paper_forward_rejection_reasons": row.get("paper_forward_rejection_reasons"),
                 "training_rejection_reasons": row.get("training_rejection_reasons"),
             }
             for row in ranked
             if row.get("research_rejection_reasons")
+            or row.get("maker_rejection_reasons")
             or row.get("paper_forward_rejection_reasons")
             or row.get("training_rejection_reasons")
         ][:250],
@@ -4510,6 +4776,12 @@ def best_ranked_config(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return max(rows, key=_rank_sort_key)
 
 
+def best_maker_ranked_config(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    return max(rows, key=_maker_rank_sort_key)
+
+
 def _rank_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
     return (
         bool(row.get("economically_viable")),
@@ -4519,6 +4791,35 @@ def _rank_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
         _metric_float(row.get("net_return_pct")),
         min(5.0, _profit_factor_value(row.get("profit_factor_net"))),
     )
+
+
+def _maker_rank_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        bool(row.get("maker_economically_viable")),
+        bool(row.get("maker_research_promising")),
+        bool(row.get("walk_forward_passed")),
+        int(row.get("folds_with_min_trades_count", 0) or 0),
+        _metric_float(row.get("maker_current_net_return_pct")),
+        min(5.0, _profit_factor_value(row.get("maker_current_profit_factor"))),
+        int(row.get("number_of_trades", 0) or 0),
+        _metric_float(row.get("zero_cost_net_return_pct")),
+    )
+
+
+def volatility_focus_blocker_summary(rows: list[dict[str, Any]], field: str) -> dict[str, Any]:
+    counts = rejection_reason_counts_for_field(rows, field)
+    if not counts:
+        return {
+            "primary_blocker": None,
+            "reason_counts": {},
+            "configs_blocked": 0,
+        }
+    primary, _ = max(counts.items(), key=lambda item: (item[1], item[0]))
+    return {
+        "primary_blocker": primary,
+        "reason_counts": counts,
+        "configs_blocked": sum(1 for row in rows if str(row.get(field) or "")),
+    }
 
 
 def rejection_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
@@ -6060,6 +6361,10 @@ def _csv_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
         "maker_current_net_return_pct",
         "maker_low_slippage_net_return_pct",
         "zero_cost_net_return_pct",
+        "current_taker_profit_factor",
+        "maker_current_profit_factor",
+        "maker_low_slippage_profit_factor",
+        "zero_cost_profit_factor",
         "gross_return_pct",
         "net_return_pct",
         "profit_factor_net",
@@ -6076,11 +6381,23 @@ def _csv_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
         "worst_fold_net_return_pct",
         "median_fold_net_return_pct",
         "research_promising",
+        "maker_research_promising",
+        "maker_economically_viable",
+        "maker_only_candidate",
         "fallback_prediction_used",
         "active_model_valid",
         "economically_viable",
         "paper_forward_eligible",
+        "estimated_fill_rate_required_to_remain_profitable",
+        "maker_vs_taker_net_gap",
+        "max_allowed_taker_fallback_rate_before_net_negative",
+        "spread_bps_assumption",
+        "slippage_bps_assumption",
+        "no_market_fallback_required",
+        "post_only_required",
+        "unfilled_cancel_required",
         "rejection_reasons",
+        "maker_rejection_reasons",
         "rank_score",
     ]
     extras = sorted({key for row in rows for key in row} - set(preferred))

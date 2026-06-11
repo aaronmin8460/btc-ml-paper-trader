@@ -18,12 +18,17 @@ from scripts.research_higher_timeframe import (
     UPTREND_PULLBACK_STRATEGY,
     VOLATILITY_BREAKOUT_STRATEGY,
     VOLATILITY_FOCUS_STRATEGY,
+    EXIT_MODE_BREAK_EVEN_AFTER_1R,
     EXIT_MODE_BREAK_EVEN_1R,
     EXIT_MODE_MFE_PROTECT_1R_50,
+    EXIT_MODE_MFE_PROTECTION_EXIT,
+    EXIT_MODE_TRAILING_AFTER_1R,
     EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
     EXIT_MODE_TRAILING_1R,
     VOLATILITY_FOCUS_TRACK_A,
     VOLATILITY_FOCUS_TRACK_B,
+    VOLATILITY_FOCUS_TRACK_M,
+    VOLATILITY_FOCUS_TRACK_T,
     ResearchDataReport,
     ResearchConfig,
     _resolve_requested_timeframes,
@@ -63,6 +68,7 @@ from scripts.research_higher_timeframe import (
     run_higher_timeframe_research,
     strategy_baseline_comparison,
     summarize_walk_forward_metrics,
+    volatility_focus_maker_research_gate,
     volatility_focus_research_gate,
     volatility_focus_trade_diagnostics,
     write_volatility_focus_outputs,
@@ -268,6 +274,36 @@ def test_volatility_focus_v7_adds_targeted_1h_tracks_and_exit_modes():
     assert track_b[0].max_hold_bars == 48
 
 
+def test_volatility_focus_v8_adds_maker_and_taker_survival_tracks():
+    configs = generate_volatility_focus_configs(max_configs=5000, timeframes=("1H",))
+    track_m = [config for config in configs if config.track_id == VOLATILITY_FOCUS_TRACK_M]
+    track_t = [config for config in configs if config.track_id == VOLATILITY_FOCUS_TRACK_T]
+
+    assert len(configs) == 5000
+    assert {config.timeframe for config in configs} == {"1H"}
+    assert {config.strategy_name for config in configs} == {VOLATILITY_BREAKOUT_STRATEGY}
+    assert len(track_m) == 2500
+    assert len(track_t) == 2500
+    assert {config.exit_mode for config in track_m} == {
+        "fixed_tp_sl_timeout",
+        EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+        EXIT_MODE_MFE_PROTECTION_EXIT,
+    }
+    assert {config.exit_mode for config in track_t} == {
+        "fixed_tp_sl_timeout",
+        EXIT_MODE_BREAK_EVEN_AFTER_1R,
+        EXIT_MODE_TRAILING_AFTER_1R,
+        EXIT_MODE_MFE_PROTECTION_EXIT,
+        EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+    }
+    assert track_m[0].take_profit_pct == 0.045
+    assert track_m[0].stop_loss_pct == 0.02
+    assert track_m[0].max_hold_bars == 48
+    assert track_m[0].min_volume_zscore == 0.25
+    assert track_t[0].take_profit_pct == 0.07
+    assert track_t[0].max_hold_bars == 96
+
+
 def test_paper_forward_readiness_blocks_fallback_and_invalid_model():
     settings = _settings()
 
@@ -367,6 +403,63 @@ def test_volatility_focus_research_gate_enforces_trade_fold_cost_and_baseline_ga
     assert "current_taker_profit_factor_below_1_05" in reasons
     assert "does_not_beat_buy_and_hold_risk_adjusted" in reasons
     assert "does_not_beat_dca_risk_adjusted" in reasons
+
+
+def test_maker_research_gate_does_not_override_current_taker_gate():
+    metrics = _passing_metrics(number_of_trades=24, max_drawdown_pct=0.005)
+    settings = _settings(max_backtest_drawdown_pct=0.01)
+    config = _volatility_breakout_config(timeframe="1H", track_id=VOLATILITY_FOCUS_TRACK_M)
+    source_report = ResearchDataReport(
+        timeframe="1H",
+        source_used="collected_market_data_derived_from_15min",
+        latest_timestamp="2026-06-07T09:00:00+00:00",
+        data_age_minutes=0.0,
+        row_count=3998,
+        synthetic_data_used=False,
+        research_result_valid=True,
+    )
+    cost_summary = {
+        "net_return_by_cost_scenario": {"current_taker": -0.02, "maker_current": 0.03},
+        "profit_factor_by_cost_scenario": {"current_taker": 0.90, "maker_current": 1.20},
+    }
+    baseline = {
+        "beats_buy_hold_risk_adjusted": True,
+        "beats_dca_daily_risk_adjusted": True,
+    }
+    walk_forward = {"walk_forward_passed": True, "folds_with_min_trades_count": 4, "fold_count": 4}
+
+    current_gate = volatility_focus_research_gate(
+        metrics,
+        settings,
+        config,
+        cost_summary=cost_summary,
+        source_report=source_report,
+        synthetic_data_used=False,
+        research_result_valid=True,
+        baseline_comparison=baseline,
+        walk_forward=walk_forward,
+        concentration=0.20,
+        active_model_valid=True,
+        min_focused_trades=20,
+    )
+    maker_gate = volatility_focus_maker_research_gate(
+        metrics,
+        settings,
+        config,
+        cost_summary=cost_summary,
+        source_report=source_report,
+        synthetic_data_used=False,
+        research_result_valid=True,
+        baseline_comparison=baseline,
+        walk_forward=walk_forward,
+        min_focused_trades=20,
+    )
+
+    assert current_gate["research_promising"] is False
+    assert "current_taker_net_return_not_positive" in current_gate["research_rejection_reasons"]
+    assert maker_gate["maker_research_promising"] is True
+    assert maker_gate["maker_economically_viable"] is True
+    assert maker_gate["maker_rejection_reasons"] == []
 
 
 def test_paper_forward_readiness_requires_economic_thresholds():
@@ -718,16 +811,37 @@ def test_volatility_focus_summary_and_output_files_include_safety_and_rejections
         "per_fold_net_return_pct": [0.01, 0.005, 0.005, 0.0],
         "per_fold_profit_factor_net": [1.2, 1.1, 1.1, 1.0],
         "cost_sensitivity_classification": "signal_survives_current_taker_cost",
-        "net_return_by_cost_scenario": {"current_taker": 0.02, "maker_low_slippage": 0.03, "zero_cost_sanity": 0.04},
+        "net_return_by_cost_scenario": {
+            "current_taker": 0.02,
+            "maker_current": 0.025,
+            "maker_low_slippage": 0.03,
+            "zero_cost_sanity": 0.04,
+        },
         "current_taker_net_return_pct": 0.02,
         "maker_current_net_return_pct": 0.025,
         "maker_low_slippage_net_return_pct": 0.03,
         "zero_cost_net_return_pct": 0.04,
-        "profit_factor_by_cost_scenario": {"current_taker": 1.2},
+        "current_taker_profit_factor": 1.2,
+        "maker_current_profit_factor": 1.25,
+        "maker_low_slippage_profit_factor": 1.3,
+        "zero_cost_profit_factor": 1.4,
+        "profit_factor_by_cost_scenario": {"current_taker": 1.2, "maker_current": 1.25},
         "research_promising": True,
         "economically_viable": True,
+        "maker_research_promising": True,
+        "maker_economically_viable": True,
+        "maker_only_candidate": False,
         "paper_forward_eligible": False,
+        "estimated_fill_rate_required_to_remain_profitable": 0.0,
+        "maker_vs_taker_net_gap": 0.005,
+        "max_allowed_taker_fallback_rate_before_net_negative": 1.0,
+        "spread_bps_assumption": 5.0,
+        "slippage_bps_assumption": 5.0,
+        "no_market_fallback_required": True,
+        "post_only_required": True,
+        "unfilled_cancel_required": True,
         "research_rejection_reasons": "",
+        "maker_rejection_reasons": "",
         "paper_forward_rejection_reasons": "active_model_invalid",
         "training_rejection_reasons": "active_model_invalid;training_deferred_volatility_focus_no_ml_yet",
         "adjusted_rank_score": 10.0,
@@ -775,16 +889,26 @@ def test_volatility_focus_summary_and_output_files_include_safety_and_rejections
     assert summary["auto_trade_enabled"] is False
     assert summary["synthetic_data_used"] is False
     assert summary["research_promising_count"] == 1
+    assert summary["current_taker_research_promising_count"] == 1
+    assert summary["maker_research_promising_count"] == 1
+    assert summary["maker_economically_viable_count"] == 1
+    assert summary["maker_only_candidate_count"] == 0
     assert summary["paper_forward_eligible_count"] == 0
     assert summary["candidate_b_best"]["parameter_set_id"] == "vff_vbo_00001"
+    assert summary["best_maker_candidate"]["parameter_set_id"] == "vff_vbo_00001"
+    assert summary["best_all_maker_research_gates_passed"]["parameter_set_id"] == "vff_vbo_00001"
     assert summary["best_20_plus_current_cost_positive"]["parameter_set_id"] == "vff_vbo_00001"
     assert summary["best_walk_forward_current_cost_positive"]["parameter_set_id"] == "vff_vbo_00001"
     assert summary["best_all_research_gates_passed"]["parameter_set_id"] == "vff_vbo_00001"
     assert summary["any_config_passed_all_research_gates"] is True
+    assert summary["any_current_taker_config_passed_all_research_gates"] is True
+    assert summary["any_maker_config_passed_maker_research_gates"] is True
     assert summary["recommendation"] == "candidate_found_keep_trading_disabled"
     assert (tmp_path / "volatility_focus_summary.json").exists()
     top_csv = (tmp_path / "volatility_focus_top_configs.csv").read_text(encoding="utf-8")
     assert "track_id,parameter_set_id,strategy_name,timeframe,exit_mode" in top_csv
+    assert "maker_research_promising" in top_csv
+    assert "estimated_fill_rate_required_to_remain_profitable" in top_csv
     rejections = (tmp_path / "volatility_focus_rejections.json").read_text(encoding="utf-8")
     assert "active_model_invalid" in rejections
 
