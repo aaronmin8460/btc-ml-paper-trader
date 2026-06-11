@@ -9,7 +9,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from itertools import product
+from itertools import combinations, product
 from pathlib import Path
 from typing import Any
 
@@ -106,10 +106,14 @@ VOLATILITY_FOCUS_MAX_ATR_EXPANSION_VALUES = (1.8, 2.2, 2.6, 3.0, 3.5)
 VOLATILITY_FOCUS_V7_MIN_CONFIGS = 4000
 VOLATILITY_FOCUS_V7_BASE_CONFIGS = 1000
 VOLATILITY_FOCUS_V8_MIN_CONFIGS = 5000
+VOLATILITY_FOCUS_V9_CONFIGS = 3000
 VOLATILITY_FOCUS_TRACK_A = "A_vff_vbo_00808_expansion"
 VOLATILITY_FOCUS_TRACK_B = "B_vff_vbo_00001_exit_fix"
 VOLATILITY_FOCUS_TRACK_M = "M_vff_vbo_00001_maker_only"
 VOLATILITY_FOCUS_TRACK_T = "T_taker_survival_swing_breakout"
+VOLATILITY_FOCUS_TRACK_M9 = "M9_v8m_00086_drawdown_reduction"
+VOLATILITY_FOCUS_V9_ANCHOR_PARAMETER_SET_ID = "v8m_00086"
+VOLATILITY_FOCUS_V9_ANCHOR_MAX_DRAWDOWN_PCT = 0.1079
 EXIT_MODE_FIXED = "fixed_tp_sl_timeout"
 EXIT_MODE_BREAK_EVEN_1R = "break_even_stop_after_1r"
 EXIT_MODE_TRAILING_1R = "trailing_stop_after_1r"
@@ -136,6 +140,71 @@ VOLATILITY_FOCUS_V8_TAKER_EXIT_MODES = (
     EXIT_MODE_TRAILING_AFTER_1R,
     EXIT_MODE_MFE_PROTECTION_EXIT,
     EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+)
+VOLATILITY_FOCUS_V9_EXIT_MODES = (
+    EXIT_MODE_FIXED,
+    EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+    EXIT_MODE_MFE_PROTECTION_EXIT,
+    EXIT_MODE_BREAK_EVEN_AFTER_1R,
+)
+VOLATILITY_FOCUS_V9_SEARCH_SPACE = {
+    "strategy_name": (VOLATILITY_BREAKOUT_STRATEGY,),
+    "timeframe": ("1H",),
+    "take_profit_pct": (0.045, 0.0475, 0.05, 0.0525, 0.055),
+    "stop_loss_pct": (0.016, 0.018, 0.019, 0.02, 0.021, 0.022),
+    "max_hold_bars": (36, 42, 48, 54, 60),
+    "breakout_lookback": (18, 20, 22),
+    "consolidation_lookback": (10, 12, 14),
+    "min_body_vs_avg": (1.0, 1.1, 1.2, 1.3),
+    "min_recent_return_pct": (0.0025, 0.003, 0.0035),
+    "min_trend_strength": (0.0, 0.02, 0.03),
+    "max_atr_expansion": (2.2, 2.6, 3.0),
+    "min_volume_zscore": (0.0, 0.25, 0.5),
+    "exit_mode": VOLATILITY_FOCUS_V9_EXIT_MODES,
+}
+VOLATILITY_FOCUS_V9_ANCHOR_SPEC = {
+    "exit_mode": EXIT_MODE_FIXED,
+    "take_profit_pct": 0.045,
+    "stop_loss_pct": 0.022,
+    "max_hold_bars": 48,
+    "breakout_lookback": 20,
+    "consolidation_lookback": 12,
+    "min_body_vs_avg": 1.2,
+    "min_recent_return_pct": 0.003,
+    "min_trend_strength": 0.0,
+    "max_atr_expansion": 3.0,
+    "min_volume_zscore": 0.25,
+}
+VOLATILITY_FOCUS_V9_RANKING_PRIORITY = (
+    "maker_current_net_return_pct > 0",
+    "maker_current_profit_factor >= 1.05",
+    "number_of_trades >= 20",
+    "walk_forward_passed == true",
+    "folds_with_min_trades_count == fold_count",
+    "max_drawdown_pct <= configured_drawdown_gate",
+    "beats_buy_hold_risk_adjusted == true",
+    "beats_dca_daily_risk_adjusted == true",
+    "lower_single_trade_return_concentration",
+    "higher_median_fold_net_return_pct",
+    "lower_worst_fold_net_return_pct_loss_magnitude",
+)
+VOLATILITY_FOCUS_V9_TERMINAL_FAILURE_RECOMMENDATION = (
+    "abandon_1h_volatility_breakout_maker_only_and_switch_strategy_family"
+)
+VOLATILITY_FOCUS_V9_TERMINAL_FOUND_RECOMMENDATION = (
+    "maker_only_research_candidate_found_but_not_live_tradable"
+)
+VOLATILITY_FOCUS_V9_TERMINAL_BLOCKERS = (
+    "max_drawdown_above_configured_limit",
+    "maker_current_net_return_not_positive",
+    "maker_current_profit_factor_below_1_05",
+    "number_of_trades_below_20",
+    "walk_forward_not_passed",
+    "folds_with_min_trades_below_required",
+    "does_not_beat_buy_and_hold_risk_adjusted",
+    "does_not_beat_dca_risk_adjusted",
+    "statistically_weak",
+    "invalid_data_source",
 )
 VOLATILITY_FOCUS_RECOMMENDATIONS = (
     "no_edge_found",
@@ -1788,7 +1857,9 @@ def generate_volatility_focus_configs(
             }
         )
 
-    if _volatility_focus_v8_enabled(max_configs, requested_timeframes):
+    if _volatility_focus_v9_enabled(max_configs, requested_timeframes):
+        raw_specs = generate_volatility_focus_v9_targeted_specs(max_specs=int(max_configs))
+    elif _volatility_focus_v8_enabled(max_configs, requested_timeframes):
         raw_specs = generate_volatility_focus_v8_targeted_specs(max_specs=int(max_configs))
     elif _volatility_focus_v7_enabled(max_configs, requested_timeframes):
         base_budget = min(VOLATILITY_FOCUS_V7_BASE_CONFIGS, max(0, int(max_configs) // 4))
@@ -1812,6 +1883,10 @@ def generate_volatility_focus_configs(
 
 def _volatility_focus_v7_enabled(max_configs: int, requested_timeframes: tuple[str, ...]) -> bool:
     return int(max_configs) >= VOLATILITY_FOCUS_V7_MIN_CONFIGS and requested_timeframes == ("1H",)
+
+
+def _volatility_focus_v9_enabled(max_configs: int, requested_timeframes: tuple[str, ...]) -> bool:
+    return int(max_configs) == VOLATILITY_FOCUS_V9_CONFIGS and requested_timeframes == ("1H",)
 
 
 def _volatility_focus_v8_enabled(max_configs: int, requested_timeframes: tuple[str, ...]) -> bool:
@@ -1959,6 +2034,95 @@ def generate_volatility_focus_v8_targeted_specs(*, max_specs: int) -> list[dict[
         volume_values=(0.0, 0.25, 0.5),
     )
     return track_m + track_t
+
+
+def generate_volatility_focus_v9_targeted_specs(*, max_specs: int) -> list[dict[str, Any]]:
+    if max_specs <= 0:
+        return []
+    dimensions: tuple[tuple[str, tuple[Any, ...]], ...] = (
+        ("exit_mode", VOLATILITY_FOCUS_V9_SEARCH_SPACE["exit_mode"]),
+        ("take_profit_pct", VOLATILITY_FOCUS_V9_SEARCH_SPACE["take_profit_pct"]),
+        ("stop_loss_pct", VOLATILITY_FOCUS_V9_SEARCH_SPACE["stop_loss_pct"]),
+        ("max_hold_bars", VOLATILITY_FOCUS_V9_SEARCH_SPACE["max_hold_bars"]),
+        ("breakout_lookback", VOLATILITY_FOCUS_V9_SEARCH_SPACE["breakout_lookback"]),
+        ("consolidation_lookback", VOLATILITY_FOCUS_V9_SEARCH_SPACE["consolidation_lookback"]),
+        ("min_body_vs_avg", VOLATILITY_FOCUS_V9_SEARCH_SPACE["min_body_vs_avg"]),
+        ("min_recent_return_pct", VOLATILITY_FOCUS_V9_SEARCH_SPACE["min_recent_return_pct"]),
+        ("min_trend_strength", VOLATILITY_FOCUS_V9_SEARCH_SPACE["min_trend_strength"]),
+        ("max_atr_expansion", VOLATILITY_FOCUS_V9_SEARCH_SPACE["max_atr_expansion"]),
+        ("min_volume_zscore", VOLATILITY_FOCUS_V9_SEARCH_SPACE["min_volume_zscore"]),
+    )
+    quality_profile = _volatility_focus_v7_quality_profiles()[0]
+    selected: list[dict[str, Any]] = []
+    for distance in range(len(dimensions) + 1):
+        level_specs: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        for changed_indexes in combinations(range(len(dimensions)), distance):
+            changed = set(changed_indexes)
+            option_groups: list[tuple[tuple[Any, ...], ...]] = []
+            for index, (name, values) in enumerate(dimensions):
+                anchor_value = VOLATILITY_FOCUS_V9_ANCHOR_SPEC[name]
+                options = _volatility_focus_v9_options_by_anchor_distance(
+                    values,
+                    anchor_value=anchor_value,
+                    changed=index in changed,
+                )
+                option_groups.append(tuple((name, value) for value in options))
+            for values in product(*option_groups):
+                spec_values = {name: value for name, value in values}
+                spec = {
+                    "track_id": VOLATILITY_FOCUS_TRACK_M9,
+                    "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+                    "timeframe": "1H",
+                    **spec_values,
+                    **quality_profile,
+                }
+                level_specs.append((_volatility_focus_v9_anchor_sort_key(spec), spec))
+        for _, spec in sorted(level_specs, key=lambda item: item[0]):
+            selected.append(spec)
+            if len(selected) >= int(max_specs):
+                return [
+                    {
+                        **selected_spec,
+                        "parameter_set_id": f"v9m_{index:05d}",
+                    }
+                    for index, selected_spec in enumerate(selected)
+                ]
+    return [
+        {
+            **selected_spec,
+            "parameter_set_id": f"v9m_{index:05d}",
+        }
+        for index, selected_spec in enumerate(selected[: int(max_specs)])
+    ]
+
+
+def _volatility_focus_v9_options_by_anchor_distance(
+    values: tuple[Any, ...],
+    *,
+    anchor_value: Any,
+    changed: bool,
+) -> tuple[Any, ...]:
+    if changed:
+        options = [value for value in values if _normalise_spec_value(value) != _normalise_spec_value(anchor_value)]
+    else:
+        options = [anchor_value]
+    return tuple(sorted(options, key=lambda value: _volatility_focus_v9_value_distance_key(value, anchor_value)))
+
+
+def _volatility_focus_v9_anchor_sort_key(spec: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        _volatility_focus_v9_value_distance_key(spec[name], VOLATILITY_FOCUS_V9_ANCHOR_SPEC[name])
+        for name in VOLATILITY_FOCUS_V9_ANCHOR_SPEC
+    )
+
+
+def _volatility_focus_v9_value_distance_key(value: Any, anchor_value: Any) -> tuple[Any, ...]:
+    if isinstance(value, (int, float)) and isinstance(anchor_value, (int, float)):
+        return (abs(float(value) - float(anchor_value)), float(value))
+    return (
+        0 if _normalise_spec_value(value) == _normalise_spec_value(anchor_value) else 1,
+        str(value),
+    )
 
 
 def _sample_volatility_focus_v7_track_specs(
@@ -4150,7 +4314,9 @@ def build_volatility_focus_summary(
     rejections_path: Path,
     trade_audit_paths: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    ranked = sorted(rows, key=_rank_sort_key, reverse=True)
+    v9_mode = _volatility_focus_v9_mode(rows)
+    rank_key = _maker_rank_sort_key if v9_mode else _rank_sort_key
+    ranked = sorted(rows, key=rank_key, reverse=True)
     source_reports = _summary_source_reports(data_source_reports=data_source_reports, data_sources=None)
     synthetic_data_used = bool(base_summary.get("synthetic_data_used")) or any(
         bool(row.get("synthetic_data_used")) for row in ranked
@@ -4185,10 +4351,12 @@ def build_volatility_focus_summary(
     all_track_b_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_B]
     all_track_m_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_M]
     all_track_t_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_T]
+    all_track_m9_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_M9]
     track_a_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_A]
     track_b_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_B]
     track_m_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_M]
     track_t_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_T]
+    track_m9_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_M9]
     maker_research_promising_rows = [row for row in eligible_rows if row.get("maker_research_promising")]
     maker_economically_viable_rows = [row for row in eligible_rows if row.get("maker_economically_viable")]
     maker_only_rows = [row for row in eligible_rows if row.get("maker_only_candidate")]
@@ -4213,6 +4381,22 @@ def build_volatility_focus_summary(
         if not str(row.get("research_rejection_reasons") or "")
         and bool(row.get("research_promising"))
     ]
+    v9_rows_for_candidate_selection = track_m9_rows if research_result_valid and not synthetic_data_used else all_track_m9_rows
+    v9_twenty_plus_rows = [
+        row
+        for row in v9_rows_for_candidate_selection
+        if int(row.get("number_of_trades", 0) or 0) >= MIN_RESEARCH_TRADES
+    ]
+    v9_drawdown_reduced_rows = [
+        row
+        for row in v9_twenty_plus_rows
+        if _metric_float(row.get("max_drawdown_pct")) < VOLATILITY_FOCUS_V9_ANCHOR_MAX_DRAWDOWN_PCT
+    ]
+    v9_under_drawdown_limit_rows = [
+        row
+        for row in v9_twenty_plus_rows
+        if _metric_float(row.get("max_drawdown_pct")) <= float(settings.max_backtest_drawdown_pct)
+    ]
     diagnosis = volatility_focus_diagnosis(ranked, research_result_valid=research_result_valid)
     v7_failure = volatility_focus_v7_failure_analysis(eligible_rows if research_result_valid else ranked)
     v8_blockers = {
@@ -4231,6 +4415,12 @@ def build_volatility_focus_summary(
         synthetic_data_used=synthetic_data_used,
         diagnosis=diagnosis,
         max_focused_configs=max_focused_configs,
+    )
+    v9_terminal = volatility_focus_v9_terminal_state(
+        v9_rows_for_candidate_selection,
+        settings,
+        research_result_valid=research_result_valid,
+        synthetic_data_used=synthetic_data_used,
     )
     summary = {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -4258,6 +4448,7 @@ def build_volatility_focus_summary(
         "max_focused_configs": int(max_focused_configs),
         "min_focused_trades": int(min_focused_trades),
         "target_focused_trades": int(target_focused_trades),
+        "v9_track_configs": volatility_focus_v9_track_configs(all_track_m9_rows),
         "configs_with_20_plus_trades": sum(1 for row in ranked if int(row.get("number_of_trades", 0) or 0) >= 20),
         "configs_with_50_plus_trades": sum(1 for row in ranked if int(row.get("number_of_trades", 0) or 0) >= 50),
         "profitable_current_cost_configs": len(current_profitable),
@@ -4282,12 +4473,15 @@ def build_volatility_focus_summary(
         "best_maker_candidate": best_maker_ranked_config(track_m_rows or eligible_rows),
         "best_maker_candidate_with_20_plus_trades": best_maker_ranked_config(maker_twenty_plus_rows),
         "best_maker_walk_forward_candidate": best_maker_ranked_config(maker_walk_forward_rows),
+        "best_v9_maker_candidate": best_maker_ranked_config(v9_twenty_plus_rows),
+        "best_v9_drawdown_reduced_candidate": best_maker_ranked_config(v9_drawdown_reduced_rows),
         "best_taker_swing_candidate": best_ranked_config(track_t_rows or all_track_t_rows),
         "best_20_plus_current_cost_positive": best_ranked_config(twenty_plus_current_positive),
         "best_walk_forward_current_cost_positive": best_ranked_config(walk_forward_current_positive),
         "best_all_research_gates_passed": best_ranked_config(all_research_gates_passed),
         "best_all_current_taker_research_gates_passed": best_ranked_config(all_research_gates_passed),
         "best_all_maker_research_gates_passed": best_maker_ranked_config(maker_research_promising_rows),
+        "best_candidate_under_drawdown_limit": best_maker_ranked_config(v9_under_drawdown_limit_rows),
         "any_config_passed_all_research_gates": bool(all_research_gates_passed),
         "any_current_taker_config_passed_all_research_gates": bool(all_research_gates_passed),
         "any_maker_only_config_passed_maker_research_gates": bool(maker_only_rows),
@@ -4302,6 +4496,12 @@ def build_volatility_focus_summary(
             VOLATILITY_FOCUS_TRACK_M: len(all_track_m_rows),
             VOLATILITY_FOCUS_TRACK_T: len(all_track_t_rows),
         },
+        "volatility_focus_v9_track_counts": {
+            VOLATILITY_FOCUS_TRACK_M9: len(all_track_m9_rows),
+        },
+        "terminal_line_failed": v9_terminal["terminal_line_failed"],
+        "terminal_recommendation": v9_terminal["terminal_recommendation"],
+        "exact_blockers": v9_terminal["exact_blockers"],
         "top_configs": ranked[:10],
         "rejection_reason_counts": {
             "research": rejection_reason_counts_for_field(ranked, "research_rejection_reasons"),
@@ -4336,7 +4536,8 @@ def write_volatility_focus_outputs(
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     top_configs_csv_path.parent.mkdir(parents=True, exist_ok=True)
     rejections_path.parent.mkdir(parents=True, exist_ok=True)
-    ranked = sorted(rows, key=_rank_sort_key, reverse=True)
+    rank_key = _maker_rank_sort_key if focused_summary.get("v9_track_configs") else _rank_sort_key
+    ranked = sorted(rows, key=rank_key, reverse=True)
     top_rows = ranked[:50]
     top_fields = [
         "track_id",
@@ -4355,6 +4556,7 @@ def write_volatility_focus_outputs(
         "min_volume_zscore",
         "max_atr_expansion",
         "number_of_trades",
+        "gross_return_pct",
         "current_taker_net_return_pct",
         "maker_current_net_return_pct",
         "maker_low_slippage_net_return_pct",
@@ -4368,6 +4570,7 @@ def write_volatility_focus_outputs(
         "max_drawdown_pct",
         "win_rate_net",
         "expectancy",
+        "fold_count",
         "average_mfe",
         "average_mae",
         "pct_trades_reaching_1r_before_stop",
@@ -4378,7 +4581,13 @@ def write_volatility_focus_outputs(
         "pct_trades_exiting_by_protective_stop",
         "average_bars_held",
         "walk_forward_passed",
+        "statistically_weak",
+        "profit_factor_reliable",
+        "single_trade_return_concentration",
+        "folds_profitable_count",
         "folds_with_min_trades_count",
+        "worst_fold_net_return_pct",
+        "median_fold_net_return_pct",
         "per_fold_number_of_trades",
         "per_fold_net_return_pct",
         "per_fold_profit_factor_net",
@@ -4782,6 +4991,192 @@ def best_maker_ranked_config(rows: list[dict[str, Any]]) -> dict[str, Any] | Non
     return max(rows, key=_maker_rank_sort_key)
 
 
+def _volatility_focus_v9_mode(rows: list[dict[str, Any]]) -> bool:
+    return any(row.get("track_id") == VOLATILITY_FOCUS_TRACK_M9 for row in rows)
+
+
+def volatility_focus_v9_track_configs(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    return {
+        "track_id": VOLATILITY_FOCUS_TRACK_M9,
+        "anchor_parameter_set_id": VOLATILITY_FOCUS_V9_ANCHOR_PARAMETER_SET_ID,
+        "anchor_max_drawdown_pct": VOLATILITY_FOCUS_V9_ANCHOR_MAX_DRAWDOWN_PCT,
+        "configs_generated": len(rows),
+        "search_space": VOLATILITY_FOCUS_V9_SEARCH_SPACE,
+        "ranking_priority": list(VOLATILITY_FOCUS_V9_RANKING_PRIORITY),
+        "scope": "final_narrow_1h_btc_usd_long_only_paper_research_drawdown_reduction",
+    }
+
+
+def volatility_focus_v9_terminal_state(
+    rows: list[dict[str, Any]],
+    settings: Settings,
+    *,
+    research_result_valid: bool,
+    synthetic_data_used: bool,
+) -> dict[str, Any]:
+    if not rows:
+        return {
+            "terminal_line_failed": None,
+            "terminal_recommendation": None,
+            "exact_blockers": {},
+        }
+    passed = [row for row in rows if bool(row.get("maker_research_promising"))]
+    exact_blockers = volatility_focus_v9_exact_blockers(
+        rows,
+        settings,
+        research_result_valid=research_result_valid,
+        synthetic_data_used=synthetic_data_used,
+    )
+    if passed:
+        return {
+            "terminal_line_failed": False,
+            "terminal_recommendation": VOLATILITY_FOCUS_V9_TERMINAL_FOUND_RECOMMENDATION,
+            "exact_blockers": exact_blockers,
+        }
+    return {
+        "terminal_line_failed": True,
+        "terminal_recommendation": VOLATILITY_FOCUS_V9_TERMINAL_FAILURE_RECOMMENDATION,
+        "exact_blockers": exact_blockers,
+    }
+
+
+def volatility_focus_v9_exact_blockers(
+    rows: list[dict[str, Any]],
+    settings: Settings,
+    *,
+    research_result_valid: bool,
+    synthetic_data_used: bool,
+) -> dict[str, Any]:
+    counts = {blocker: 0 for blocker in VOLATILITY_FOCUS_V9_TERMINAL_BLOCKERS}
+    row_blockers: list[dict[str, Any]] = []
+    for row in rows:
+        blockers = volatility_focus_v9_blockers_for_row(
+            row,
+            settings,
+            research_result_valid=research_result_valid,
+            synthetic_data_used=synthetic_data_used,
+        )
+        for blocker in blockers:
+            counts[blocker] = counts.get(blocker, 0) + 1
+        row_blockers.append(
+            {
+                "parameter_set_id": row.get("parameter_set_id"),
+                "track_id": row.get("track_id"),
+                "number_of_trades": row.get("number_of_trades"),
+                "maker_current_net_return_pct": row.get("maker_current_net_return_pct"),
+                "maker_current_profit_factor": row.get("maker_current_profit_factor"),
+                "max_drawdown_pct": row.get("max_drawdown_pct"),
+                "walk_forward_passed": row.get("walk_forward_passed"),
+                "folds_with_min_trades_count": row.get("folds_with_min_trades_count"),
+                "blockers": blockers,
+            }
+        )
+    best_row = best_maker_ranked_config(rows)
+    best_under_drawdown = best_maker_ranked_config(
+        [
+            row
+            for row in rows
+            if int(row.get("number_of_trades", 0) or 0) >= MIN_RESEARCH_TRADES
+            and _metric_float(row.get("max_drawdown_pct")) <= float(settings.max_backtest_drawdown_pct)
+        ]
+    )
+    return {
+        "configured_drawdown_limit_pct": float(settings.max_backtest_drawdown_pct),
+        "required_min_trades": MIN_RESEARCH_TRADES,
+        "required_profit_factor": MIN_RESEARCH_PROFIT_FACTOR_NET,
+        "required_folds_with_min_trades": 4,
+        "present": {blocker: counts.get(blocker, 0) > 0 for blocker in VOLATILITY_FOCUS_V9_TERMINAL_BLOCKERS},
+        "reason_counts": {blocker: count for blocker, count in counts.items() if count},
+        "best_v9_maker_candidate_blockers": (
+            volatility_focus_v9_blockers_for_row(
+                best_row,
+                settings,
+                research_result_valid=research_result_valid,
+                synthetic_data_used=synthetic_data_used,
+            )
+            if best_row is not None
+            else []
+        ),
+        "best_candidate_under_drawdown_limit_blockers": (
+            volatility_focus_v9_blockers_for_row(
+                best_under_drawdown,
+                settings,
+                research_result_valid=research_result_valid,
+                synthetic_data_used=synthetic_data_used,
+            )
+            if best_under_drawdown is not None
+            else ["no_candidate_under_configured_drawdown_limit"]
+        ),
+        "sample_rejected_rows": row_blockers[:10],
+    }
+
+
+def volatility_focus_v9_blockers_for_row(
+    row: dict[str, Any],
+    settings: Settings,
+    *,
+    research_result_valid: bool,
+    synthetic_data_used: bool,
+) -> list[str]:
+    blockers: list[str] = []
+    maker_net = _metric_float(row.get("maker_current_net_return_pct"))
+    maker_pf = _profit_factor_value(row.get("maker_current_profit_factor"))
+    trades = int(row.get("number_of_trades", 0) or 0)
+    fold_count = int(row.get("fold_count", 4) or 4)
+    folds_with_min_trades = int(row.get("folds_with_min_trades_count", 0) or 0)
+    max_drawdown = _metric_float(row.get("max_drawdown_pct"))
+    if max_drawdown > float(settings.max_backtest_drawdown_pct):
+        blockers.append("max_drawdown_above_configured_limit")
+    if maker_net <= 0:
+        blockers.append("maker_current_net_return_not_positive")
+    if maker_pf < MIN_RESEARCH_PROFIT_FACTOR_NET:
+        blockers.append("maker_current_profit_factor_below_1_05")
+    if trades < MIN_RESEARCH_TRADES:
+        blockers.append("number_of_trades_below_20")
+    if not bool(row.get("walk_forward_passed")):
+        blockers.append("walk_forward_not_passed")
+    if folds_with_min_trades < min(4, fold_count):
+        blockers.append("folds_with_min_trades_below_required")
+    if not bool(row.get("beats_buy_hold_risk_adjusted")):
+        blockers.append("does_not_beat_buy_and_hold_risk_adjusted")
+    if not bool(row.get("beats_dca_daily_risk_adjusted")):
+        blockers.append("does_not_beat_dca_risk_adjusted")
+    if bool(row.get("statistically_weak")) or trades < MIN_RESEARCH_TRADES:
+        blockers.append("statistically_weak")
+    source_invalid = (
+        not research_result_valid
+        or synthetic_data_used
+        or bool(row.get("synthetic_data_used"))
+        or not bool(row.get("research_result_valid", True))
+        or not _is_collected_market_data_source(str(row.get("source_used") or "unknown"))
+    )
+    if source_invalid:
+        blockers.append("invalid_data_source")
+    for reason in _semicolon_values(row.get("maker_rejection_reasons")):
+        mapped = _volatility_focus_v9_terminal_blocker_from_reason(reason)
+        if mapped:
+            blockers.append(mapped)
+    return list(dict.fromkeys(blockers))
+
+
+def _volatility_focus_v9_terminal_blocker_from_reason(reason: str) -> str | None:
+    if reason in VOLATILITY_FOCUS_V9_TERMINAL_BLOCKERS:
+        return reason
+    if reason == "folds_with_min_trades_not_all_4":
+        return "folds_with_min_trades_below_required"
+    if reason in {"research_data_source_invalid", "data_source_not_collected_market_data", "synthetic_data_used"}:
+        return "invalid_data_source"
+    if reason.startswith("number_of_trades_below"):
+        return "number_of_trades_below_20"
+    return None
+
+
+def _semicolon_values(value: Any) -> list[str]:
+    return [part for part in str(value or "").split(";") if part]
+
+
 def _rank_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
     return (
         bool(row.get("economically_viable")),
@@ -4794,15 +5189,32 @@ def _rank_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _maker_rank_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    trades = int(row.get("number_of_trades", 0) or 0)
+    maker_net = _metric_float(row.get("maker_current_net_return_pct"))
+    maker_pf = _profit_factor_value(row.get("maker_current_profit_factor"))
+    fold_count = int(row.get("fold_count", 4) or 4)
+    folds_with_min_trades = int(row.get("folds_with_min_trades_count", 0) or 0)
+    concentration = _metric_float(row.get("single_trade_return_concentration"))
+    drawdown = _metric_float(row.get("max_drawdown_pct"))
+    maker_reasons = set(_semicolon_values(row.get("maker_rejection_reasons")))
     return (
-        bool(row.get("maker_economically_viable")),
-        bool(row.get("maker_research_promising")),
+        maker_net > 0,
+        maker_pf >= MIN_RESEARCH_PROFIT_FACTOR_NET,
+        trades >= MIN_RESEARCH_TRADES,
         bool(row.get("walk_forward_passed")),
-        int(row.get("folds_with_min_trades_count", 0) or 0),
-        _metric_float(row.get("maker_current_net_return_pct")),
-        min(5.0, _profit_factor_value(row.get("maker_current_profit_factor"))),
-        int(row.get("number_of_trades", 0) or 0),
-        _metric_float(row.get("zero_cost_net_return_pct")),
+        folds_with_min_trades >= min(4, fold_count),
+        "max_drawdown_above_configured_limit" not in maker_reasons,
+        bool(row.get("beats_buy_hold_risk_adjusted")),
+        bool(row.get("beats_dca_daily_risk_adjusted")),
+        -concentration,
+        _metric_float(row.get("median_fold_net_return_pct")),
+        _metric_float(row.get("worst_fold_net_return_pct")),
+        maker_net,
+        min(5.0, maker_pf),
+        -drawdown,
+        trades,
+        bool(row.get("maker_research_promising")),
+        bool(row.get("maker_economically_viable")),
     )
 
 
@@ -4955,7 +5367,8 @@ def export_trade_audit_logs(
     filename_prefix: str = "",
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    ranked = sorted(rows, key=_rank_sort_key, reverse=True)
+    rank_key = _maker_rank_sort_key if strategy == VOLATILITY_FOCUS_STRATEGY and _volatility_focus_v9_mode(rows) else _rank_sort_key
+    ranked = sorted(rows, key=rank_key, reverse=True)
     preferred = [
         row
         for row in ranked

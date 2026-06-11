@@ -28,6 +28,7 @@ from scripts.research_higher_timeframe import (
     VOLATILITY_FOCUS_TRACK_A,
     VOLATILITY_FOCUS_TRACK_B,
     VOLATILITY_FOCUS_TRACK_M,
+    VOLATILITY_FOCUS_TRACK_M9,
     VOLATILITY_FOCUS_TRACK_T,
     ResearchDataReport,
     ResearchConfig,
@@ -302,6 +303,35 @@ def test_volatility_focus_v8_adds_maker_and_taker_survival_tracks():
     assert track_m[0].min_volume_zscore == 0.25
     assert track_t[0].take_profit_pct == 0.07
     assert track_t[0].max_hold_bars == 96
+
+
+def test_volatility_focus_v9_final_drawdown_reduction_track_is_narrow():
+    configs = generate_volatility_focus_configs(max_configs=3000, timeframes=("1H",))
+
+    assert len(configs) == 3000
+    assert {config.track_id for config in configs} == {VOLATILITY_FOCUS_TRACK_M9}
+    assert {config.strategy_name for config in configs} == {VOLATILITY_BREAKOUT_STRATEGY}
+    assert {config.timeframe for config in configs} == {"1H"}
+    assert {config.exit_mode for config in configs} <= {
+        "fixed_tp_sl_timeout",
+        EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+        EXIT_MODE_MFE_PROTECTION_EXIT,
+        EXIT_MODE_BREAK_EVEN_AFTER_1R,
+    }
+    assert {config.parameter_set_id for config in configs} == {f"v9m_{index:05d}" for index in range(3000)}
+
+    anchor = configs[0]
+    assert anchor.exit_mode == "fixed_tp_sl_timeout"
+    assert anchor.take_profit_pct == 0.045
+    assert anchor.stop_loss_pct == 0.022
+    assert anchor.max_hold_bars == 48
+    assert anchor.breakout_lookback == 20
+    assert anchor.consolidation_lookback == 12
+    assert anchor.min_body_vs_avg == 1.2
+    assert anchor.min_recent_return_pct == 0.003
+    assert anchor.min_trend_strength == 0.0
+    assert anchor.max_atr_expansion == 3.0
+    assert anchor.min_volume_zscore == 0.25
 
 
 def test_paper_forward_readiness_blocks_fallback_and_invalid_model():
@@ -911,6 +941,131 @@ def test_volatility_focus_summary_and_output_files_include_safety_and_rejections
     assert "estimated_fill_rate_required_to_remain_profitable" in top_csv
     rejections = (tmp_path / "volatility_focus_rejections.json").read_text(encoding="utf-8")
     assert "active_model_invalid" in rejections
+
+
+def test_volatility_focus_v9_terminal_recommends_abandon_when_no_maker_gate_passes(tmp_path):
+    settings = research_settings(_settings())
+    row = {
+        "parameter_set_id": "v9m_00042",
+        "track_id": VOLATILITY_FOCUS_TRACK_M9,
+        "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+        "timeframe": "1H",
+        "exit_mode": "fixed_tp_sl_timeout",
+        "take_profit_pct": 0.045,
+        "stop_loss_pct": 0.022,
+        "max_hold_bars": 48,
+        "breakout_lookback": 20,
+        "consolidation_lookback": 12,
+        "min_body_vs_avg": 1.2,
+        "min_recent_return_pct": 0.003,
+        "min_trend_strength": 0.0,
+        "min_volume_zscore": 0.25,
+        "max_atr_expansion": 3.0,
+        "number_of_trades": 21,
+        "gross_return_pct": 0.11,
+        "net_return_pct": -0.01,
+        "profit_factor_net": 0.94,
+        "max_drawdown_pct": 0.108,
+        "win_rate_net": 0.52,
+        "expectancy": 0.001,
+        "fold_count": 4,
+        "walk_forward_passed": True,
+        "folds_profitable_count": 3,
+        "folds_with_min_trades_count": 4,
+        "worst_fold_net_return_pct": -0.02,
+        "median_fold_net_return_pct": 0.01,
+        "fold_by_fold_returns": [0.02, 0.01, -0.02, 0.015],
+        "fold_by_fold_trade_counts": [5, 5, 6, 5],
+        "per_fold_number_of_trades": [5, 5, 6, 5],
+        "per_fold_net_return_pct": [0.02, 0.01, -0.02, 0.015],
+        "per_fold_profit_factor_net": [1.4, 1.2, 0.8, 1.3],
+        "net_return_by_cost_scenario": {
+            "current_taker": -0.011,
+            "maker_current": 0.03,
+            "maker_low_slippage": 0.038,
+            "zero_cost_sanity": 0.114,
+        },
+        "profit_factor_by_cost_scenario": {
+            "current_taker": 0.94,
+            "maker_current": 1.15,
+            "maker_low_slippage": 1.2,
+            "zero_cost_sanity": 1.76,
+        },
+        "current_taker_net_return_pct": -0.011,
+        "maker_current_net_return_pct": 0.03,
+        "maker_low_slippage_net_return_pct": 0.038,
+        "zero_cost_net_return_pct": 0.114,
+        "current_taker_profit_factor": 0.94,
+        "maker_current_profit_factor": 1.15,
+        "maker_low_slippage_profit_factor": 1.2,
+        "zero_cost_profit_factor": 1.76,
+        "single_trade_return_concentration": 0.35,
+        "statistically_weak": False,
+        "profit_factor_reliable": True,
+        "beats_buy_hold_risk_adjusted": True,
+        "beats_dca_daily_risk_adjusted": True,
+        "research_promising": False,
+        "economically_viable": False,
+        "maker_research_promising": False,
+        "maker_economically_viable": False,
+        "maker_only_candidate": False,
+        "paper_forward_eligible": False,
+        "estimated_fill_rate_required_to_remain_profitable": 0.0,
+        "maker_vs_taker_net_gap": 0.041,
+        "max_allowed_taker_fallback_rate_before_net_negative": 0.73,
+        "no_market_fallback_required": True,
+        "post_only_required": True,
+        "unfilled_cancel_required": True,
+        "source_used": "collected_market_data",
+        "synthetic_data_used": False,
+        "research_result_valid": True,
+        "research_rejection_reasons": "current_taker_net_return_not_positive;max_drawdown_above_configured_limit",
+        "maker_rejection_reasons": "max_drawdown_above_configured_limit",
+        "paper_forward_rejection_reasons": "current_taker_net_return_not_positive;max_drawdown_above_configured_limit",
+        "training_rejection_reasons": "training_deferred_volatility_focus_no_ml_yet",
+        "adjusted_rank_score": 10.0,
+    }
+    reports = {
+        "1H": ResearchDataReport(
+            timeframe="1H",
+            source_used="collected_market_data",
+            latest_timestamp="2026-06-07T09:00:00+00:00",
+            data_age_minutes=0.0,
+            row_count=500,
+            synthetic_data_used=False,
+            research_result_valid=True,
+        )
+    }
+
+    summary = build_volatility_focus_summary(
+        [row],
+        settings,
+        base_summary={
+            "synthetic_data_used": False,
+            "research_result_valid": True,
+            "timeframes": ["1H"],
+            "baselines": {},
+        },
+        data_source_reports=reports,
+        bars_by_timeframe={"1H": _bars(latest=datetime(2026, 6, 7, 9, 0, tzinfo=UTC), count=40, step_minutes=60)},
+        min_focused_trades=20,
+        target_focused_trades=50,
+        max_focused_configs=3000,
+        focused_summary_path=tmp_path / "volatility_focus_v9_summary.json",
+        top_configs_csv_path=tmp_path / "volatility_focus_v9_top_configs.csv",
+        rejections_path=tmp_path / "volatility_focus_v9_rejections.json",
+        trade_audit_paths=[],
+    )
+
+    assert summary["v9_track_configs"]["track_id"] == VOLATILITY_FOCUS_TRACK_M9
+    assert summary["best_v9_maker_candidate"]["parameter_set_id"] == "v9m_00042"
+    assert summary["best_v9_drawdown_reduced_candidate"] is None
+    assert summary["best_all_maker_research_gates_passed"] is None
+    assert summary["best_candidate_under_drawdown_limit"] is None
+    assert summary["terminal_line_failed"] is True
+    assert summary["terminal_recommendation"] == "abandon_1h_volatility_breakout_maker_only_and_switch_strategy_family"
+    assert summary["exact_blockers"]["present"]["max_drawdown_above_configured_limit"] is True
+    assert summary["exact_blockers"]["best_v9_maker_candidate_blockers"] == ["max_drawdown_above_configured_limit"]
 
 
 def _buy_the_dip_config(**overrides) -> ResearchConfig:

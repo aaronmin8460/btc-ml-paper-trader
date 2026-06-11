@@ -10,7 +10,15 @@ models/*
 !models/registry.json
 logs/*
 !logs/.gitkeep
+logs/*.log
+logs/*_summary.json
+logs/*_top_configs.csv
+logs/*_rejections.json
+logs/trade_audits/*.csv
+logs/trade_audits/*.jsonl
 runtime/
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
+**/__pycache__/
+*.pyc
