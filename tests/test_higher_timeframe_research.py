@@ -1507,10 +1507,18 @@ def test_run_volatility_focus_writes_summary_and_keeps_trading_disabled(tmp_path
     assert list((tmp_path / "trade_audits").glob("volatility_focus_top_*.jsonl"))
 
 
-def test_volatility_focus_does_not_derive_from_15min_unless_requested(tmp_path):
+def test_volatility_focus_derives_1h_from_15min_without_15min_results(tmp_path, monkeypatch):
     now = datetime(2026, 6, 7, 9, 0, tzinfo=UTC)
     engine, Session = _session_factory(tmp_path)
+    _insert_collected_rows(Session, timeframe="15Min", latest=now - timedelta(minutes=15), count=32, step_minutes=15)
     requested_market_timeframes = []
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "TRADING_ENABLED=false\nAUTO_TRADE_ENABLED=false\nALLOW_FALLBACK_TRADING=false\n",
+        encoding="utf-8",
+    )
+    env_before = env_path.read_text(encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
 
     class EmptyClient:
         async def fetch_bars(self, symbol, *, timeframe=None, limit=None, force_refresh=False):
@@ -1521,13 +1529,14 @@ def test_volatility_focus_does_not_derive_from_15min_unless_requested(tmp_path):
         summary = asyncio.run(
             run_higher_timeframe_research(
                 _settings(min_training_rows=1),
-                bar_limit=5,
+                bar_limit=8,
                 client=EmptyClient(),
                 output_dir=tmp_path,
                 session_factory=Session,
                 now=now,
                 strategy=VOLATILITY_FOCUS_STRATEGY,
-                max_v3_configs=2,
+                timeframes=("1H",),
+                max_v3_configs=6,
                 save_focused_summary=tmp_path / "volatility_focus_summary.json",
             )
         )
@@ -1535,7 +1544,43 @@ def test_volatility_focus_does_not_derive_from_15min_unless_requested(tmp_path):
         engine.dispose()
 
     assert requested_market_timeframes == ["1Hour"]
-    assert summary["volatility_focus"]["source_used_by_timeframe"] == {"1H": "no_valid_real_data_source"}
+    focused = summary["volatility_focus"]
+    expected_source = "collected_market_data_derived_from_15min"
+    assert env_path.read_text(encoding="utf-8") == env_before
+    assert summary["timeframes"] == ["1H"]
+    assert focused["timeframes_used"] == ["1H"]
+    assert summary["source_used"] == {"1H": expected_source}
+    assert focused["source_used_by_timeframe"] == {"1H": expected_source}
+    assert summary["research_result_valid"] is True
+    assert focused["research_result_valid"] is True
+    assert summary["row_count"]["1H"] > 0
+    assert focused["row_count"]["1H"] > 0
+    assert "15Min" not in summary["row_count"]
+    assert "15Min" not in focused["row_count"]
+    assert summary["timeframe_data"]["1H"]["derived_from_timeframe"] == "15Min"
+    assert any(
+        source["timeframe"] == "15Min" and source["status"] == "used_for_1H_derivation"
+        for source in summary["timeframe_data"]["1H"]["rejected_sources"]
+    )
+    assert {row["timeframe"] for row in summary["all_results"]} == {"1H"}
+    assert {row["timeframe"] for row in focused["top_configs"]} == {"1H"}
+    assert all(
+        "data_source_not_collected_market_data" not in row["research_rejection_reasons"].split(";")
+        for row in summary["all_results"]
+    )
+    assert all(
+        "research_data_source_invalid" not in row["research_rejection_reasons"].split(";")
+        for row in summary["all_results"]
+    )
+    assert focused["synthetic_data_used"] is False
+    assert summary["synthetic_data_used"] is False
+    assert focused["orders_placed"] == 0
+    assert focused["trading_enabled"] is False
+    assert focused["auto_trade_enabled"] is False
+    assert focused["fallback_trading_allowed"] is False
+    assert summary["trading_enabled"] is False
+    assert summary["auto_trade_enabled"] is False
+    assert summary["fallback_trading_allowed"] is False
 
 
 def test_default_research_row_limit_remains_backward_compatible(tmp_path):

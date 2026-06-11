@@ -131,6 +131,11 @@ RISK_OFF_FILTER_PROFILES = (
     },
 )
 COST_SCENARIOS = ("current_taker", "maker_current", "maker_low_slippage", "zero_cost_sanity")
+DERIVATION_SOURCES_BY_TIMEFRAME = {
+    "1H": ("15Min",),
+    "4H": ("1H", "15Min"),
+    "1D": ("1H", "15Min"),
+}
 BUY_THE_DIP_SIGNAL_PROFILES = (
     {
         "rsi_threshold": 35.0,
@@ -486,31 +491,37 @@ async def run_higher_timeframe_research(
         lookback_days=lookback_days,
         now=current_time,
     )
-    requested_timeframes = _resolve_requested_timeframes(
+    requested_strategy_timeframes = _resolve_requested_timeframes(
         strategy,
         timeframes,
         higher_timeframe_audit=higher_timeframe_audit,
         exclude_15min=exclude_15min,
     )
     row_limits = max_rows_by_timeframe or {
-        timeframe: int(bar_limit) for timeframe in requested_timeframes
+        timeframe: int(bar_limit) for timeframe in requested_strategy_timeframes
     }
-    for timeframe in requested_timeframes:
+    for timeframe in requested_strategy_timeframes:
         limit = int(row_limits.get(timeframe, bar_limit))
+        raw_source_bars_by_timeframe = dict(bars_by_timeframe)
+        raw_source_reports_by_timeframe = dict(data_source_reports)
         result = await _fetch_or_derive_research_bars(
             client,
             settings,
             timeframe=timeframe,
             limit=limit,
-            existing_bars_by_timeframe=bars_by_timeframe,
-            existing_reports_by_timeframe=data_source_reports,
+            existing_bars_by_timeframe=raw_source_bars_by_timeframe,
+            existing_reports_by_timeframe=raw_source_reports_by_timeframe,
             row_limits=row_limits,
             session_factory=session_factory,
             allow_synthetic_fallback=allow_synthetic_fallback,
             now=current_time,
             start=window_start,
             end=window_end,
-            allow_15min_derivation=not volatility_focus or "15Min" in requested_timeframes,
+            allowed_derivation_source_timeframes=_allowed_raw_derivation_sources_for_timeframe(
+                timeframe,
+                requested_strategy_timeframes,
+                volatility_focus=volatility_focus,
+            ),
         )
         bars_by_timeframe[timeframe] = result.bars
         data_source_reports[timeframe] = result.report
@@ -526,7 +537,7 @@ async def run_higher_timeframe_research(
         walk_forward_splits=walk_forward_splits,
         min_trades=min_trades,
         min_trades_per_split=min_trades_per_split,
-        timeframes=requested_timeframes,
+        timeframes=requested_strategy_timeframes,
         audit_mode=audit_mode,
         volatility_focus=volatility_focus,
         min_focused_trades=min_focused_trades,
@@ -551,7 +562,7 @@ async def run_higher_timeframe_research(
         walk_forward_splits=walk_forward_splits,
         min_trades=min_trades,
         min_trades_per_split=min_trades_per_split,
-        requested_timeframes=requested_timeframes,
+        requested_timeframes=requested_strategy_timeframes,
         audit_mode=audit_mode,
         bars_by_timeframe=bars_by_timeframe,
     )
@@ -579,7 +590,7 @@ async def run_higher_timeframe_research(
             max_v3_configs=max_v3_configs,
             walk_forward_splits=walk_forward_splits,
             min_trades_per_split=min_trades_per_split,
-            timeframes=requested_timeframes,
+            timeframes=requested_strategy_timeframes,
             output_dir=trade_log_dir or (output_path / "trade_audits"),
             top_n=top_n_trade_configs,
             include_rejected=include_rejected_trades,
@@ -612,7 +623,7 @@ async def run_higher_timeframe_research(
                 max_v3_configs=max_v3_configs,
                 walk_forward_splits=walk_forward_splits,
                 min_trades_per_split=min_trades_per_split,
-                timeframes=requested_timeframes,
+                timeframes=requested_strategy_timeframes,
                 output_dir=trade_log_dir or (output_path / "trade_audits"),
                 top_n=top_n_trade_configs,
                 include_rejected=True,
@@ -771,6 +782,22 @@ def _resolve_requested_timeframes(
     if not requested:
         raise ValueError("At least one research timeframe must be requested")
     return requested
+
+
+def _allowed_raw_derivation_sources_for_timeframe(
+    target_timeframe: str,
+    requested_strategy_timeframes: tuple[str, ...] | list[str],
+    *,
+    volatility_focus: bool,
+) -> tuple[str, ...] | None:
+    if not volatility_focus:
+        return None
+    candidate_sources = DERIVATION_SOURCES_BY_TIMEFRAME.get(target_timeframe, ())
+    requested = set(requested_strategy_timeframes)
+    allowed = {source for source in candidate_sources if source != "15Min"}
+    if target_timeframe == "1H" or "15Min" in requested:
+        allowed.add("15Min")
+    return tuple(source for source in candidate_sources if source in allowed)
 
 
 def _market_data_timeframe(timeframe: str) -> str:
@@ -3071,7 +3098,7 @@ def paper_forward_readiness_gate(
     reasons: list[str] = []
     if not research_result_valid:
         reasons.append("research_data_source_invalid")
-    if source_used is not None and source_used != "collected_market_data":
+    if source_used is not None and not _is_collected_market_data_source(source_used):
         reasons.append("data_source_not_collected_market_data")
     if _metric_float(metrics.get("net_return_pct")) <= 0:
         reasons.append("net_return_not_positive")
@@ -3123,7 +3150,7 @@ def volatility_focus_research_gate(
         research_reasons.append("research_data_source_invalid")
     if synthetic_data_used:
         research_reasons.append("synthetic_data_used")
-    if source_report is None or source_report.source_used != "collected_market_data":
+    if source_report is None or not _is_collected_market_data_source(source_report.source_used):
         research_reasons.append("data_source_not_collected_market_data")
     if config.timeframe not in {"1H", "4H"}:
         research_reasons.append("timeframe_not_1h_or_valid_4h")
@@ -4654,7 +4681,7 @@ async def _fetch_or_derive_research_bars(
     now: datetime | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
-    allow_15min_derivation: bool = True,
+    allowed_derivation_source_timeframes: tuple[str, ...] | list[str] | set[str] | None = None,
 ) -> ResearchBarsResult:
     result = await _fetch_research_bars(
         client,
@@ -4669,12 +4696,7 @@ async def _fetch_or_derive_research_bars(
     )
     if result.report.research_result_valid:
         return result
-    derivation_sources = {
-        "1H": ("15Min",),
-        "4H": ("1H", "15Min"),
-        "1D": ("1H", "15Min"),
-    }
-    if timeframe not in derivation_sources:
+    if timeframe not in DERIVATION_SOURCES_BY_TIMEFRAME:
         return result
 
     rejected_sources: list[dict[str, Any]] = [
@@ -4684,9 +4706,10 @@ async def _fetch_or_derive_research_bars(
     source_bars = pd.DataFrame()
     source_report: ResearchDataReport | None = None
     source_timeframe: str | None = None
-    candidate_sources = tuple(
-        source for source in derivation_sources[timeframe] if allow_15min_derivation or source != "15Min"
-    )
+    candidate_sources = DERIVATION_SOURCES_BY_TIMEFRAME[timeframe]
+    if allowed_derivation_source_timeframes is not None:
+        allowed_sources = set(allowed_derivation_source_timeframes)
+        candidate_sources = tuple(source for source in candidate_sources if source in allowed_sources)
     if not candidate_sources:
         return result
     for candidate_source in candidate_sources:
@@ -4695,7 +4718,7 @@ async def _fetch_or_derive_research_bars(
         if candidate_source in existing_bars_by_timeframe and candidate_source in existing_reports_by_timeframe:
             candidate_bars = existing_bars_by_timeframe[candidate_source]
             candidate_report = existing_reports_by_timeframe[candidate_source]
-        elif candidate_source in derivation_sources:
+        elif candidate_source in DERIVATION_SOURCES_BY_TIMEFRAME:
             candidate_result = await _fetch_or_derive_research_bars(
                 client,
                 settings,
@@ -4709,7 +4732,7 @@ async def _fetch_or_derive_research_bars(
                 now=now,
                 start=start,
                 end=end,
-                allow_15min_derivation=allow_15min_derivation,
+                allowed_derivation_source_timeframes=allowed_derivation_source_timeframes,
             )
             candidate_bars = candidate_result.bars
             candidate_report = candidate_result.report
@@ -4764,7 +4787,7 @@ async def _fetch_or_derive_research_bars(
     min_rows = _minimum_research_rows(settings, limit)
     derived_report = _assess_research_bars(
         derived,
-        source_used="collected_market_data",
+        source_used=_derived_source_used(source_report.source_used, source_timeframe),
         timeframe=timeframe,
         min_rows=min_rows,
         now=current_time,
@@ -4885,6 +4908,17 @@ def _source_bars_per_target_bar(source_timeframe: str, target_timeframe: str) ->
     if not float(ratio).is_integer():
         raise ValueError(f"{source_timeframe} does not divide evenly into {target_timeframe}")
     return int(ratio)
+
+
+def _derived_source_used(source_used: str, source_timeframe: str) -> str:
+    return f"{source_used}_derived_from_{source_timeframe.lower()}"
+
+
+def _is_collected_market_data_source(source_used: str | None) -> bool:
+    return bool(
+        source_used == "collected_market_data"
+        or (isinstance(source_used, str) and source_used.startswith("collected_market_data_derived_from_"))
+    )
 
 
 def _pandas_group_frequency(timeframe: str) -> str:
