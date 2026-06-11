@@ -103,6 +103,22 @@ VOLATILITY_FOCUS_MIN_RECENT_RETURN_VALUES = (0.001, 0.002, 0.003, 0.004, 0.006, 
 VOLATILITY_FOCUS_MIN_TREND_STRENGTH_VALUES = (0.0, 0.02, 0.05, 0.08, 0.10)
 VOLATILITY_FOCUS_MIN_VOLUME_ZSCORE_VALUES = (-0.25, 0.0, 0.25, 0.5, 0.75, 1.0)
 VOLATILITY_FOCUS_MAX_ATR_EXPANSION_VALUES = (1.8, 2.2, 2.6, 3.0, 3.5)
+VOLATILITY_FOCUS_V7_MIN_CONFIGS = 4000
+VOLATILITY_FOCUS_V7_BASE_CONFIGS = 1000
+VOLATILITY_FOCUS_TRACK_A = "A_vff_vbo_00808_expansion"
+VOLATILITY_FOCUS_TRACK_B = "B_vff_vbo_00001_exit_fix"
+EXIT_MODE_FIXED = "fixed_tp_sl_timeout"
+EXIT_MODE_BREAK_EVEN_1R = "break_even_stop_after_1r"
+EXIT_MODE_TRAILING_1R = "trailing_stop_after_1r"
+EXIT_MODE_MFE_PROTECT_1R_50 = "mfe_protection_1r_50"
+EXIT_MODE_TIME_STOP_MOMENTUM_WEAK = "time_stop_momentum_weak"
+VOLATILITY_FOCUS_V7_EXIT_MODES = (
+    EXIT_MODE_FIXED,
+    EXIT_MODE_BREAK_EVEN_1R,
+    EXIT_MODE_TRAILING_1R,
+    EXIT_MODE_MFE_PROTECT_1R_50,
+    EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+)
 VOLATILITY_FOCUS_RECOMMENDATIONS = (
     "no_edge_found",
     "cost_drag_only",
@@ -232,6 +248,8 @@ class ResearchConfig:
     min_consolidation_compression: float | None = None
     require_volume_expansion: bool | None = None
     max_atr_percentile: float | None = None
+    track_id: str | None = None
+    exit_mode: str = EXIT_MODE_FIXED
 
 
 @dataclass(frozen=True)
@@ -612,6 +630,8 @@ async def run_higher_timeframe_research(
             )
     focused_trade_audit_paths: list[dict[str, Any]] = []
     if volatility_focus:
+        focused_summary_path = save_focused_summary or (output_path / "volatility_focus_summary.json")
+        focused_output_stem = _focused_output_stem(focused_summary_path)
         if export_focused_trades:
             focused_trade_audit_paths = export_trade_audit_logs(
                 rows,
@@ -627,12 +647,12 @@ async def run_higher_timeframe_research(
                 output_dir=trade_log_dir or (output_path / "trade_audits"),
                 top_n=top_n_trade_configs,
                 include_rejected=True,
-                filename_prefix="volatility_focus_top_",
+                filename_prefix=f"{focused_output_stem}_top_",
             )
             summary["focused_trade_audits"] = focused_trade_audit_paths
-        focused_summary_path = save_focused_summary or (output_path / "volatility_focus_summary.json")
-        focused_top_csv_path = output_path / "volatility_focus_top_configs.csv"
-        focused_rejections_path = output_path / "volatility_focus_rejections.json"
+        focused_output_dir = focused_summary_path.parent
+        focused_top_csv_path = focused_output_dir / f"{focused_output_stem}_top_configs.csv"
+        focused_rejections_path = focused_output_dir / f"{focused_output_stem}_rejections.json"
         focused_summary = build_volatility_focus_summary(
             rows,
             settings,
@@ -680,6 +700,11 @@ def research_settings(settings: Settings) -> Settings:
         }
     )
     return Settings(_env_file=None, **data)
+
+
+def _focused_output_stem(focused_summary_path: Path) -> str:
+    stem = focused_summary_path.stem
+    return stem.removesuffix("_summary") if stem.endswith("_summary") else "volatility_focus"
 
 
 def research_config_settings(
@@ -1025,8 +1050,10 @@ def evaluate_research_configs(
         rows.append(
             {
                 "parameter_set_id": config.parameter_set_id,
+                "track_id": config.track_id,
                 "strategy_name": config.strategy_name,
                 "timeframe": config.timeframe,
+                "exit_mode": config.exit_mode,
                 "take_profit_pct": config.take_profit_pct,
                 "stop_loss_pct": config.stop_loss_pct,
                 "max_hold_bars": config.max_hold_bars,
@@ -1084,6 +1111,18 @@ def evaluate_research_configs(
                 "worst_fold_net_return_pct": _metric_float(walk_forward["worst_fold_net_return_pct"]),
                 "median_fold_net_return_pct": _metric_float(walk_forward["median_fold_net_return_pct"]),
                 "walk_forward_passed": bool(walk_forward["walk_forward_passed"]),
+                "current_taker_net_return_pct": _metric_float(
+                    (cost_summary.get("net_return_by_cost_scenario") or {}).get("current_taker")
+                ),
+                "maker_current_net_return_pct": _metric_float(
+                    (cost_summary.get("net_return_by_cost_scenario") or {}).get("maker_current")
+                ),
+                "maker_low_slippage_net_return_pct": _metric_float(
+                    (cost_summary.get("net_return_by_cost_scenario") or {}).get("maker_low_slippage")
+                ),
+                "zero_cost_net_return_pct": _metric_float(
+                    (cost_summary.get("net_return_by_cost_scenario") or {}).get("zero_cost_sanity")
+                ),
                 "statistically_weak": rank_details["statistically_weak"],
                 "trade_count_score": rank_details["trade_count_score"],
                 "concentration_penalty": rank_details["concentration_penalty"],
@@ -1619,14 +1658,14 @@ def generate_volatility_focus_configs(
         for timeframe in (timeframes or VOLATILITY_FOCUS_DEFAULT_TIMEFRAMES)
         if timeframe in VOLATILITY_FOCUS_SUPPORTED_TIMEFRAMES
     )
-    raw_specs: list[dict[str, Any]] = []
+    base_specs: list[dict[str, Any]] = []
 
     def add_spec(spec: dict[str, Any]) -> None:
         key = tuple((name, _normalise_spec_value(spec.get(name))) for name in sorted(spec))
         if key in seen_specs:
             return
         seen_specs.add(key)
-        raw_specs.append(spec)
+        base_specs.append(spec)
 
     seen_specs: set[tuple[tuple[str, Any], ...]] = set()
     for timeframe in requested_timeframes:
@@ -1694,64 +1733,290 @@ def generate_volatility_focus_configs(
             }
         )
 
-    if len(raw_specs) > max_configs:
-        anchors = raw_specs[: 2 * max(1, len(requested_timeframes))]
-        remaining = raw_specs[len(anchors) :]
-        desired_remaining = max(0, int(max_configs) - len(anchors))
-        sampled_remaining = (
-            [remaining[index] for index in _evenly_spaced_indexes(len(remaining), desired_remaining)]
-            if desired_remaining and remaining
-            else []
+    if _volatility_focus_v7_enabled(max_configs, requested_timeframes):
+        base_budget = min(VOLATILITY_FOCUS_V7_BASE_CONFIGS, max(0, int(max_configs) // 4))
+        targeted_budget = max(0, int(max_configs) - base_budget)
+        raw_specs = generate_volatility_focus_v7_targeted_specs(max_specs=targeted_budget)
+        raw_specs.extend(_sample_volatility_focus_specs(base_specs, base_budget, anchor_count=2))
+    else:
+        raw_specs = _sample_volatility_focus_specs(
+            base_specs,
+            int(max_configs),
+            anchor_count=2 * max(1, len(requested_timeframes)),
         )
-        raw_specs = anchors[: int(max_configs)] + sampled_remaining
 
     configs: list[ResearchConfig] = []
     for index, spec in enumerate(raw_specs[: int(max_configs)]):
         strategy_name = str(spec["strategy_name"])
         prefix = "vff_vbo" if strategy_name == VOLATILITY_BREAKOUT_STRATEGY else "vff_htfb"
-        configs.append(
-            ResearchConfig(
-                parameter_set_id=f"{prefix}_{index:05d}",
-                strategy_name=strategy_name,
-                timeframe=str(spec["timeframe"]),
-                take_profit_pct=float(spec["take_profit_pct"]),
-                stop_loss_pct=float(spec["stop_loss_pct"]),
-                max_hold_bars=int(spec["max_hold_bars"]),
-                breakout_lookback=int(spec["breakout_lookback"]),
-                consolidation_lookback=int(spec["consolidation_lookback"]),
-                min_volume_zscore=float(spec["min_volume_zscore"]),
-                min_body_vs_avg=float(spec["min_body_vs_avg"]),
-                min_recent_return_pct=float(spec["min_recent_return_pct"]),
-                min_trend_strength=float(spec["min_trend_strength"]),
-                max_atr_expansion=float(spec["max_atr_expansion"]),
-                require_ema_trend_filter=bool(spec.get("require_ema_trend_filter", False)),
-                require_positive_ema20_slope=bool(spec.get("require_positive_ema20_slope", False)),
-                require_close_above_ema200=bool(spec.get("require_close_above_ema200", False)),
-                max_breakout_candle_atr_multiple=(
-                    None
-                    if spec.get("max_breakout_candle_atr_multiple") is None
-                    else float(spec["max_breakout_candle_atr_multiple"])
-                ),
-                min_close_position_in_candle=(
-                    None
-                    if spec.get("min_close_position_in_candle") is None
-                    else float(spec["min_close_position_in_candle"])
-                ),
-                max_recent_runup_pct=(
-                    None if spec.get("max_recent_runup_pct") is None else float(spec["max_recent_runup_pct"])
-                ),
-                min_consolidation_compression=(
-                    None
-                    if spec.get("min_consolidation_compression") is None
-                    else float(spec["min_consolidation_compression"])
-                ),
-                require_volume_expansion=bool(spec.get("require_volume_expansion", False)),
-                max_atr_percentile=(
-                    None if spec.get("max_atr_percentile") is None else float(spec["max_atr_percentile"])
-                ),
-            )
-        )
+        configs.append(_research_config_from_volatility_focus_spec(spec, index=index, prefix=prefix))
     return configs
+
+
+def _volatility_focus_v7_enabled(max_configs: int, requested_timeframes: tuple[str, ...]) -> bool:
+    return int(max_configs) >= VOLATILITY_FOCUS_V7_MIN_CONFIGS and requested_timeframes == ("1H",)
+
+
+def _sample_volatility_focus_specs(
+    specs: list[dict[str, Any]],
+    desired: int,
+    *,
+    anchor_count: int,
+) -> list[dict[str, Any]]:
+    if desired <= 0 or not specs:
+        return []
+    if len(specs) <= desired:
+        return list(specs)
+    anchors = specs[: min(anchor_count, desired)]
+    remaining = specs[len(anchors) :]
+    desired_remaining = max(0, int(desired) - len(anchors))
+    sampled_remaining = (
+        [remaining[index] for index in _evenly_spaced_indexes(len(remaining), desired_remaining)]
+        if desired_remaining and remaining
+        else []
+    )
+    return anchors + sampled_remaining
+
+
+def _research_config_from_volatility_focus_spec(
+    spec: dict[str, Any],
+    *,
+    index: int,
+    prefix: str,
+) -> ResearchConfig:
+    return ResearchConfig(
+        parameter_set_id=str(spec.get("parameter_set_id") or f"{prefix}_{index:05d}"),
+        strategy_name=str(spec["strategy_name"]),
+        timeframe=str(spec["timeframe"]),
+        take_profit_pct=float(spec["take_profit_pct"]),
+        stop_loss_pct=float(spec["stop_loss_pct"]),
+        max_hold_bars=int(spec["max_hold_bars"]),
+        breakout_lookback=int(spec["breakout_lookback"]),
+        consolidation_lookback=int(spec["consolidation_lookback"]),
+        min_volume_zscore=float(spec["min_volume_zscore"]),
+        min_body_vs_avg=float(spec["min_body_vs_avg"]),
+        min_recent_return_pct=float(spec["min_recent_return_pct"]),
+        min_trend_strength=float(spec["min_trend_strength"]),
+        max_atr_expansion=float(spec["max_atr_expansion"]),
+        require_ema_trend_filter=bool(spec.get("require_ema_trend_filter", False)),
+        require_positive_ema20_slope=bool(spec.get("require_positive_ema20_slope", False)),
+        require_close_above_ema200=bool(spec.get("require_close_above_ema200", False)),
+        max_breakout_candle_atr_multiple=(
+            None
+            if spec.get("max_breakout_candle_atr_multiple") is None
+            else float(spec["max_breakout_candle_atr_multiple"])
+        ),
+        min_close_position_in_candle=(
+            None if spec.get("min_close_position_in_candle") is None else float(spec["min_close_position_in_candle"])
+        ),
+        max_recent_runup_pct=(None if spec.get("max_recent_runup_pct") is None else float(spec["max_recent_runup_pct"])),
+        min_consolidation_compression=(
+            None
+            if spec.get("min_consolidation_compression") is None
+            else float(spec["min_consolidation_compression"])
+        ),
+        require_volume_expansion=bool(spec.get("require_volume_expansion", False)),
+        max_atr_percentile=(None if spec.get("max_atr_percentile") is None else float(spec["max_atr_percentile"])),
+        track_id=spec.get("track_id"),
+        exit_mode=str(spec.get("exit_mode") or EXIT_MODE_FIXED),
+    )
+
+
+def generate_volatility_focus_v7_targeted_specs(*, max_specs: int) -> list[dict[str, Any]]:
+    if max_specs <= 0:
+        return []
+    track_a_budget = int(max_specs) // 2
+    track_a = _sample_volatility_focus_v7_track_specs(
+        track_id=VOLATILITY_FOCUS_TRACK_A,
+        desired=track_a_budget,
+        parameter_prefix="v7a",
+        take_profit_values=(0.06, 0.05, 0.055, 0.065, 0.07),
+        stop_loss_values=(0.02, 0.018, 0.022, 0.025),
+        max_hold_values=(96, 72, 120),
+        breakout_values=(20, 16, 24),
+        consolidation_values=(16, 12, 20),
+        body_values=(1.2, 1.0, 1.1),
+        recent_values=(0.004, 0.002, 0.003, 0.005),
+        trend_values=(0.05, 0.0, 0.03),
+        atr_values=(2.2, 2.6, 3.0),
+        volume_values=(0.5, 0.0, 0.25),
+    )
+    track_b = _sample_volatility_focus_v7_track_specs(
+        track_id=VOLATILITY_FOCUS_TRACK_B,
+        desired=max(0, int(max_specs) - len(track_a)),
+        parameter_prefix="v7b",
+        take_profit_values=(0.04, 0.045, 0.05, 0.055, 0.06),
+        stop_loss_values=(0.02, 0.018, 0.022, 0.025),
+        max_hold_values=(48, 36, 60, 72),
+        breakout_values=(20, 16, 24),
+        consolidation_values=(12, 8, 16),
+        body_values=(1.0, 0.8, 1.2),
+        recent_values=(0.002, 0.001, 0.003),
+        trend_values=(0.0, 0.03),
+        atr_values=(2.6, 2.2, 3.0, 3.5),
+        volume_values=(0.5, 0.0, 0.25),
+    )
+    return track_a + track_b
+
+
+def _sample_volatility_focus_v7_track_specs(
+    *,
+    track_id: str,
+    desired: int,
+    parameter_prefix: str,
+    take_profit_values: tuple[float, ...],
+    stop_loss_values: tuple[float, ...],
+    max_hold_values: tuple[int, ...],
+    breakout_values: tuple[int, ...],
+    consolidation_values: tuple[int, ...],
+    body_values: tuple[float, ...],
+    recent_values: tuple[float, ...],
+    trend_values: tuple[float, ...],
+    atr_values: tuple[float, ...],
+    volume_values: tuple[float, ...],
+) -> list[dict[str, Any]]:
+    if desired <= 0:
+        return []
+    dimensions = (
+        VOLATILITY_FOCUS_V7_EXIT_MODES,
+        take_profit_values,
+        stop_loss_values,
+        max_hold_values,
+        breakout_values,
+        consolidation_values,
+        body_values,
+        recent_values,
+        trend_values,
+        atr_values,
+        volume_values,
+        _volatility_focus_v7_quality_profiles(),
+    )
+    total = math.prod(len(dimension) for dimension in dimensions)
+    sampled_indexes = _evenly_spaced_indexes(total, max(1, int(desired) - len(VOLATILITY_FOCUS_V7_EXIT_MODES)))
+    specs: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[str, Any], ...]] = set()
+    anchor_values = (
+        take_profit_values[0],
+        stop_loss_values[0],
+        max_hold_values[0],
+        breakout_values[0],
+        consolidation_values[0],
+        body_values[0],
+        recent_values[0],
+        trend_values[0],
+        atr_values[0],
+        volume_values[0],
+        _volatility_focus_v7_quality_profiles()[0],
+    )
+    for exit_mode in VOLATILITY_FOCUS_V7_EXIT_MODES:
+        _append_volatility_focus_v7_track_spec(
+            specs,
+            seen,
+            track_id=track_id,
+            values=(exit_mode, *anchor_values),
+        )
+    for index in sampled_indexes:
+        _append_volatility_focus_v7_track_spec(
+            specs,
+            seen,
+            track_id=track_id,
+            values=_product_values_at_index(dimensions, index),
+        )
+        if len(specs) >= desired:
+            break
+    fill_index = 0
+    while len(specs) < desired and fill_index < total:
+        _append_volatility_focus_v7_track_spec(
+            specs,
+            seen,
+            track_id=track_id,
+            values=_product_values_at_index(dimensions, fill_index),
+        )
+        fill_index += 1
+    return [
+        {
+            **spec,
+            "parameter_set_id": f"{parameter_prefix}_{index:05d}",
+        }
+        for index, spec in enumerate(specs[:desired])
+    ]
+
+
+def _volatility_focus_v7_quality_profiles() -> tuple[dict[str, Any], ...]:
+    disabled = {
+        "require_ema_trend_filter": False,
+        "require_positive_ema20_slope": False,
+        "require_close_above_ema200": False,
+        "max_breakout_candle_atr_multiple": None,
+        "min_close_position_in_candle": None,
+        "max_recent_runup_pct": None,
+        "min_consolidation_compression": None,
+        "require_volume_expansion": False,
+        "max_atr_percentile": None,
+    }
+    light = {
+        **disabled,
+        "require_close_above_ema200": True,
+        "max_breakout_candle_atr_multiple": 3.0,
+        "min_close_position_in_candle": 0.50,
+        "max_recent_runup_pct": 0.10,
+        "min_consolidation_compression": 0.80,
+        "max_atr_percentile": 0.97,
+    }
+    return disabled, light
+
+
+def _append_volatility_focus_v7_track_spec(
+    specs: list[dict[str, Any]],
+    seen: set[tuple[tuple[str, Any], ...]],
+    *,
+    track_id: str,
+    values: tuple[Any, ...],
+) -> None:
+    (
+        exit_mode,
+        take_profit_pct,
+        stop_loss_pct,
+        max_hold_bars,
+        breakout_lookback,
+        consolidation_lookback,
+        min_body_vs_avg,
+        min_recent_return_pct,
+        min_trend_strength,
+        max_atr_expansion,
+        min_volume_zscore,
+        quality_profile,
+    ) = values
+    spec = {
+        "track_id": track_id,
+        "exit_mode": exit_mode,
+        "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+        "timeframe": "1H",
+        "take_profit_pct": float(take_profit_pct),
+        "stop_loss_pct": float(stop_loss_pct),
+        "max_hold_bars": int(max_hold_bars),
+        "breakout_lookback": int(breakout_lookback),
+        "consolidation_lookback": int(consolidation_lookback),
+        "min_body_vs_avg": float(min_body_vs_avg),
+        "min_recent_return_pct": float(min_recent_return_pct),
+        "min_trend_strength": float(min_trend_strength),
+        "max_atr_expansion": float(max_atr_expansion),
+        "min_volume_zscore": float(min_volume_zscore),
+        **quality_profile,
+    }
+    key = tuple((name, _normalise_spec_value(spec.get(name))) for name in sorted(spec))
+    if key not in seen:
+        seen.add(key)
+        specs.append(spec)
+
+
+def _product_values_at_index(dimensions: tuple[tuple[Any, ...], ...], index: int) -> tuple[Any, ...]:
+    values: list[Any] = []
+    remaining = int(index)
+    for dimension in reversed(dimensions):
+        values.append(dimension[remaining % len(dimension)])
+        remaining //= len(dimension)
+    return tuple(reversed(values))
 
 
 def volatility_focus_signal_profiles() -> tuple[dict[str, Any], ...]:
@@ -2619,19 +2884,38 @@ def build_buy_the_dip_research_trades(
 def resolve_research_exit(features: pd.DataFrame, entry_index: int, config: ResearchConfig) -> dict[str, Any]:
     entry_close = float(features.iloc[entry_index]["close"])
     take_profit_price = entry_close * (1 + config.take_profit_pct)
-    stop_loss_price = entry_close * (1 - config.stop_loss_pct)
+    initial_stop_loss_price = entry_close * (1 - config.stop_loss_pct)
+    stop_loss_price = initial_stop_loss_price
     max_exit_index = min(len(features) - 1, entry_index + config.max_hold_bars)
+    exit_mode = config.exit_mode or EXIT_MODE_FIXED
+    one_r_price = entry_close * (1 + config.stop_loss_pct)
+    one_r_reached = False
+    high_watermark = entry_close
+    time_stop_after_bars = max(3, min(max(3, int(config.max_hold_bars) - 1), int(config.max_hold_bars * 0.50)))
     for offset, row_index in enumerate(range(entry_index + 1, max_exit_index + 1), start=1):
         row = features.iloc[row_index]
         high = float(row["high"])
         low = float(row["low"])
+        close = float(row["close"])
+        high_watermark = max(high_watermark, high)
+        one_r_reached = one_r_reached or high >= one_r_price
+        if one_r_reached and exit_mode == EXIT_MODE_BREAK_EVEN_1R:
+            stop_loss_price = max(stop_loss_price, entry_close)
+        elif one_r_reached and exit_mode == EXIT_MODE_TRAILING_1R:
+            stop_loss_price = max(stop_loss_price, entry_close, high_watermark * (1 - config.stop_loss_pct))
         hit_take_profit = high >= take_profit_price
         hit_stop_loss = low <= stop_loss_price
         window = features.iloc[entry_index + 1 : row_index + 1]
         if hit_take_profit and hit_stop_loss:
+            gross_return = stop_loss_price / entry_close - 1
+            exit_reason = (
+                "ambiguous_stop_first"
+                if stop_loss_price <= initial_stop_loss_price
+                else _dynamic_stop_exit_reason(exit_mode)
+            )
             return _exit_result(
-                -config.stop_loss_pct,
-                "ambiguous_stop_first",
+                gross_return,
+                exit_reason,
                 offset,
                 high,
                 low,
@@ -2641,9 +2925,11 @@ def resolve_research_exit(features: pd.DataFrame, entry_index: int, config: Rese
                 window=window,
             )
         if hit_stop_loss:
+            gross_return = stop_loss_price / entry_close - 1
+            exit_reason = "research_stop_loss" if stop_loss_price <= initial_stop_loss_price else _dynamic_stop_exit_reason(exit_mode)
             return _exit_result(
-                -config.stop_loss_pct,
-                "research_stop_loss",
+                gross_return,
+                exit_reason,
                 offset,
                 high,
                 low,
@@ -2652,6 +2938,21 @@ def resolve_research_exit(features: pd.DataFrame, entry_index: int, config: Rese
                 exit_index=row_index,
                 window=window,
             )
+        if one_r_reached and exit_mode == EXIT_MODE_MFE_PROTECT_1R_50:
+            max_favorable_pct = max(0.0, high_watermark / entry_close - 1)
+            protect_price = entry_close * (1 + max_favorable_pct * 0.50)
+            if low <= protect_price:
+                return _exit_result(
+                    protect_price / entry_close - 1,
+                    "research_mfe_protection",
+                    offset,
+                    high,
+                    low,
+                    entry_close=entry_close,
+                    exit_timestamp=row.get("timestamp"),
+                    exit_index=row_index,
+                    window=window,
+                )
         if hit_take_profit:
             return _exit_result(
                 config.take_profit_pct,
@@ -2664,6 +2965,19 @@ def resolve_research_exit(features: pd.DataFrame, entry_index: int, config: Rese
                 exit_index=row_index,
                 window=window,
             )
+        if exit_mode == EXIT_MODE_TIME_STOP_MOMENTUM_WEAK and offset >= time_stop_after_bars:
+            if _momentum_weak_for_time_stop(row):
+                return _exit_result(
+                    close / entry_close - 1,
+                    "research_time_stop_momentum_weak",
+                    offset,
+                    high,
+                    low,
+                    entry_close=entry_close,
+                    exit_timestamp=row.get("timestamp"),
+                    exit_index=row_index,
+                    window=window,
+                )
     exit_row = features.iloc[max_exit_index]
     gross_return = float(exit_row["close"] / entry_close - 1)
     window = features.iloc[entry_index + 1 : max_exit_index + 1]
@@ -2678,6 +2992,24 @@ def resolve_research_exit(features: pd.DataFrame, entry_index: int, config: Rese
         exit_index=max_exit_index,
         window=window,
     )
+
+
+def _dynamic_stop_exit_reason(exit_mode: str) -> str:
+    if exit_mode == EXIT_MODE_BREAK_EVEN_1R:
+        return "research_break_even_stop"
+    if exit_mode == EXIT_MODE_TRAILING_1R:
+        return "research_trailing_stop"
+    return "research_stop_loss"
+
+
+def _momentum_weak_for_time_stop(row: pd.Series) -> bool:
+    close = _metric_float(row.get("close"))
+    ema_20 = _metric_float(row.get("ema_20"))
+    log_return_3 = _metric_float(row.get("log_return_3"))
+    ema_50_slope = _metric_float(row.get("ema_50_slope_5"))
+    if close > 0 and ema_20 > 0 and close < ema_20:
+        return True
+    return log_return_3 <= 0 or ema_50_slope <= 0
 
 
 def build_walk_forward_inputs(
@@ -3234,11 +3566,24 @@ def volatility_focus_trade_diagnostics(
     stop_risk = max(1e-12, float(config.stop_loss_pct))
     quick_stop_bars = max(1.0, min(3.0, float(config.max_hold_bars) * 0.25))
     stopped = np.asarray(
-        [reason in {"research_stop_loss", "ambiguous_stop_first"} for reason in exit_reasons],
+        [
+            reason
+            in {
+                "research_stop_loss",
+                "ambiguous_stop_first",
+                "research_break_even_stop",
+                "research_trailing_stop",
+            }
+            for reason in exit_reasons
+        ],
         dtype=bool,
     )
-    timed_out = np.asarray([reason == "research_max_hold" for reason in exit_reasons], dtype=bool)
+    timed_out = np.asarray(
+        [reason in {"research_max_hold", "research_time_stop_momentum_weak"} for reason in exit_reasons],
+        dtype=bool,
+    )
     took_profit = np.asarray([reason == "research_take_profit" for reason in exit_reasons], dtype=bool)
+    protected = np.asarray([reason == "research_mfe_protection" for reason in exit_reasons], dtype=bool)
     stopped_quickly = stopped & (bars_held <= quick_stop_bars) if len(bars_held) else np.asarray([], dtype=bool)
     return {
         "total_entries": int(len(signal_frame)),
@@ -3254,6 +3599,7 @@ def volatility_focus_trade_diagnostics(
         "pct_trades_timing_out": float(timed_out.mean()) if len(timed_out) else 0.0,
         "pct_trades_exiting_by_take_profit": float(took_profit.mean()) if len(took_profit) else 0.0,
         "pct_trades_exiting_by_stop_loss": float(stopped.mean()) if len(stopped) else 0.0,
+        "pct_trades_exiting_by_protective_stop": float(protected.mean()) if len(protected) else 0.0,
         "average_bars_held": float(bars_held.mean()) if len(bars_held) else 0.0,
         "median_bars_held": float(np.median(bars_held)) if len(bars_held) else 0.0,
         "fold_by_fold_returns": walk_forward.get("per_fold_net_return_pct", []),
@@ -3637,7 +3983,29 @@ def build_volatility_focus_summary(
     research_promising_rows = [row for row in eligible_rows if row.get("research_promising")]
     economically_viable_rows = [row for row in eligible_rows if row.get("economically_viable")]
     paper_forward_rows = [row for row in eligible_rows if row.get("paper_forward_eligible")]
+    all_track_a_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_A]
+    all_track_b_rows = [row for row in ranked if row.get("track_id") == VOLATILITY_FOCUS_TRACK_B]
+    track_a_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_A]
+    track_b_rows = [row for row in eligible_rows if row.get("track_id") == VOLATILITY_FOCUS_TRACK_B]
+    twenty_plus_current_positive = [
+        row
+        for row in eligible_rows
+        if int(row.get("number_of_trades", 0) or 0) >= MIN_RESEARCH_TRADES
+        and _metric_float((row.get("net_return_by_cost_scenario") or {}).get("current_taker")) > 0
+    ]
+    walk_forward_current_positive = [
+        row
+        for row in twenty_plus_current_positive
+        if bool(row.get("walk_forward_passed"))
+    ]
+    all_research_gates_passed = [
+        row
+        for row in eligible_rows
+        if not str(row.get("research_rejection_reasons") or "")
+        and bool(row.get("research_promising"))
+    ]
     diagnosis = volatility_focus_diagnosis(ranked, research_result_valid=research_result_valid)
+    v7_failure = volatility_focus_v7_failure_analysis(eligible_rows if research_result_valid else ranked)
     recommendation = volatility_focus_recommendation(
         ranked,
         research_result_valid=research_result_valid,
@@ -3685,6 +4053,17 @@ def build_volatility_focus_summary(
         "best_low_cost_config": best_config_for_cost_scenario(eligible_rows, "maker_low_slippage"),
         "best_zero_cost_config": best_config_for_cost_scenario(eligible_rows, "zero_cost_sanity"),
         "best_walk_forward_config": best_ranked_config(walk_forward_rows),
+        "candidate_a_best": best_ranked_config(track_a_rows or all_track_a_rows),
+        "candidate_b_best": best_ranked_config(track_b_rows or all_track_b_rows),
+        "best_20_plus_current_cost_positive": best_ranked_config(twenty_plus_current_positive),
+        "best_walk_forward_current_cost_positive": best_ranked_config(walk_forward_current_positive),
+        "best_all_research_gates_passed": best_ranked_config(all_research_gates_passed),
+        "any_config_passed_all_research_gates": bool(all_research_gates_passed),
+        "volatility_focus_v7_failure_analysis": v7_failure,
+        "volatility_focus_v7_track_counts": {
+            VOLATILITY_FOCUS_TRACK_A: len(all_track_a_rows),
+            VOLATILITY_FOCUS_TRACK_B: len(all_track_b_rows),
+        },
         "top_configs": ranked[:10],
         "rejection_reason_counts": {
             "research": rejection_reason_counts_for_field(ranked, "research_rejection_reasons"),
@@ -3721,9 +4100,11 @@ def write_volatility_focus_outputs(
     ranked = sorted(rows, key=_rank_sort_key, reverse=True)
     top_rows = ranked[:50]
     top_fields = [
+        "track_id",
         "parameter_set_id",
         "strategy_name",
         "timeframe",
+        "exit_mode",
         "take_profit_pct",
         "stop_loss_pct",
         "max_hold_bars",
@@ -3735,6 +4116,10 @@ def write_volatility_focus_outputs(
         "min_volume_zscore",
         "max_atr_expansion",
         "number_of_trades",
+        "current_taker_net_return_pct",
+        "maker_current_net_return_pct",
+        "maker_low_slippage_net_return_pct",
+        "zero_cost_net_return_pct",
         "net_return_pct",
         "profit_factor_net",
         "max_drawdown_pct",
@@ -3747,11 +4132,16 @@ def write_volatility_focus_outputs(
         "pct_trades_timing_out",
         "pct_trades_exiting_by_take_profit",
         "pct_trades_exiting_by_stop_loss",
+        "pct_trades_exiting_by_protective_stop",
         "average_bars_held",
         "walk_forward_passed",
         "folds_with_min_trades_count",
+        "per_fold_number_of_trades",
+        "per_fold_net_return_pct",
+        "per_fold_profit_factor_net",
         "fold_by_fold_returns",
         "fold_by_fold_trade_counts",
+        "fold_by_fold_profit_factor",
         "cost_sensitivity_classification",
         "research_promising",
         "economically_viable",
@@ -3773,9 +4163,15 @@ def write_volatility_focus_outputs(
         "rejected_configs": [
             {
                 "parameter_set_id": row.get("parameter_set_id"),
+                "track_id": row.get("track_id"),
                 "strategy_name": row.get("strategy_name"),
                 "timeframe": row.get("timeframe"),
+                "exit_mode": row.get("exit_mode"),
                 "number_of_trades": row.get("number_of_trades"),
+                "current_taker_net_return_pct": row.get("current_taker_net_return_pct"),
+                "maker_current_net_return_pct": row.get("maker_current_net_return_pct"),
+                "maker_low_slippage_net_return_pct": row.get("maker_low_slippage_net_return_pct"),
+                "zero_cost_net_return_pct": row.get("zero_cost_net_return_pct"),
                 "net_return_pct": row.get("net_return_pct"),
                 "research_rejection_reasons": row.get("research_rejection_reasons"),
                 "paper_forward_rejection_reasons": row.get("paper_forward_rejection_reasons"),
@@ -3798,6 +4194,47 @@ def rejection_reason_counts_for_field(rows: list[dict[str, Any]], field: str) ->
         for reason in [part for part in raw.split(";") if part]:
             counts[reason] = counts.get(reason, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def volatility_focus_v7_failure_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {
+            "primary_failure_mode": "no_configs_to_evaluate",
+            "failure_counts": {},
+        }
+    reason_counts = rejection_reason_counts_for_field(rows, "research_rejection_reasons")
+    failure_counts = {
+        "trade_count": sum(
+            count
+            for reason, count in reason_counts.items()
+            if reason.startswith("number_of_trades_below") or reason.startswith("folds_with_min_trades_below")
+        ),
+        "cost_drag": sum(
+            count
+            for reason, count in reason_counts.items()
+            if reason in {"current_taker_net_return_not_positive", "current_taker_profit_factor_below_1_05"}
+        ),
+        "drawdown": reason_counts.get("max_drawdown_above_configured_limit", 0),
+        "walk_forward_instability": reason_counts.get("walk_forward_not_passed", 0),
+        "baseline": sum(
+            count
+            for reason, count in reason_counts.items()
+            if reason in {"does_not_beat_buy_and_hold_risk_adjusted", "does_not_beat_dca_risk_adjusted"}
+        ),
+        "data_source": sum(
+            count
+            for reason, count in reason_counts.items()
+            if reason in {"research_data_source_invalid", "data_source_not_collected_market_data", "synthetic_data_used"}
+        ),
+    }
+    primary = max(failure_counts.items(), key=lambda item: (item[1], item[0]))[0]
+    if all(count == 0 for count in failure_counts.values()):
+        primary = "none_all_research_gates_passed"
+    return {
+        "primary_failure_mode": primary,
+        "failure_counts": failure_counts,
+        "research_rejection_reason_counts": reason_counts,
+    }
 
 
 def volatility_focus_diagnosis(rows: list[dict[str, Any]], *, research_result_valid: bool) -> dict[str, Any]:
@@ -4331,7 +4768,9 @@ def build_trade_audit_rows(
             {
                 "strategy_name": config.strategy_name,
                 "parameter_set_id": config.parameter_set_id,
+                "track_id": result_row.get("track_id"),
                 "timeframe": config.timeframe,
+                "exit_mode": result_row.get("exit_mode"),
                 "entry_timestamp": _timestamp_to_iso(entry_timestamp),
                 "exit_timestamp": _timestamp_to_iso(trade_row.get("exit_timestamp")),
                 "entry_price": _metric_float(trade_row.get("entry_price", trade_row.get("close"))),
@@ -4398,6 +4837,8 @@ def write_trade_audit_files(
         "parameter_set_id",
         "timeframe",
         "entry_timestamp",
+        "track_id",
+        "exit_mode",
         "exit_timestamp",
         "entry_price",
         "exit_price",
@@ -5317,6 +5758,8 @@ def _buy_the_dip_signal_row(row: pd.Series, *, config: ResearchConfig) -> dict[s
         "research_take_profit_pct": config.take_profit_pct,
         "research_stop_loss_pct": config.stop_loss_pct,
         "research_max_hold_bars": config.max_hold_bars,
+        "research_track_id": config.track_id,
+        "research_exit_mode": config.exit_mode,
         "rsi_14": float(row.get("rsi_14", 0.0)),
         "rolling_zscore_20": float(row.get("rolling_zscore_20", 0.0)),
         "vwap_distance": float(row.get("vwap_distance", 0.0)),
@@ -5362,6 +5805,8 @@ def _v3_signal_row(
         "research_take_profit_pct": config.take_profit_pct,
         "research_stop_loss_pct": config.stop_loss_pct,
         "research_max_hold_bars": config.max_hold_bars,
+        "research_track_id": config.track_id,
+        "research_exit_mode": config.exit_mode,
         "rsi_14": float(row.get("rsi_14", 0.0)),
         "volume_zscore_20": float(row.get("volume_zscore_20", 0.0)),
         "atr_expansion_20": float(row.get("atr_expansion_20", 0.0)),
@@ -5602,13 +6047,19 @@ def _profit_factor_value(value: Any) -> float:
 
 def _csv_fieldnames(rows: list[dict[str, Any]]) -> list[str]:
     preferred = [
+        "track_id",
         "parameter_set_id",
         "strategy_name",
         "timeframe",
+        "exit_mode",
         "take_profit_pct",
         "stop_loss_pct",
         "max_hold_bars",
         "number_of_trades",
+        "current_taker_net_return_pct",
+        "maker_current_net_return_pct",
+        "maker_low_slippage_net_return_pct",
+        "zero_cost_net_return_pct",
         "gross_return_pct",
         "net_return_pct",
         "profit_factor_net",

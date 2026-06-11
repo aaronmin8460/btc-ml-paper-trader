@@ -18,6 +18,12 @@ from scripts.research_higher_timeframe import (
     UPTREND_PULLBACK_STRATEGY,
     VOLATILITY_BREAKOUT_STRATEGY,
     VOLATILITY_FOCUS_STRATEGY,
+    EXIT_MODE_BREAK_EVEN_1R,
+    EXIT_MODE_MFE_PROTECT_1R_50,
+    EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+    EXIT_MODE_TRAILING_1R,
+    VOLATILITY_FOCUS_TRACK_A,
+    VOLATILITY_FOCUS_TRACK_B,
     ResearchDataReport,
     ResearchConfig,
     _resolve_requested_timeframes,
@@ -53,6 +59,7 @@ from scripts.research_higher_timeframe import (
     prepare_buy_the_dip_features,
     research_rank_details,
     research_settings,
+    resolve_research_exit,
     run_higher_timeframe_research,
     strategy_baseline_comparison,
     summarize_walk_forward_metrics,
@@ -235,6 +242,30 @@ def test_volatility_focus_strategy_generates_only_breakout_families():
         "htf_volatility_expansion_breakout",
     }
     assert "15Min" not in {config.timeframe for config in configs}
+
+
+def test_volatility_focus_v7_adds_targeted_1h_tracks_and_exit_modes():
+    configs = generate_volatility_focus_configs(max_configs=4000, timeframes=("1H",))
+    track_a = [config for config in configs if config.track_id == VOLATILITY_FOCUS_TRACK_A]
+    track_b = [config for config in configs if config.track_id == VOLATILITY_FOCUS_TRACK_B]
+
+    assert len(configs) == 4000
+    assert {config.timeframe for config in configs} == {"1H"}
+    assert {config.strategy_name for config in track_a + track_b} == {VOLATILITY_BREAKOUT_STRATEGY}
+    assert len(track_a) == 1500
+    assert len(track_b) == 1500
+    assert {config.exit_mode for config in track_a + track_b} == {
+        "fixed_tp_sl_timeout",
+        EXIT_MODE_BREAK_EVEN_1R,
+        EXIT_MODE_TRAILING_1R,
+        EXIT_MODE_MFE_PROTECT_1R_50,
+        EXIT_MODE_TIME_STOP_MOMENTUM_WEAK,
+    }
+    assert track_a[0].take_profit_pct == 0.06
+    assert track_a[0].stop_loss_pct == 0.02
+    assert track_a[0].max_hold_bars == 96
+    assert track_b[0].take_profit_pct == 0.04
+    assert track_b[0].max_hold_bars == 48
 
 
 def test_paper_forward_readiness_blocks_fallback_and_invalid_model():
@@ -664,8 +695,10 @@ def test_volatility_focus_summary_and_output_files_include_safety_and_rejections
     settings = research_settings(_settings())
     row = {
         "parameter_set_id": "vff_vbo_00001",
+        "track_id": VOLATILITY_FOCUS_TRACK_B,
         "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
         "timeframe": "1H",
+        "exit_mode": EXIT_MODE_BREAK_EVEN_1R,
         "take_profit_pct": 0.04,
         "stop_loss_pct": 0.02,
         "max_hold_bars": 48,
@@ -681,8 +714,15 @@ def test_volatility_focus_summary_and_output_files_include_safety_and_rejections
         "folds_with_min_trades_count": 3,
         "fold_by_fold_returns": [0.01, 0.005, 0.005, 0.0],
         "fold_by_fold_trade_counts": [7, 6, 6, 6],
+        "per_fold_number_of_trades": [7, 6, 6, 6],
+        "per_fold_net_return_pct": [0.01, 0.005, 0.005, 0.0],
+        "per_fold_profit_factor_net": [1.2, 1.1, 1.1, 1.0],
         "cost_sensitivity_classification": "signal_survives_current_taker_cost",
         "net_return_by_cost_scenario": {"current_taker": 0.02, "maker_low_slippage": 0.03, "zero_cost_sanity": 0.04},
+        "current_taker_net_return_pct": 0.02,
+        "maker_current_net_return_pct": 0.025,
+        "maker_low_slippage_net_return_pct": 0.03,
+        "zero_cost_net_return_pct": 0.04,
         "profit_factor_by_cost_scenario": {"current_taker": 1.2},
         "research_promising": True,
         "economically_viable": True,
@@ -736,10 +776,15 @@ def test_volatility_focus_summary_and_output_files_include_safety_and_rejections
     assert summary["synthetic_data_used"] is False
     assert summary["research_promising_count"] == 1
     assert summary["paper_forward_eligible_count"] == 0
+    assert summary["candidate_b_best"]["parameter_set_id"] == "vff_vbo_00001"
+    assert summary["best_20_plus_current_cost_positive"]["parameter_set_id"] == "vff_vbo_00001"
+    assert summary["best_walk_forward_current_cost_positive"]["parameter_set_id"] == "vff_vbo_00001"
+    assert summary["best_all_research_gates_passed"]["parameter_set_id"] == "vff_vbo_00001"
+    assert summary["any_config_passed_all_research_gates"] is True
     assert summary["recommendation"] == "candidate_found_keep_trading_disabled"
     assert (tmp_path / "volatility_focus_summary.json").exists()
     top_csv = (tmp_path / "volatility_focus_top_configs.csv").read_text(encoding="utf-8")
-    assert "parameter_set_id,strategy_name,timeframe" in top_csv
+    assert "track_id,parameter_set_id,strategy_name,timeframe,exit_mode" in top_csv
     rejections = (tmp_path / "volatility_focus_rejections.json").read_text(encoding="utf-8")
     assert "active_model_invalid" in rejections
 
@@ -974,6 +1019,49 @@ def test_volatility_breakout_produces_expected_long_only_entries_on_fixture_data
     assert set(trades["entry_reason"]) == {"volatility_breakout_momentum_continuation_candidate"}
     assert set(trades["ml_sell_probability"]) == {0.0}
     assert "short" not in set(str(reason).lower() for reason in trades["entry_reason"])
+
+
+def test_volatility_focus_v7_exit_modes_adjust_research_exits():
+    start = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+    features = pd.DataFrame(
+        [
+            {"timestamp": start, "close": 100.0, "high": 100.0, "low": 100.0, "ema_20": 99.0, "log_return_3": 0.01, "ema_50_slope_5": 0.01},
+            {"timestamp": start + timedelta(hours=1), "close": 103.0, "high": 104.0, "low": 102.5, "ema_20": 99.0, "log_return_3": 0.01, "ema_50_slope_5": 0.01},
+            {"timestamp": start + timedelta(hours=2), "close": 101.0, "high": 101.5, "low": 99.5, "ema_20": 99.0, "log_return_3": 0.01, "ema_50_slope_5": 0.01},
+            {"timestamp": start + timedelta(hours=3), "close": 100.5, "high": 101.0, "low": 100.0, "ema_20": 101.0, "log_return_3": -0.001, "ema_50_slope_5": -0.001},
+            {"timestamp": start + timedelta(hours=4), "close": 100.0, "high": 100.5, "low": 99.8, "ema_20": 101.0, "log_return_3": -0.001, "ema_50_slope_5": -0.001},
+        ]
+    )
+
+    break_even = resolve_research_exit(
+        features,
+        0,
+        _volatility_breakout_config(take_profit_pct=0.10, stop_loss_pct=0.02, max_hold_bars=4, exit_mode=EXIT_MODE_BREAK_EVEN_1R),
+    )
+    trailing = resolve_research_exit(
+        features,
+        0,
+        _volatility_breakout_config(take_profit_pct=0.10, stop_loss_pct=0.02, max_hold_bars=4, exit_mode=EXIT_MODE_TRAILING_1R),
+    )
+    mfe_protect = resolve_research_exit(
+        features,
+        0,
+        _volatility_breakout_config(take_profit_pct=0.10, stop_loss_pct=0.02, max_hold_bars=4, exit_mode=EXIT_MODE_MFE_PROTECT_1R_50),
+    )
+    time_stop = resolve_research_exit(
+        features,
+        0,
+        _volatility_breakout_config(take_profit_pct=0.10, stop_loss_pct=0.02, max_hold_bars=4, exit_mode=EXIT_MODE_TIME_STOP_MOMENTUM_WEAK),
+    )
+
+    assert break_even["exit_reason"] == "research_break_even_stop"
+    assert break_even["gross_return"] == pytest.approx(0.0)
+    assert trailing["exit_reason"] == "research_trailing_stop"
+    assert trailing["gross_return"] == pytest.approx(0.0192)
+    assert mfe_protect["exit_reason"] == "research_mfe_protection"
+    assert mfe_protect["gross_return"] == pytest.approx(0.02)
+    assert time_stop["exit_reason"] == "research_time_stop_momentum_weak"
+    assert time_stop["gross_return"] == pytest.approx(0.005)
 
 
 def test_volatility_focus_quality_filters_block_low_quality_breakouts():
@@ -1505,6 +1593,44 @@ def test_run_volatility_focus_writes_summary_and_keeps_trading_disabled(tmp_path
     assert summary["auto_trade_enabled"] is False
     assert list((tmp_path / "trade_audits").glob("volatility_focus_top_*.csv"))
     assert list((tmp_path / "trade_audits").glob("volatility_focus_top_*.jsonl"))
+
+
+def test_run_volatility_focus_uses_v7_output_stem_when_requested(tmp_path):
+    now = datetime(2026, 6, 7, 9, 0, tzinfo=UTC)
+    engine, Session = _session_factory(tmp_path)
+    _insert_collected_rows(Session, timeframe="1H", latest=now - timedelta(hours=1), count=80, step_minutes=60)
+
+    class ShouldNotFetchClient:
+        async def fetch_bars(self, *args, **kwargs):
+            raise AssertionError("fresh collected_market_data should be used before fetching client bars")
+
+    try:
+        summary = asyncio.run(
+            run_higher_timeframe_research(
+                _settings(min_training_rows=1),
+                bar_limit=80,
+                client=ShouldNotFetchClient(),
+                output_dir=tmp_path,
+                session_factory=Session,
+                now=now,
+                strategy=VOLATILITY_FOCUS_STRATEGY,
+                max_v3_configs=2,
+                save_focused_summary=tmp_path / "volatility_focus_v7_summary.json",
+                export_focused_trades=True,
+                trade_log_dir=tmp_path / "trade_audits",
+                top_n_trade_configs=1,
+            )
+        )
+    finally:
+        engine.dispose()
+
+    assert (tmp_path / "volatility_focus_v7_summary.json").exists()
+    assert (tmp_path / "volatility_focus_v7_top_configs.csv").exists()
+    assert (tmp_path / "volatility_focus_v7_rejections.json").exists()
+    assert summary["volatility_focus_top_configs_csv_path"].endswith("volatility_focus_v7_top_configs.csv")
+    assert summary["volatility_focus_rejections_path"].endswith("volatility_focus_v7_rejections.json")
+    assert list((tmp_path / "trade_audits").glob("volatility_focus_v7_top_*.csv"))
+    assert list((tmp_path / "trade_audits").glob("volatility_focus_v7_top_*.jsonl"))
 
 
 def test_volatility_focus_derives_1h_from_15min_without_15min_results(tmp_path, monkeypatch):
