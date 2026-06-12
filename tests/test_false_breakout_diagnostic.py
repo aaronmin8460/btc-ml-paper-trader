@@ -11,9 +11,12 @@ from scripts.research_higher_timeframe import (
     VOLATILITY_BREAKOUT_STRATEGY,
     ResearchConfig,
     attach_false_breakout_signal_features,
+    build_false_breakout_feature_comparisons,
     evaluate_false_breakout_filter_candidate,
     false_breakout_filter_metrics_pass,
     false_breakout_summary_from_outputs,
+    generate_false_breakout_filter_definitions,
+    simple_threshold_candidates,
 )
 
 
@@ -144,7 +147,83 @@ def test_filter_evaluation_removes_stops_and_preserves_tp():
     assert result["kept_tp_count"] == 2
 
 
-@pytest.mark.parametrize("feature", ["max_favorable_excursion_pct", "exit_reason"])
+def test_simple_threshold_candidates_skips_boolean_series_without_crashing():
+    candidates = simple_threshold_candidates(
+        pd.Series([True, False, True], dtype=bool),
+        pd.Series([False, True], dtype=bool),
+    )
+
+    assert candidates == []
+
+
+def test_boolean_signal_time_features_generate_boolean_equality_filter_candidates():
+    features = _feature_rows().assign(
+        close_above_ema20=[
+            True,
+            False,
+            True,
+            False,
+            True,
+            True,
+            True,
+            True,
+            False,
+            True,
+            True,
+            True,
+        ],
+        close_above_ema50=[True] * 12,
+        close_above_ema200=[False] * 12,
+    )
+
+    filter_names = {
+        candidate["filter_name"]
+        for candidate in generate_false_breakout_filter_definitions(features)
+        if candidate["feature"] in {"close_above_ema20", "close_above_ema50", "close_above_ema200"}
+    }
+
+    assert "close_above_ema20 == true" in filter_names
+    assert "close_above_ema20 == false" in filter_names
+    assert "close_above_ema50 == true" in filter_names
+    assert "close_above_ema50 == false" in filter_names
+    assert "close_above_ema200 == true" in filter_names
+    assert "close_above_ema200 == false" in filter_names
+
+
+def test_false_breakout_diagnostic_handles_boolean_ema_features():
+    features = _feature_rows().assign(
+        close_above_ema20=[
+            True,
+            False,
+            True,
+            False,
+            True,
+            True,
+            True,
+            True,
+            False,
+            True,
+            True,
+            True,
+        ],
+        close_above_ema50=[True] * 12,
+        close_above_ema200=[False] * 12,
+    )
+
+    comparisons = build_false_breakout_feature_comparisons(features)
+    candidates = generate_false_breakout_filter_definitions(features)
+    ema20_true = next(candidate for candidate in candidates if candidate["filter_name"] == "close_above_ema20 == true")
+    result = evaluate_false_breakout_filter_candidate(features, ema20_true)
+
+    assert comparisons
+    assert result["feature"] == "close_above_ema20"
+    assert result["uses_signal_time_features_only"] is True
+
+
+@pytest.mark.parametrize(
+    "feature",
+    ["max_favorable_excursion_pct", "max_adverse_excursion_pct", "exit_reason", "return_pct"],
+)
 def test_filter_cannot_use_future_or_outcome_features(feature):
     with pytest.raises(ValueError, match="signal-time-only"):
         evaluate_false_breakout_filter_candidate(

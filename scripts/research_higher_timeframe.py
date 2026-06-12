@@ -6252,15 +6252,16 @@ def build_false_breakout_feature_comparisons(features: pd.DataFrame) -> list[dic
         for column in FALSE_BREAKOUT_FEATURE_CSV_FIELDS
         if column not in {"signal_timestamp", "exit_reason"}
         and column in features
-        and pd.api.types.is_numeric_dtype(pd.to_numeric(features[column], errors="coerce"))
+        and not false_breakout_series_is_boolean(features[column])
+        and not false_breakout_numeric_non_boolean_values(features[column]).empty
     ]
     rows: list[dict[str, Any]] = []
     for name, stop_mask, win_mask in comparisons:
         stop_group = features.loc[stop_mask]
         win_group = features.loc[win_mask]
         for column in numeric_columns:
-            stop_values = pd.to_numeric(stop_group[column], errors="coerce").dropna()
-            win_values = pd.to_numeric(win_group[column], errors="coerce").dropna()
+            stop_values = false_breakout_numeric_non_boolean_values(stop_group[column])
+            win_values = false_breakout_numeric_non_boolean_values(win_group[column])
             if stop_values.empty or win_values.empty:
                 continue
             stop_mean = float(stop_values.mean())
@@ -6285,15 +6286,39 @@ def build_false_breakout_feature_comparisons(features: pd.DataFrame) -> list[dic
     return rows
 
 
+def false_breakout_series_is_boolean(values: pd.Series) -> bool:
+    series = pd.Series(values).dropna()
+    if series.empty:
+        return False
+    if pd.api.types.is_bool_dtype(series):
+        return True
+    raw_values = series.to_numpy(dtype=object)
+    if all(isinstance(value, (bool, np.bool_)) for value in raw_values):
+        return True
+    normalized = {str(value).strip().lower() for value in raw_values}
+    return bool(normalized) and normalized.issubset({"true", "false"})
+
+
+def false_breakout_numeric_non_boolean_values(values: pd.Series) -> pd.Series:
+    if false_breakout_series_is_boolean(values):
+        return pd.Series(dtype=float)
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric.empty or pd.api.types.is_bool_dtype(numeric):
+        return pd.Series(dtype=float)
+    return numeric.astype(float)
+
+
 def simple_threshold_candidates(stop_values: pd.Series, win_values: pd.Series) -> list[float]:
-    values = pd.concat([stop_values, win_values]).dropna()
-    if values.empty:
+    stop_numeric = false_breakout_numeric_non_boolean_values(stop_values)
+    win_numeric = false_breakout_numeric_non_boolean_values(win_values)
+    values = pd.concat([stop_numeric, win_numeric]).dropna()
+    if values.empty or stop_numeric.empty or win_numeric.empty:
         return []
     candidates = {
         float(values.quantile(0.25)),
         float(values.quantile(0.50)),
         float(values.quantile(0.75)),
-        float((stop_values.median() + win_values.median()) / 2),
+        float((stop_numeric.median() + win_numeric.median()) / 2),
     }
     return sorted(value for value in candidates if math.isfinite(value))
 
@@ -6318,7 +6343,7 @@ def generate_false_breakout_filter_definitions(features: pd.DataFrame) -> list[d
     def add_thresholds(feature: str, operator: str, defaults: tuple[float, ...] = ()) -> None:
         if feature not in features:
             return
-        values = pd.to_numeric(features[feature], errors="coerce").dropna()
+        values = false_breakout_numeric_non_boolean_values(features[feature])
         if values.empty:
             return
         thresholds = set(defaults)
@@ -6347,7 +6372,7 @@ def generate_false_breakout_filter_definitions(features: pd.DataFrame) -> list[d
     add_thresholds("signal_body_pct", ">=", (0.002, 0.005, 0.01))
     add_thresholds("signal_range_pct", "<=", (0.02, 0.03, 0.05))
     if "candle_body_vs_avg" in features:
-        body_values = pd.to_numeric(features["candle_body_vs_avg"], errors="coerce").dropna()
+        body_values = false_breakout_numeric_non_boolean_values(features["candle_body_vs_avg"])
         if not body_values.empty:
             for low_q, high_q in ((0.10, 0.90), (0.20, 0.80), (0.25, 0.75)):
                 low_value = float(body_values.quantile(low_q))
@@ -6364,14 +6389,15 @@ def generate_false_breakout_filter_definitions(features: pd.DataFrame) -> list[d
                     )
     for feature in ("close_above_ema20", "close_above_ema50", "close_above_ema200"):
         if feature in features and features[feature].notna().any():
-            candidates.append(
-                {
-                    "filter_name": f"{feature} == true",
-                    "feature": feature,
-                    "operator": "==",
-                    "threshold": True,
-                }
-            )
+            for threshold in (True, False):
+                candidates.append(
+                    {
+                        "filter_name": f"{feature} == {str(threshold).lower()}",
+                        "feature": feature,
+                        "operator": "==",
+                        "threshold": threshold,
+                    }
+                )
     for feature in ("hour_utc", "day_of_week"):
         bad_values = false_breakout_bad_time_values(features, feature)
         for value in bad_values:
