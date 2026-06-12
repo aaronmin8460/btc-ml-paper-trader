@@ -294,6 +294,33 @@ MIN_RESEARCH_TRADES = 20
 MIN_RESEARCH_TRADES_PER_SPLIT = 3
 MIN_RESEARCH_PROFIT_FACTOR_NET = 1.05
 MAX_SINGLE_TRADE_RETURN_SHARE = 0.60
+MAKER_FILL_DEFAULT_PARAMETER_SET_ID = "v9m_00021"
+MAKER_FILL_DEFAULT_ENTRY_OFFSET_BPS = 2.0
+MAKER_FILL_DEFAULT_ENTRY_TIMEOUT_MINUTES = 60
+MAKER_FILL_OFFSET_BPS_TESTS = (1.0, 2.0, 3.0, 5.0)
+MAKER_FILL_ENTRY_TIMEOUT_MINUTES_TESTS = (15, 30, 60, 120, 240)
+MAKER_FILL_TRADE_CSV_FIELDS = [
+    "signal_timestamp",
+    "signal_close",
+    "entry_limit_price",
+    "entry_filled",
+    "entry_fill_timestamp",
+    "minutes_to_entry_fill",
+    "entry_timeout_minutes",
+    "maker_entry_offset_bps",
+    "take_profit_price",
+    "stop_loss_price",
+    "exit_scenario",
+    "exit_reason",
+    "exit_timestamp",
+    "exit_price",
+    "return_pct",
+    "max_adverse_excursion_pct",
+    "max_favorable_excursion_pct",
+    "market_fallback_used",
+    "stop_loss_requires_taker_fallback",
+    "timeout_exit_requires_liquidity_assumption",
+]
 
 
 @dataclass(frozen=True)
@@ -466,6 +493,33 @@ def _parse_args() -> argparse.Namespace:
         help="Path for the dedicated volatility focus summary JSON.",
     )
     parser.add_argument(
+        "--maker-fill-simulation",
+        action="store_true",
+        help="Run offline research-only post-only maker fill simulation for a selected parameter set.",
+    )
+    parser.add_argument(
+        "--maker-fill-parameter-set-id",
+        default=MAKER_FILL_DEFAULT_PARAMETER_SET_ID,
+        help="Parameter set id to reconstruct for the post-only maker fill simulation.",
+    )
+    parser.add_argument(
+        "--maker-entry-offset-bps",
+        type=float,
+        default=MAKER_FILL_DEFAULT_ENTRY_OFFSET_BPS,
+        help="Primary post-only buy limit offset in basis points below the next lower-timeframe open.",
+    )
+    parser.add_argument(
+        "--maker-entry-timeout-minutes",
+        type=int,
+        default=MAKER_FILL_DEFAULT_ENTRY_TIMEOUT_MINUTES,
+        help="Primary entry cancellation timeout in minutes for the detailed maker fill audit.",
+    )
+    parser.add_argument(
+        "--save-maker-fill-summary",
+        default="logs/maker_fill_simulation_summary.json",
+        help="Path for the maker fill simulation summary JSON.",
+    )
+    parser.add_argument(
         "--min-trades-per-split",
         type=int,
         default=MIN_RESEARCH_TRADES_PER_SPLIT,
@@ -524,6 +578,11 @@ async def main() -> None:
         target_focused_trades=args.target_focused_trades,
         save_focused_summary=Path(args.save_focused_summary),
         export_focused_trades=args.export_focused_trades,
+        maker_fill_simulation=args.maker_fill_simulation,
+        maker_fill_parameter_set_id=args.maker_fill_parameter_set_id,
+        maker_entry_offset_bps=args.maker_entry_offset_bps,
+        maker_entry_timeout_minutes=args.maker_entry_timeout_minutes,
+        save_maker_fill_summary=Path(args.save_maker_fill_summary),
     )
     print(json.dumps(report, indent=2, default=str))
 
@@ -560,6 +619,11 @@ async def run_higher_timeframe_research(
     target_focused_trades: int = PREFERRED_RESEARCH_TRADES,
     save_focused_summary: Path | None = None,
     export_focused_trades: bool = False,
+    maker_fill_simulation: bool = False,
+    maker_fill_parameter_set_id: str = MAKER_FILL_DEFAULT_PARAMETER_SET_ID,
+    maker_entry_offset_bps: float = MAKER_FILL_DEFAULT_ENTRY_OFFSET_BPS,
+    maker_entry_timeout_minutes: int = MAKER_FILL_DEFAULT_ENTRY_TIMEOUT_MINUTES,
+    save_maker_fill_summary: Path | None = None,
 ) -> dict[str, Any]:
     settings = research_settings(base_settings)
     volatility_focus = bool(volatility_focus or strategy == VOLATILITY_FOCUS_STRATEGY)
@@ -765,6 +829,24 @@ async def run_higher_timeframe_research(
         summary["volatility_focus_summary_path"] = str(focused_summary_path)
         summary["volatility_focus_top_configs_csv_path"] = str(focused_top_csv_path)
         summary["volatility_focus_rejections_path"] = str(focused_rejections_path)
+    if maker_fill_simulation:
+        maker_fill_summary_path = save_maker_fill_summary or (
+            output_path / f"maker_fill_simulation_{maker_fill_parameter_set_id}_summary.json"
+        )
+        maker_fill_summary = build_and_write_maker_fill_simulation(
+            rows,
+            bars_by_timeframe,
+            settings,
+            data_source_reports=data_source_reports,
+            parameter_set_id=maker_fill_parameter_set_id,
+            summary_path=maker_fill_summary_path,
+            session_factory=session_factory,
+            maker_entry_offset_bps=maker_entry_offset_bps,
+            entry_timeout_minutes=maker_entry_timeout_minutes,
+            now=current_time,
+        )
+        summary["maker_fill_simulation"] = maker_fill_summary
+        summary["maker_fill_simulation_summary_path"] = str(maker_fill_summary_path)
     write_research_outputs(rows, summary, csv_path=csv_path, summary_path=summary_path)
     if audit_mode == "reality":
         (output_path / "strategy_reality_audit_summary.json").write_text(
@@ -4875,6 +4957,881 @@ def rejection_reason_counts_for_field(rows: list[dict[str, Any]], field: str) ->
         for reason in [part for part in raw.split(";") if part]:
             counts[reason] = counts.get(reason, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def build_and_write_maker_fill_simulation(
+    rows: list[dict[str, Any]],
+    bars_by_timeframe: dict[str, pd.DataFrame],
+    settings: Settings,
+    *,
+    data_source_reports: dict[str, ResearchDataReport | dict[str, Any]],
+    parameter_set_id: str,
+    summary_path: Path,
+    session_factory: Any | None,
+    maker_entry_offset_bps: float,
+    entry_timeout_minutes: int,
+    now: datetime,
+) -> dict[str, Any]:
+    target_row = next((row for row in rows if str(row.get("parameter_set_id")) == str(parameter_set_id)), None)
+    output_paths = maker_fill_output_paths(summary_path)
+    if target_row is None:
+        summary = maker_fill_summary_from_result(
+            simulation=empty_maker_fill_simulation_result(),
+            settings=settings,
+            target_row=None,
+            config=None,
+            signal_report=None,
+            fill_timeframe_used=None,
+            fill_source_used="no_valid_lower_timeframe_data",
+            fill_row_count=0,
+            source_used_by_timeframe={"fill": "no_target_parameter_set"},
+            row_count={"fill": 0},
+            research_result_valid=False,
+            data_ready=False,
+            synthetic_data_used=False,
+            maker_entry_offset_bps=maker_entry_offset_bps,
+            entry_timeout_minutes=entry_timeout_minutes,
+            maker_entry_offset_bps_results={},
+            entry_timeout_minutes_results={},
+            output_paths=output_paths,
+            extra_rejection_reasons=["parameter_set_id_not_found"],
+        )
+        write_maker_fill_outputs(summary, [], [], output_paths=output_paths)
+        return summary
+
+    config = research_config_from_result_row(target_row)
+    signal_report = _coerce_data_report(
+        config.timeframe,
+        data_source_reports.get(
+            config.timeframe,
+            {
+                "source_used": str(target_row.get("source_used") or "unknown"),
+                "row_count": int(target_row.get("row_count", 0) or 0),
+                "synthetic_data_used": bool(target_row.get("synthetic_data_used")),
+                "research_result_valid": bool(target_row.get("research_result_valid", True)),
+            },
+        ),
+    )
+    signal_bars = bars_by_timeframe.get(config.timeframe, pd.DataFrame())
+    candidate_settings = research_config_settings(settings, config)
+    trades, signals = build_strategy_research_trades(config, bars=signal_bars, settings=candidate_settings)
+    signal_trade_returns = [
+        _metric_float(row.get("buy_exit_return_pct", row.get("gross_return_pct", 0.0)))
+        for _, row in trades.iterrows()
+    ]
+    fill_timeframe_used, fill_bars, fill_source_used = select_maker_fill_bars(
+        settings,
+        signals,
+        config,
+        session_factory=session_factory,
+        now=now,
+    )
+    fill_row_count = int(len(fill_bars))
+    source_used_by_timeframe = {
+        config.timeframe: signal_report.source_used,
+    }
+    row_count = {
+        config.timeframe: signal_report.row_count,
+    }
+    if fill_timeframe_used is not None:
+        source_used_by_timeframe[fill_timeframe_used] = fill_source_used
+        row_count[fill_timeframe_used] = fill_row_count
+    else:
+        source_used_by_timeframe["fill"] = "no_valid_lower_timeframe_data"
+        row_count["fill"] = 0
+
+    primary = simulate_post_only_maker_fill_scenario(
+        signals,
+        fill_bars,
+        config,
+        candidate_settings,
+        maker_entry_offset_bps=maker_entry_offset_bps,
+        entry_timeout_minutes=entry_timeout_minutes,
+        signal_trade_returns=signal_trade_returns,
+    )
+    offset_results: dict[str, dict[str, Any]] = {}
+    for offset_bps in MAKER_FILL_OFFSET_BPS_TESTS:
+        result = simulate_post_only_maker_fill_scenario(
+            signals,
+            fill_bars,
+            config,
+            candidate_settings,
+            maker_entry_offset_bps=float(offset_bps),
+            entry_timeout_minutes=entry_timeout_minutes,
+            signal_trade_returns=signal_trade_returns,
+        )
+        offset_results[_maker_fill_parameter_key(offset_bps)] = compact_maker_fill_simulation_result(result)
+    timeout_results: dict[str, dict[str, Any]] = {}
+    for timeout_minutes in MAKER_FILL_ENTRY_TIMEOUT_MINUTES_TESTS:
+        result = simulate_post_only_maker_fill_scenario(
+            signals,
+            fill_bars,
+            config,
+            candidate_settings,
+            maker_entry_offset_bps=maker_entry_offset_bps,
+            entry_timeout_minutes=int(timeout_minutes),
+            signal_trade_returns=signal_trade_returns,
+        )
+        timeout_results[str(int(timeout_minutes))] = compact_maker_fill_simulation_result(result)
+
+    signal_valid = bool(signal_report.research_result_valid) and not bool(signal_report.synthetic_data_used)
+    fill_valid = fill_timeframe_used is not None and fill_row_count > 0
+    data_ready = bool(signal_valid and fill_valid)
+    research_result_valid = data_ready
+    synthetic_data_used = bool(signal_report.synthetic_data_used)
+    summary = maker_fill_summary_from_result(
+        simulation=primary,
+        settings=candidate_settings,
+        target_row=target_row,
+        config=config,
+        signal_report=signal_report,
+        fill_timeframe_used=fill_timeframe_used,
+        fill_source_used=fill_source_used,
+        fill_row_count=fill_row_count,
+        source_used_by_timeframe=source_used_by_timeframe,
+        row_count=row_count,
+        research_result_valid=research_result_valid,
+        data_ready=data_ready,
+        synthetic_data_used=synthetic_data_used,
+        maker_entry_offset_bps=maker_entry_offset_bps,
+        entry_timeout_minutes=entry_timeout_minutes,
+        maker_entry_offset_bps_results=offset_results,
+        entry_timeout_minutes_results=timeout_results,
+        output_paths=output_paths,
+        extra_rejection_reasons=[] if fill_valid else ["no_valid_lower_timeframe_data"],
+    )
+    write_maker_fill_outputs(
+        summary,
+        primary["trade_rows"],
+        primary["order_rows"],
+        output_paths=output_paths,
+    )
+    return summary
+
+
+def maker_fill_output_paths(summary_path: Path) -> dict[str, Path]:
+    prefix = summary_path.stem.removesuffix("_summary")
+    return {
+        "summary": summary_path,
+        "trades": summary_path.with_name(f"{prefix}_trades.csv"),
+        "orders": summary_path.with_name(f"{prefix}_orders.csv"),
+        "rejections": summary_path.with_name(f"{prefix}_rejections.json"),
+    }
+
+
+def research_config_from_result_row(row: dict[str, Any]) -> ResearchConfig:
+    return ResearchConfig(
+        parameter_set_id=str(row.get("parameter_set_id") or MAKER_FILL_DEFAULT_PARAMETER_SET_ID),
+        track_id=row.get("track_id"),
+        strategy_name=str(row.get("strategy_name") or VOLATILITY_BREAKOUT_STRATEGY),
+        timeframe=str(row.get("timeframe") or "1H"),
+        exit_mode=str(row.get("exit_mode") or EXIT_MODE_FIXED),
+        take_profit_pct=float(row.get("take_profit_pct") or 0.045),
+        stop_loss_pct=float(row.get("stop_loss_pct") or 0.02),
+        max_hold_bars=int(row.get("max_hold_bars") or 48),
+        breakout_lookback=int(row.get("breakout_lookback") or 20),
+        consolidation_lookback=int(row.get("consolidation_lookback") or 12),
+        min_body_vs_avg=float(row.get("min_body_vs_avg") or 1.2),
+        min_recent_return_pct=float(row.get("min_recent_return_pct") or 0.003),
+        min_trend_strength=float(row.get("min_trend_strength") or 0.0),
+        max_atr_expansion=float(row.get("max_atr_expansion") or 3.0),
+        min_volume_zscore=float(row.get("min_volume_zscore") or 0.25),
+        require_ema_trend_filter=bool(row.get("require_ema_trend_filter", False)),
+        require_positive_ema20_slope=bool(row.get("require_positive_ema20_slope", False)),
+        require_close_above_ema200=bool(row.get("require_close_above_ema200", False)),
+        max_breakout_candle_atr_multiple=(
+            None
+            if row.get("max_breakout_candle_atr_multiple") in {None, ""}
+            else float(row.get("max_breakout_candle_atr_multiple"))
+        ),
+        min_close_position_in_candle=(
+            None
+            if row.get("min_close_position_in_candle") in {None, ""}
+            else float(row.get("min_close_position_in_candle"))
+        ),
+        max_recent_runup_pct=(
+            None if row.get("max_recent_runup_pct") in {None, ""} else float(row.get("max_recent_runup_pct"))
+        ),
+        min_consolidation_compression=(
+            None
+            if row.get("min_consolidation_compression") in {None, ""}
+            else float(row.get("min_consolidation_compression"))
+        ),
+        require_volume_expansion=bool(row.get("require_volume_expansion", False)),
+        max_atr_percentile=(
+            None if row.get("max_atr_percentile") in {None, ""} else float(row.get("max_atr_percentile"))
+        ),
+    )
+
+
+def select_maker_fill_bars(
+    settings: Settings,
+    signal_frame: pd.DataFrame,
+    config: ResearchConfig,
+    *,
+    session_factory: Any | None,
+    now: datetime,
+) -> tuple[str | None, pd.DataFrame, str]:
+    window_start, window_end = maker_fill_window_for_signals(signal_frame, config, now=now)
+    for timeframe in ("1Min", "15Min"):
+        limit = lower_timeframe_fill_limit(window_start, window_end, timeframe=timeframe)
+        bars = _load_collected_market_data(
+            settings,
+            timeframe=timeframe,
+            limit=limit,
+            session_factory=session_factory,
+            start=window_start,
+            end=window_end,
+        )
+        if not bars.empty:
+            return timeframe, bars, "collected_market_data"
+    return None, pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"]), "no_valid_lower_timeframe_data"
+
+
+def maker_fill_window_for_signals(
+    signal_frame: pd.DataFrame,
+    config: ResearchConfig,
+    *,
+    now: datetime,
+) -> tuple[datetime | None, datetime | None]:
+    if signal_frame.empty or "timestamp" not in signal_frame:
+        return None, _utc_timestamp(now)
+    timestamps = pd.to_datetime(signal_frame["timestamp"], utc=True, errors="coerce").dropna()
+    if timestamps.empty:
+        return None, _utc_timestamp(now)
+    first_close = signal_bar_close_timestamp(timestamps.min(), config.timeframe)
+    last_close = signal_bar_close_timestamp(timestamps.max(), config.timeframe)
+    max_timeout = max(MAKER_FILL_ENTRY_TIMEOUT_MINUTES_TESTS)
+    hold_duration = parse_timeframe_duration(_market_data_timeframe(config.timeframe)) * int(config.max_hold_bars)
+    return first_close, last_close + timedelta(minutes=max_timeout) + hold_duration
+
+
+def lower_timeframe_fill_limit(
+    start: datetime | None,
+    end: datetime | None,
+    *,
+    timeframe: str,
+) -> int:
+    if start is None or end is None:
+        return 500_000 if timeframe == "1Min" else 50_000
+    duration_minutes = max(1.0, (_utc_timestamp(end) - _utc_timestamp(start)).total_seconds() / 60)
+    step_minutes = parse_timeframe_duration(_market_data_timeframe(timeframe)).total_seconds() / 60
+    return max(1, int(math.ceil(duration_minutes / max(1.0, step_minutes))) + 10)
+
+
+def simulate_post_only_maker_fill_scenario(
+    signal_frame: pd.DataFrame,
+    fill_bars: pd.DataFrame,
+    config: ResearchConfig,
+    settings: Settings,
+    *,
+    maker_entry_offset_bps: float = MAKER_FILL_DEFAULT_ENTRY_OFFSET_BPS,
+    entry_timeout_minutes: int = MAKER_FILL_DEFAULT_ENTRY_TIMEOUT_MINUTES,
+    signal_trade_returns: list[float] | None = None,
+) -> dict[str, Any]:
+    signal_count = int(len(signal_frame))
+    if fill_bars.empty:
+        fill_data = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    else:
+        fill_data = normalize_ohlcv(fill_bars)
+    if not fill_data.empty:
+        fill_data = fill_data.sort_values("timestamp").reset_index(drop=True)
+
+    trade_rows: list[dict[str, Any]] = []
+    order_rows: list[dict[str, Any]] = []
+    minutes_to_fill: list[float] = []
+    conservative_returns: list[float] = []
+    stress_returns: list[float] = []
+    stress_mae: list[float] = []
+    entry_filled_count = 0
+    maker_take_profit_fill_count = 0
+    stop_loss_accounting_count = 0
+    timeout_exit_count = 0
+    stop_loss_requires_taker_fallback_count = 0
+    missed_winner_count = 0
+    missed_loser_count = 0
+    signal_trade_returns = signal_trade_returns or []
+
+    for signal_index, (_, signal) in enumerate(signal_frame.reset_index(drop=True).iterrows()):
+        signal_timestamp = signal.get("timestamp")
+        signal_close = _metric_float(signal.get("close"))
+        close_timestamp = signal_bar_close_timestamp(signal_timestamp, config.timeframe)
+        deadline = close_timestamp + timedelta(minutes=int(entry_timeout_minutes))
+        entry_window = (
+            fill_data[
+                (fill_data["timestamp"] >= pd.Timestamp(close_timestamp))
+                & (fill_data["timestamp"] <= pd.Timestamp(deadline))
+            ].reset_index(drop=True)
+            if not fill_data.empty
+            else pd.DataFrame()
+        )
+        first_lower_open = _metric_float(entry_window.iloc[0].get("open")) if not entry_window.empty else 0.0
+        entry_reference_price = first_lower_open if first_lower_open > 0 else signal_close
+        entry_limit_price = entry_reference_price * (1 - float(maker_entry_offset_bps) / 10_000)
+        filled_match = (
+            entry_window.loc[pd.to_numeric(entry_window["low"], errors="coerce") <= entry_limit_price].head(1)
+            if not entry_window.empty
+            else pd.DataFrame()
+        )
+        order_base = {
+            "signal_timestamp": _timestamp_to_iso(signal_timestamp),
+            "order_timestamp": _timestamp_to_iso(close_timestamp),
+            "order_role": "entry",
+            "side": "buy",
+            "order_type": "post_only_limit",
+            "post_only": True,
+            "limit_price": entry_limit_price,
+            "maker_entry_offset_bps": float(maker_entry_offset_bps),
+            "entry_timeout_minutes": int(entry_timeout_minutes),
+            "market_fallback_used": False,
+            "orders_placed": 0,
+        }
+        if filled_match.empty:
+            optimistic_return = signal_trade_returns[signal_index] if signal_index < len(signal_trade_returns) else 0.0
+            if optimistic_return > 0:
+                missed_winner_count += 1
+            else:
+                missed_loser_count += 1
+            order_rows.append(
+                {
+                    **order_base,
+                    "status": "canceled",
+                    "fill_timestamp": None,
+                    "fill_price": None,
+                    "cancel_reason": "entry_limit_not_reached_before_timeout",
+                }
+            )
+            continue
+
+        entry_bar = filled_match.iloc[0]
+        entry_fill_timestamp = _utc_timestamp(entry_bar["timestamp"])
+        minutes = max(0.0, (entry_fill_timestamp - close_timestamp).total_seconds() / 60)
+        minutes_to_fill.append(minutes)
+        entry_filled_count += 1
+        take_profit_price = entry_limit_price * (1 + float(config.take_profit_pct))
+        stop_loss_price = entry_limit_price * (1 - float(config.stop_loss_pct))
+        order_rows.append(
+            {
+                **order_base,
+                "status": "filled",
+                "fill_timestamp": _timestamp_to_iso(entry_fill_timestamp),
+                "fill_price": entry_limit_price,
+                "cancel_reason": None,
+            }
+        )
+        exit_results = simulate_maker_exit_scenarios(
+            fill_data,
+            config,
+            settings,
+            entry_fill_timestamp=entry_fill_timestamp,
+            entry_fill_price=entry_limit_price,
+            take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
+        )
+        for scenario_name, exit_result in exit_results.items():
+            if scenario_name == "conservative_stop_accounting":
+                conservative_returns.append(_metric_float(exit_result["return_pct"]))
+                if exit_result["exit_reason"] == "maker_take_profit":
+                    maker_take_profit_fill_count += 1
+                if exit_result["exit_reason"] == "stop_loss_accounting":
+                    stop_loss_accounting_count += 1
+                if exit_result["timeout_exit_requires_liquidity_assumption"]:
+                    timeout_exit_count += 1
+                if exit_result["stop_loss_requires_taker_fallback"]:
+                    stop_loss_requires_taker_fallback_count += 1
+            else:
+                stress_returns.append(_metric_float(exit_result["return_pct"]))
+                stress_mae.append(_metric_float(exit_result["max_adverse_excursion_pct"]))
+            trade_rows.append(
+                {
+                    "signal_timestamp": _timestamp_to_iso(signal_timestamp),
+                    "signal_close": signal_close,
+                    "entry_limit_price": entry_limit_price,
+                    "entry_filled": True,
+                    "entry_fill_timestamp": _timestamp_to_iso(entry_fill_timestamp),
+                    "minutes_to_entry_fill": minutes,
+                    "entry_timeout_minutes": int(entry_timeout_minutes),
+                    "maker_entry_offset_bps": float(maker_entry_offset_bps),
+                    "take_profit_price": take_profit_price,
+                    "stop_loss_price": stop_loss_price,
+                    "exit_scenario": scenario_name,
+                    "exit_reason": exit_result["exit_reason"],
+                    "exit_timestamp": _timestamp_to_iso(exit_result["exit_timestamp"]),
+                    "exit_price": exit_result["exit_price"],
+                    "return_pct": exit_result["return_pct"],
+                    "max_adverse_excursion_pct": exit_result["max_adverse_excursion_pct"],
+                    "max_favorable_excursion_pct": exit_result["max_favorable_excursion_pct"],
+                    "market_fallback_used": False,
+                    "stop_loss_requires_taker_fallback": bool(exit_result["stop_loss_requires_taker_fallback"]),
+                    "timeout_exit_requires_liquidity_assumption": bool(
+                        exit_result["timeout_exit_requires_liquidity_assumption"]
+                    ),
+                }
+            )
+            order_rows.append(
+                {
+                    "signal_timestamp": _timestamp_to_iso(signal_timestamp),
+                    "order_timestamp": _timestamp_to_iso(entry_fill_timestamp),
+                    "order_role": "take_profit",
+                    "side": "sell",
+                    "order_type": "post_only_limit",
+                    "post_only": True,
+                    "limit_price": take_profit_price,
+                    "maker_entry_offset_bps": float(maker_entry_offset_bps),
+                    "entry_timeout_minutes": int(entry_timeout_minutes),
+                    "market_fallback_used": False,
+                    "orders_placed": 0,
+                    "exit_scenario": scenario_name,
+                    "status": "filled" if exit_result["exit_reason"].startswith("maker_take_profit") else "canceled",
+                    "fill_timestamp": (
+                        _timestamp_to_iso(exit_result["exit_timestamp"])
+                        if exit_result["exit_reason"].startswith("maker_take_profit")
+                        else None
+                    ),
+                    "fill_price": take_profit_price if exit_result["exit_reason"].startswith("maker_take_profit") else None,
+                    "cancel_reason": None
+                    if exit_result["exit_reason"].startswith("maker_take_profit")
+                    else exit_result["exit_reason"],
+                }
+            )
+
+    entry_unfilled_count = max(0, signal_count - entry_filled_count)
+    conservative_metrics = maker_fill_trade_metrics(conservative_returns)
+    stress_metrics = maker_fill_trade_metrics(stress_returns)
+    return {
+        "signal_count": signal_count,
+        "entry_orders_created": signal_count,
+        "entry_filled_count": entry_filled_count,
+        "entry_unfilled_count": entry_unfilled_count,
+        "entry_fill_rate": entry_filled_count / signal_count if signal_count else 0.0,
+        "entry_cancel_rate": entry_unfilled_count / signal_count if signal_count else 0.0,
+        "avg_minutes_to_entry_fill": float(np.mean(minutes_to_fill)) if minutes_to_fill else 0.0,
+        "median_minutes_to_entry_fill": float(np.median(minutes_to_fill)) if minutes_to_fill else 0.0,
+        "filled_trade_count": entry_filled_count,
+        "maker_take_profit_fill_count": maker_take_profit_fill_count,
+        "stop_loss_accounting_count": stop_loss_accounting_count,
+        "timeout_exit_count": timeout_exit_count,
+        "stop_loss_requires_taker_fallback_count": stop_loss_requires_taker_fallback_count,
+        "market_fallback_used_count": 0,
+        "conservative_stop_accounting_return_pct": conservative_metrics["return_pct"],
+        "conservative_stop_accounting_profit_factor": conservative_metrics["profit_factor"],
+        "conservative_stop_accounting_max_drawdown_pct": conservative_metrics["max_drawdown_pct"],
+        "no_market_fallback_stress_return_pct": stress_metrics["return_pct"],
+        "no_market_fallback_stress_profit_factor": stress_metrics["profit_factor"],
+        "no_market_fallback_stress_max_drawdown_pct": stress_metrics["max_drawdown_pct"],
+        "worst_adverse_excursion_pct": min(stress_mae) if stress_mae else 0.0,
+        "missed_winner_count": missed_winner_count,
+        "missed_loser_count": missed_loser_count,
+        "trade_rows": trade_rows,
+        "order_rows": order_rows,
+    }
+
+
+def signal_bar_close_timestamp(value: Any, timeframe: str) -> datetime:
+    return _utc_timestamp(value) + parse_timeframe_duration(_market_data_timeframe(timeframe))
+
+
+def simulate_maker_exit_scenarios(
+    fill_data: pd.DataFrame,
+    config: ResearchConfig,
+    settings: Settings,
+    *,
+    entry_fill_timestamp: datetime,
+    entry_fill_price: float,
+    take_profit_price: float,
+    stop_loss_price: float,
+) -> dict[str, dict[str, Any]]:
+    hold_duration = parse_timeframe_duration(_market_data_timeframe(config.timeframe)) * int(config.max_hold_bars)
+    hold_end = _utc_timestamp(entry_fill_timestamp) + hold_duration
+    hold_window = fill_data[
+        (fill_data["timestamp"] >= pd.Timestamp(entry_fill_timestamp))
+        & (fill_data["timestamp"] <= pd.Timestamp(hold_end))
+    ].reset_index(drop=True)
+    if hold_window.empty:
+        hold_window = pd.DataFrame(
+            [
+                {
+                    "timestamp": entry_fill_timestamp,
+                    "open": entry_fill_price,
+                    "high": entry_fill_price,
+                    "low": entry_fill_price,
+                    "close": entry_fill_price,
+                    "volume": 0.0,
+                }
+            ]
+        )
+    maker_round_trip_fee_pct = 2 * max(0.0, float(settings.maker_fee_bps)) / 10_000
+
+    def net_return(exit_price: float) -> float:
+        return float(exit_price / entry_fill_price - 1 - maker_round_trip_fee_pct)
+
+    def scenario_payload(
+        *,
+        exit_reason: str,
+        exit_timestamp: Any,
+        exit_price: float,
+        max_adverse: float,
+        max_favorable: float,
+        stop_loss_requires_taker_fallback: bool,
+        timeout_exit_requires_liquidity_assumption: bool,
+    ) -> dict[str, Any]:
+        return {
+            "exit_reason": exit_reason,
+            "exit_timestamp": exit_timestamp,
+            "exit_price": float(exit_price),
+            "return_pct": net_return(float(exit_price)),
+            "max_adverse_excursion_pct": float(max_adverse),
+            "max_favorable_excursion_pct": float(max_favorable),
+            "stop_loss_requires_taker_fallback": bool(stop_loss_requires_taker_fallback),
+            "timeout_exit_requires_liquidity_assumption": bool(timeout_exit_requires_liquidity_assumption),
+        }
+
+    conservative_result: dict[str, Any] | None = None
+    max_high = entry_fill_price
+    min_low = entry_fill_price
+    for _, row in hold_window.iterrows():
+        high = _metric_float(row.get("high"))
+        low = _metric_float(row.get("low"))
+        max_high = max(max_high, high)
+        min_low = min(min_low, low)
+        max_favorable = max_high / entry_fill_price - 1
+        max_adverse = min_low / entry_fill_price - 1
+        if low <= stop_loss_price:
+            conservative_result = scenario_payload(
+                exit_reason="stop_loss_accounting",
+                exit_timestamp=row.get("timestamp"),
+                exit_price=stop_loss_price,
+                max_adverse=max_adverse,
+                max_favorable=max_favorable,
+                stop_loss_requires_taker_fallback=True,
+                timeout_exit_requires_liquidity_assumption=False,
+            )
+            break
+        if high >= take_profit_price:
+            conservative_result = scenario_payload(
+                exit_reason="maker_take_profit",
+                exit_timestamp=row.get("timestamp"),
+                exit_price=take_profit_price,
+                max_adverse=max_adverse,
+                max_favorable=max_favorable,
+                stop_loss_requires_taker_fallback=False,
+                timeout_exit_requires_liquidity_assumption=False,
+            )
+            break
+    if conservative_result is None:
+        timeout_row = hold_window.iloc[-1]
+        conservative_result = scenario_payload(
+            exit_reason="timeout_exit",
+            exit_timestamp=timeout_row.get("timestamp"),
+            exit_price=_metric_float(timeout_row.get("close", entry_fill_price)),
+            max_adverse=min_low / entry_fill_price - 1,
+            max_favorable=max_high / entry_fill_price - 1,
+            stop_loss_requires_taker_fallback=False,
+            timeout_exit_requires_liquidity_assumption=True,
+        )
+
+    stress_result: dict[str, Any] | None = None
+    max_high = entry_fill_price
+    min_low = entry_fill_price
+    stop_breached = False
+    for _, row in hold_window.iterrows():
+        high = _metric_float(row.get("high"))
+        low = _metric_float(row.get("low"))
+        max_high = max(max_high, high)
+        min_low = min(min_low, low)
+        stop_breached = stop_breached or low <= stop_loss_price
+        if high >= take_profit_price:
+            stress_result = scenario_payload(
+                exit_reason="maker_take_profit_after_stop_breach" if stop_breached else "maker_take_profit",
+                exit_timestamp=row.get("timestamp"),
+                exit_price=take_profit_price,
+                max_adverse=min_low / entry_fill_price - 1,
+                max_favorable=max_high / entry_fill_price - 1,
+                stop_loss_requires_taker_fallback=False,
+                timeout_exit_requires_liquidity_assumption=False,
+            )
+            break
+    if stress_result is None:
+        timeout_row = hold_window.iloc[-1]
+        stress_result = scenario_payload(
+            exit_reason="timeout_after_stop_breach_no_market_fallback" if stop_breached else "timeout_exit",
+            exit_timestamp=timeout_row.get("timestamp"),
+            exit_price=_metric_float(timeout_row.get("close", entry_fill_price)),
+            max_adverse=min_low / entry_fill_price - 1,
+            max_favorable=max_high / entry_fill_price - 1,
+            stop_loss_requires_taker_fallback=False,
+            timeout_exit_requires_liquidity_assumption=True,
+        )
+    return {
+        "conservative_stop_accounting": conservative_result,
+        "no_market_fallback_stress": stress_result,
+    }
+
+
+def maker_fill_trade_metrics(returns: list[float]) -> dict[str, float]:
+    clean_returns = [_metric_float(value) for value in returns]
+    positive = [value for value in clean_returns if value > 0]
+    negative = [value for value in clean_returns if value < 0]
+    if positive and not negative:
+        profit_factor = 1_000_000.0
+    elif negative:
+        profit_factor = sum(positive) / abs(sum(negative)) if positive else 0.0
+    else:
+        profit_factor = 0.0
+    return {
+        "return_pct": float(sum(clean_returns)),
+        "profit_factor": float(profit_factor),
+        "max_drawdown_pct": max_drawdown_from_trade_returns(clean_returns),
+    }
+
+
+def compact_maker_fill_simulation_result(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "signal_count": int(result.get("signal_count", 0) or 0),
+        "entry_filled_count": int(result.get("entry_filled_count", 0) or 0),
+        "entry_unfilled_count": int(result.get("entry_unfilled_count", 0) or 0),
+        "entry_fill_rate": _metric_float(result.get("entry_fill_rate")),
+        "avg_minutes_to_entry_fill": _metric_float(result.get("avg_minutes_to_entry_fill")),
+        "filled_trade_count": int(result.get("filled_trade_count", 0) or 0),
+        "conservative_stop_accounting_return_pct": _metric_float(
+            result.get("conservative_stop_accounting_return_pct")
+        ),
+        "conservative_stop_accounting_profit_factor": _profit_factor_value(
+            result.get("conservative_stop_accounting_profit_factor")
+        ),
+        "conservative_stop_accounting_max_drawdown_pct": _metric_float(
+            result.get("conservative_stop_accounting_max_drawdown_pct")
+        ),
+        "no_market_fallback_stress_return_pct": _metric_float(result.get("no_market_fallback_stress_return_pct")),
+        "worst_adverse_excursion_pct": _metric_float(result.get("worst_adverse_excursion_pct")),
+    }
+
+
+def empty_maker_fill_simulation_result() -> dict[str, Any]:
+    return {
+        "signal_count": 0,
+        "entry_orders_created": 0,
+        "entry_filled_count": 0,
+        "entry_unfilled_count": 0,
+        "entry_fill_rate": 0.0,
+        "entry_cancel_rate": 0.0,
+        "avg_minutes_to_entry_fill": 0.0,
+        "median_minutes_to_entry_fill": 0.0,
+        "filled_trade_count": 0,
+        "maker_take_profit_fill_count": 0,
+        "stop_loss_accounting_count": 0,
+        "timeout_exit_count": 0,
+        "stop_loss_requires_taker_fallback_count": 0,
+        "market_fallback_used_count": 0,
+        "conservative_stop_accounting_return_pct": 0.0,
+        "conservative_stop_accounting_profit_factor": 0.0,
+        "conservative_stop_accounting_max_drawdown_pct": 0.0,
+        "no_market_fallback_stress_return_pct": 0.0,
+        "no_market_fallback_stress_profit_factor": 0.0,
+        "no_market_fallback_stress_max_drawdown_pct": 0.0,
+        "worst_adverse_excursion_pct": 0.0,
+        "missed_winner_count": 0,
+        "missed_loser_count": 0,
+        "trade_rows": [],
+        "order_rows": [],
+    }
+
+
+def maker_fill_summary_from_result(
+    *,
+    simulation: dict[str, Any],
+    settings: Settings,
+    target_row: dict[str, Any] | None,
+    config: ResearchConfig | None,
+    signal_report: ResearchDataReport | None,
+    fill_timeframe_used: str | None,
+    fill_source_used: str,
+    fill_row_count: int,
+    source_used_by_timeframe: dict[str, str],
+    row_count: dict[str, int],
+    research_result_valid: bool,
+    data_ready: bool,
+    synthetic_data_used: bool,
+    maker_entry_offset_bps: float,
+    entry_timeout_minutes: int,
+    maker_entry_offset_bps_results: dict[str, dict[str, Any]],
+    entry_timeout_minutes_results: dict[str, dict[str, Any]],
+    output_paths: dict[str, Path],
+    extra_rejection_reasons: list[str],
+) -> dict[str, Any]:
+    target_row = target_row or {}
+    maker_vs_taker_gap = _metric_float(target_row.get("maker_vs_taker_net_gap"))
+    if maker_vs_taker_gap == 0.0:
+        maker_vs_taker_gap = _metric_float(target_row.get("maker_current_net_return_pct")) - _metric_float(
+            target_row.get("current_taker_net_return_pct")
+        )
+    fill_rate_required = _metric_float(
+        target_row.get("estimated_fill_rate_required_to_remain_profitable", target_row.get("fill_rate_required_to_remain_profitable"))
+    )
+    summary = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "parameter_set_id": config.parameter_set_id if config is not None else target_row.get("parameter_set_id"),
+        "track_id": config.track_id if config is not None else target_row.get("track_id"),
+        "strategy_name": config.strategy_name if config is not None else target_row.get("strategy_name"),
+        "timeframe": config.timeframe if config is not None else target_row.get("timeframe"),
+        "exit_mode": config.exit_mode if config is not None else target_row.get("exit_mode"),
+        "research_result_valid": bool(research_result_valid),
+        "data_ready": bool(data_ready),
+        "synthetic_data_used": bool(synthetic_data_used),
+        "orders_placed": 0,
+        "trading_enabled": bool(settings.trading_enabled),
+        "auto_trade_enabled": bool(settings.auto_trade_enabled),
+        "fallback_trading_allowed": bool(settings.allow_fallback_trading),
+        "live_tradable": False,
+        "strict_paper_forward_eligible": False,
+        "paper_forward_validation_required": True,
+        "source_used_by_timeframe": source_used_by_timeframe,
+        "row_count": row_count,
+        "fill_timeframe_used": fill_timeframe_used,
+        "fill_source_used": fill_source_used,
+        "fill_row_count": int(fill_row_count),
+        "maker_entry_offset_bps": float(maker_entry_offset_bps),
+        "entry_timeout_minutes": int(entry_timeout_minutes),
+        **compact_maker_fill_simulation_result(simulation),
+        "entry_orders_created": int(simulation.get("entry_orders_created", 0) or 0),
+        "entry_cancel_rate": _metric_float(simulation.get("entry_cancel_rate")),
+        "median_minutes_to_entry_fill": _metric_float(simulation.get("median_minutes_to_entry_fill")),
+        "maker_entry_offset_bps_results": maker_entry_offset_bps_results,
+        "entry_timeout_minutes_results": entry_timeout_minutes_results,
+        "maker_take_profit_fill_count": int(simulation.get("maker_take_profit_fill_count", 0) or 0),
+        "stop_loss_accounting_count": int(simulation.get("stop_loss_accounting_count", 0) or 0),
+        "timeout_exit_count": int(simulation.get("timeout_exit_count", 0) or 0),
+        "stop_loss_requires_taker_fallback_count": int(
+            simulation.get("stop_loss_requires_taker_fallback_count", 0) or 0
+        ),
+        "market_fallback_used_count": int(simulation.get("market_fallback_used_count", 0) or 0),
+        "maker_only_stop_loss_enforceable": False,
+        "no_market_fallback_stop_loss_note": (
+            "Strict maker-only stop loss is not assumed enforceable; conservative stops are risk accounting only."
+        ),
+        "missed_winner_count": int(simulation.get("missed_winner_count", 0) or 0),
+        "missed_loser_count": int(simulation.get("missed_loser_count", 0) or 0),
+        "fill_rate_required_to_remain_profitable": fill_rate_required,
+        "max_allowed_taker_fallback_rate_before_net_negative": _metric_float(
+            target_row.get("max_allowed_taker_fallback_rate_before_net_negative")
+        ),
+        "maker_vs_taker_net_gap": maker_vs_taker_gap,
+        "summary_path": str(output_paths["summary"]),
+        "trades_csv_path": str(output_paths["trades"]),
+        "orders_csv_path": str(output_paths["orders"]),
+        "rejections_path": str(output_paths["rejections"]),
+    }
+    passed, reasons = evaluate_maker_fill_simulation_pass_fail(summary)
+    reasons = list(dict.fromkeys([*extra_rejection_reasons, *reasons]))
+    passed = bool(passed and not extra_rejection_reasons)
+    summary["maker_fill_simulation_passed"] = passed
+    summary["maker_fill_simulation_rejection_reasons"] = reasons
+    summary["next_required_validation"] = [
+        "paper_forward_validation_with_no_market_fallback" if passed else "resolve_maker_fill_simulation_rejection_reasons",
+        "strict_paper_forward_gates_must_still_pass",
+        "stop_loss_design_without_taker_fallback_required",
+        "human_review_required_before_any_paper_forward",
+    ]
+    summary["final_recommendation"] = (
+        "paper_forward_validation_required_not_live_trading"
+        if passed
+        else "maker_fill_simulation_rejected_" + (";".join(reasons) if reasons else "unknown_blocker")
+    )
+    return _json_safe(summary)
+
+
+def evaluate_maker_fill_simulation_pass_fail(summary: dict[str, Any]) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    if not bool(summary.get("data_ready")) or not summary.get("fill_timeframe_used"):
+        reasons.append("no_valid_lower_timeframe_data")
+    if not bool(summary.get("research_result_valid")):
+        reasons.append("research_result_invalid")
+    if bool(summary.get("synthetic_data_used")):
+        reasons.append("synthetic_data_used")
+    if int(summary.get("orders_placed", 0) or 0) != 0:
+        reasons.append("orders_placed")
+    if bool(summary.get("trading_enabled")):
+        reasons.append("trading_enabled")
+    if bool(summary.get("auto_trade_enabled")):
+        reasons.append("auto_trade_enabled")
+    if bool(summary.get("fallback_trading_allowed")):
+        reasons.append("market_fallback_required")
+    if _metric_float(summary.get("entry_fill_rate")) < 0.50:
+        reasons.append("entry_fill_rate_too_low")
+    if int(summary.get("filled_trade_count", 0) or 0) < 10:
+        reasons.append("filled_trade_count_below_10")
+    if _metric_float(summary.get("conservative_stop_accounting_return_pct")) <= 0:
+        reasons.append("conservative_return_not_positive")
+    if _profit_factor_value(summary.get("conservative_stop_accounting_profit_factor")) < 1.05:
+        reasons.append("conservative_profit_factor_below_1_05")
+    if _metric_float(summary.get("conservative_stop_accounting_max_drawdown_pct")) > 0.10:
+        reasons.append("drawdown_above_10pct")
+    if int(summary.get("market_fallback_used_count", 0) or 0) != 0:
+        reasons.append("market_fallback_required")
+    return not reasons, list(dict.fromkeys(reasons))
+
+
+def write_maker_fill_outputs(
+    summary: dict[str, Any],
+    trade_rows: list[dict[str, Any]],
+    order_rows: list[dict[str, Any]],
+    *,
+    output_paths: dict[str, Path],
+) -> None:
+    for path in output_paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    output_paths["summary"].write_text(json.dumps(_json_safe(summary), indent=2, allow_nan=False), encoding="utf-8")
+    with output_paths["trades"].open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=MAKER_FILL_TRADE_CSV_FIELDS)
+        writer.writeheader()
+        for row in trade_rows:
+            writer.writerow({field: _csv_value(row.get(field)) for field in MAKER_FILL_TRADE_CSV_FIELDS})
+    order_fields = maker_fill_order_fields(order_rows)
+    with output_paths["orders"].open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=order_fields)
+        writer.writeheader()
+        for row in order_rows:
+            writer.writerow({field: _csv_value(row.get(field)) for field in order_fields})
+    rejections = {
+        "generated_at": summary.get("generated_at"),
+        "parameter_set_id": summary.get("parameter_set_id"),
+        "maker_fill_simulation_passed": summary.get("maker_fill_simulation_passed"),
+        "maker_fill_simulation_rejection_reasons": summary.get("maker_fill_simulation_rejection_reasons"),
+        "maker_only_stop_loss_enforceable": summary.get("maker_only_stop_loss_enforceable"),
+        "no_market_fallback_stop_loss_note": summary.get("no_market_fallback_stop_loss_note"),
+        "entry_unfilled_count": summary.get("entry_unfilled_count"),
+        "missed_winner_count": summary.get("missed_winner_count"),
+        "missed_loser_count": summary.get("missed_loser_count"),
+        "final_recommendation": summary.get("final_recommendation"),
+    }
+    output_paths["rejections"].write_text(json.dumps(_json_safe(rejections), indent=2, allow_nan=False), encoding="utf-8")
+
+
+def maker_fill_order_fields(order_rows: list[dict[str, Any]]) -> list[str]:
+    preferred = [
+        "signal_timestamp",
+        "order_timestamp",
+        "order_role",
+        "side",
+        "order_type",
+        "post_only",
+        "limit_price",
+        "maker_entry_offset_bps",
+        "entry_timeout_minutes",
+        "exit_scenario",
+        "status",
+        "fill_timestamp",
+        "fill_price",
+        "cancel_reason",
+        "market_fallback_used",
+        "orders_placed",
+    ]
+    extras = sorted({key for row in order_rows for key in row} - set(preferred))
+    return preferred + extras
+
+
+def _maker_fill_parameter_key(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
 
 
 def volatility_focus_v7_failure_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
