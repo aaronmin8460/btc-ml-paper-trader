@@ -4,10 +4,15 @@ from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 import scripts.research_higher_timeframe as rh
 from app.config import Settings
+from app.db.database import Base
+from app.db.models import CollectedMarketData
 from scripts.research_higher_timeframe import (
+    MAKER_FILL_DEFAULT_PARAMETER_SET_ID,
     MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID,
     VOLATILITY_BREAKOUT_STRATEGY,
     ResearchConfig,
@@ -75,6 +80,66 @@ def _fill_bars(rows: list[tuple[datetime, float, float, float, float]]) -> pd.Da
             "volume": [1.0 for _ in rows],
         }
     )
+
+
+def _collected_session_factory(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'maker_fill_collected.db'}")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)
+
+
+def _insert_collected_bar(
+    db,
+    *,
+    timeframe: str,
+    timestamp: datetime,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: float = 1.0,
+) -> None:
+    db.add(
+        CollectedMarketData(
+            symbol="BTC/USD",
+            timeframe=timeframe,
+            timestamp=timestamp,
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=volume,
+            source="test",
+            source_used="collected_market_data",
+        )
+    )
+
+
+def _insert_15min_signal_and_1min_fill_rows(Session, *, start: datetime) -> None:
+    with Session() as db:
+        for index in range(8):
+            open_ = 100.0 + index
+            _insert_collected_bar(
+                db,
+                timeframe="15Min",
+                timestamp=start + timedelta(minutes=15 * index),
+                open_=open_,
+                high=open_ + 2.0,
+                low=open_ - 1.0,
+                close=open_ + 0.5,
+                volume=10.0 + index,
+            )
+        _insert_collected_bar(
+            db,
+            timeframe="1Min",
+            timestamp=start + timedelta(hours=1),
+            open_=100.0,
+            high=105.0,
+            low=99.97,
+            close=104.5,
+            volume=3.0,
+        )
+        db.commit()
 
 
 def test_entry_limit_does_not_fill_if_low_never_reaches_limit_price():
@@ -314,7 +379,9 @@ def test_filtered_candidate_regenerates_signals_and_keeps_trading_disabled(monke
                 "min_volume_zscore": 0.25,
             }
         ],
-        bars_by_timeframe={"1H": _signals(signal_timestamp)},
+        bars_by_timeframe={
+            "1H": _fill_bars([(signal_timestamp, 100.0, 101.0, 99.0, 100.0)]),
+        },
         settings=_settings(),
         data_source_reports={
             "1H": {
@@ -350,3 +417,109 @@ def test_filtered_candidate_regenerates_signals_and_keeps_trading_disabled(monke
     assert summary["strict_paper_forward_eligible"] is False
     assert summary["signal_count"] == 1
     assert summary["entry_filled_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("parameter_set_id", "expected_min_volume_zscore"),
+    [
+        (MAKER_FILL_DEFAULT_PARAMETER_SET_ID, 0.25),
+        (MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID, 1.0),
+    ],
+)
+def test_maker_fill_derives_1h_signal_bars_from_15min_collected_data(
+    monkeypatch,
+    tmp_path,
+    parameter_set_id,
+    expected_min_volume_zscore,
+):
+    start = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+    Session = _collected_session_factory(tmp_path)
+    _insert_15min_signal_and_1min_fill_rows(Session, start=start)
+    captured: dict[str, object] = {}
+
+    def fake_build_strategy_research_trades(
+        config,
+        *,
+        bars,
+        settings,
+        buy_the_dip_features=None,
+        v3_features=None,
+    ):
+        captured["config"] = config
+        captured["bars"] = bars.copy()
+        return (
+            pd.DataFrame({"buy_exit_return_pct": [0.045]}),
+            pd.DataFrame(
+                {
+                    "timestamp": [bars["timestamp"].iloc[0]],
+                    "close": [bars["close"].iloc[0]],
+                }
+            ),
+        )
+
+    monkeypatch.setattr(rh, "build_strategy_research_trades", fake_build_strategy_research_trades)
+
+    summary = build_and_write_maker_fill_simulation(
+        rows=[
+            {
+                "parameter_set_id": MAKER_FILL_DEFAULT_PARAMETER_SET_ID,
+                "track_id": "M9_v8m_00086_drawdown_reduction",
+                "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+                "timeframe": "1H",
+                "exit_mode": "fixed_tp_sl_timeout",
+                "take_profit_pct": 0.045,
+                "stop_loss_pct": 0.02,
+                "max_hold_bars": 48,
+                "breakout_lookback": 20,
+                "consolidation_lookback": 12,
+                "min_body_vs_avg": 1.2,
+                "min_recent_return_pct": 0.003,
+                "min_trend_strength": 0.0,
+                "max_atr_expansion": 3.0,
+                "min_volume_zscore": 0.25,
+            }
+        ],
+        bars_by_timeframe={"1H": pd.DataFrame()},
+        settings=_settings(),
+        data_source_reports={
+            "1H": {
+                "source_used": "no_valid_real_data_source",
+                "row_count": 0,
+                "synthetic_data_used": False,
+                "research_result_valid": False,
+                "requested_max_rows": 2,
+            }
+        },
+        parameter_set_id=parameter_set_id,
+        summary_path=tmp_path / f"maker_fill_simulation_{parameter_set_id}_summary.json",
+        session_factory=Session,
+        maker_entry_offset_bps=2,
+        entry_timeout_minutes=60,
+        now=start + timedelta(days=3),
+    )
+    config = captured["config"]
+    signal_bars = captured["bars"]
+
+    assert isinstance(config, ResearchConfig)
+    assert config.parameter_set_id == parameter_set_id
+    assert config.min_volume_zscore == pytest.approx(expected_min_volume_zscore)
+    assert len(signal_bars) == 2
+    assert signal_bars["timestamp"].iloc[0] == pd.Timestamp(start)
+    assert signal_bars["open"].iloc[0] == pytest.approx(100.0)
+    assert signal_bars["high"].iloc[0] == pytest.approx(105.0)
+    assert signal_bars["low"].iloc[0] == pytest.approx(99.0)
+    assert signal_bars["close"].iloc[0] == pytest.approx(103.5)
+    assert signal_bars["volume"].iloc[0] == pytest.approx(46.0)
+    assert summary["source_used_by_timeframe"]["1H"] == "collected_market_data_derived_from_15min"
+    assert summary["row_count"]["1H"] > 0
+    assert summary["signal_count"] == 1
+    assert summary["entry_filled_count"] == 1
+    assert summary["filled_trade_count"] == 1
+    assert summary["fill_timeframe_used"] == "1Min"
+    assert summary["source_used_by_timeframe"]["1Min"] == "collected_market_data"
+    assert summary["orders_placed"] == 0
+    assert summary["trading_enabled"] is False
+    assert summary["auto_trade_enabled"] is False
+    assert summary["fallback_trading_allowed"] is False
+    assert summary["live_tradable"] is False
+    assert summary["strict_paper_forward_eligible"] is False

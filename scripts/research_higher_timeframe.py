@@ -5171,19 +5171,15 @@ def build_and_write_maker_fill_simulation(
         return summary
 
     config = research_config_from_result_row(target_row)
-    signal_report = _coerce_data_report(
-        config.timeframe,
-        data_source_reports.get(
-            config.timeframe,
-            {
-                "source_used": str(target_row.get("source_used") or "unknown"),
-                "row_count": int(target_row.get("row_count", 0) or 0),
-                "synthetic_data_used": bool(target_row.get("synthetic_data_used")),
-                "research_result_valid": bool(target_row.get("research_result_valid", True)),
-            },
-        ),
+    signal_bars, signal_report = select_maker_fill_signal_bars(
+        settings,
+        config,
+        bars_by_timeframe=bars_by_timeframe,
+        data_source_reports=data_source_reports,
+        target_row=target_row,
+        session_factory=session_factory,
+        now=now,
     )
-    signal_bars = bars_by_timeframe.get(config.timeframe, pd.DataFrame())
     candidate_settings = research_config_settings(settings, config)
     trades, signals = build_strategy_research_trades(config, bars=signal_bars, settings=candidate_settings)
     signal_trade_returns = [
@@ -5357,6 +5353,143 @@ def maker_fill_filtered_candidate_metadata(parameter_set_id: str | None) -> dict
         "overfit_warning": candidate["overfit_warning"],
         "signal_generation_mode": candidate["signal_generation_mode"],
     }
+
+
+def select_maker_fill_signal_bars(
+    settings: Settings,
+    config: ResearchConfig,
+    *,
+    bars_by_timeframe: dict[str, pd.DataFrame],
+    data_source_reports: dict[str, ResearchDataReport | dict[str, Any]],
+    target_row: dict[str, Any],
+    session_factory: Any | None,
+    now: datetime,
+) -> tuple[pd.DataFrame, ResearchDataReport]:
+    fallback_report = _coerce_data_report(
+        config.timeframe,
+        data_source_reports.get(
+            config.timeframe,
+            {
+                "source_used": str(target_row.get("source_used") or "unknown"),
+                "row_count": int(target_row.get("row_count", 0) or 0),
+                "synthetic_data_used": bool(target_row.get("synthetic_data_used")),
+                "research_result_valid": bool(target_row.get("research_result_valid", True)),
+            },
+        ),
+    )
+    native_bars = bars_by_timeframe.get(config.timeframe, pd.DataFrame())
+    if not native_bars.empty:
+        normalized = normalize_ohlcv(native_bars)
+        if not normalized.empty:
+            if fallback_report.row_count > 0 and fallback_report.source_used != "no_valid_real_data_source":
+                return normalized, fallback_report
+            return normalized, maker_fill_signal_report_from_bars(
+                normalized,
+                timeframe=config.timeframe,
+                source_used="research_bars_by_timeframe",
+                now=now,
+                synthetic_data_used=bool(fallback_report.synthetic_data_used),
+                requested_max_rows=fallback_report.requested_max_rows,
+                requested_start=fallback_report.requested_start,
+                requested_end=fallback_report.requested_end,
+            )
+    if config.timeframe == "1H":
+        derived_bars, derived_report = derive_maker_fill_1h_signal_bars_from_15min(
+            settings,
+            fallback_report=fallback_report,
+            session_factory=session_factory,
+            now=now,
+        )
+        if not derived_bars.empty:
+            return derived_bars, derived_report
+    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"]), fallback_report
+
+
+def derive_maker_fill_1h_signal_bars_from_15min(
+    settings: Settings,
+    *,
+    fallback_report: ResearchDataReport,
+    session_factory: Any | None,
+    now: datetime,
+) -> tuple[pd.DataFrame, ResearchDataReport]:
+    target_limit = maker_fill_signal_target_limit(fallback_report, default=4000)
+    source_limit = target_limit * _source_bars_per_target_bar("15Min", "1H") + 4
+    collected_15m = _load_collected_market_data(
+        settings,
+        timeframe="15Min",
+        limit=source_limit,
+        session_factory=session_factory,
+    )
+    derived = derive_1h_bars_from_15min(collected_15m, limit=target_limit)
+    if derived.empty:
+        return (
+            pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"]),
+            fallback_report,
+        )
+    report = maker_fill_signal_report_from_bars(
+        derived,
+        timeframe="1H",
+        source_used="collected_market_data_derived_from_15min",
+        now=now,
+        synthetic_data_used=False,
+        requested_max_rows=target_limit,
+        requested_start=fallback_report.requested_start,
+        requested_end=fallback_report.requested_end,
+        available_rows=len(derived),
+        derived_from_timeframe="15Min",
+    )
+    return derived, report
+
+
+def maker_fill_signal_target_limit(report: ResearchDataReport, *, default: int) -> int:
+    for value in (report.requested_max_rows, report.used_rows, report.available_rows, report.row_count):
+        if value:
+            return max(1, int(value))
+    return int(default)
+
+
+def maker_fill_signal_report_from_bars(
+    bars: pd.DataFrame,
+    *,
+    timeframe: str,
+    source_used: str,
+    now: datetime,
+    synthetic_data_used: bool,
+    requested_max_rows: int | None = None,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    available_rows: int | None = None,
+    derived_from_timeframe: str | None = None,
+) -> ResearchDataReport:
+    normalized = normalize_ohlcv(bars) if not bars.empty else bars
+    latest = _latest_timestamp(normalized)
+    first = _first_timestamp(normalized)
+    rejection_reasons: list[str] = []
+    if normalized.empty:
+        rejection_reasons.append("signal_bars_missing")
+    if latest is None:
+        rejection_reasons.append("latest_timestamp_missing")
+    elif latest > pd.Timestamp(_utc_timestamp(now)):
+        rejection_reasons.append("future_timestamp_detected")
+    if synthetic_data_used:
+        rejection_reasons.append("synthetic_data_not_valid_for_research_decisions")
+    return ResearchDataReport(
+        timeframe=timeframe,
+        source_used=source_used,
+        latest_timestamp=latest.isoformat() if latest is not None else None,
+        data_age_minutes=_data_age_minutes(latest, now),
+        row_count=int(len(normalized)),
+        synthetic_data_used=bool(synthetic_data_used),
+        research_result_valid=not rejection_reasons,
+        rejection_reason=";".join(rejection_reasons) if rejection_reasons else None,
+        available_rows=int(available_rows if available_rows is not None else len(normalized)),
+        used_rows=int(len(normalized)),
+        first_timestamp=first.isoformat() if first is not None else None,
+        requested_max_rows=requested_max_rows,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        derived_from_timeframe=derived_from_timeframe,
+    )
 
 
 def select_maker_fill_bars(
