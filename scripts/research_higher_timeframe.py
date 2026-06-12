@@ -321,6 +321,118 @@ MAKER_FILL_TRADE_CSV_FIELDS = [
     "stop_loss_requires_taker_fallback",
     "timeout_exit_requires_liquidity_assumption",
 ]
+FALSE_BREAKOUT_DEFAULT_PARAMETER_SET_ID = MAKER_FILL_DEFAULT_PARAMETER_SET_ID
+FALSE_BREAKOUT_FEATURE_COLUMNS = [
+    "signal_open",
+    "signal_high",
+    "signal_low",
+    "signal_close",
+    "signal_volume",
+    "signal_body_pct",
+    "signal_range_pct",
+    "close_position_in_candle",
+    "upper_wick_ratio",
+    "lower_wick_ratio",
+    "volume_zscore",
+    "atr_pct",
+    "atr_expansion",
+    "recent_return_1h",
+    "recent_return_3h",
+    "recent_return_6h",
+    "recent_return_12h",
+    "recent_runup_6h",
+    "recent_runup_12h",
+    "breakout_distance_pct",
+    "candle_body_vs_avg",
+    "consolidation_compression",
+    "ema20_slope",
+    "ema50_slope",
+    "close_above_ema20",
+    "close_above_ema50",
+    "close_above_ema200",
+    "hour_utc",
+    "day_of_week",
+]
+FALSE_BREAKOUT_FILTER_ALLOWED_FEATURES = {
+    "signal_body_pct",
+    "signal_range_pct",
+    "close_position_in_candle",
+    "upper_wick_ratio",
+    "lower_wick_ratio",
+    "volume_zscore",
+    "atr_pct",
+    "atr_expansion",
+    "recent_return_1h",
+    "recent_return_3h",
+    "recent_return_6h",
+    "recent_return_12h",
+    "recent_runup_6h",
+    "recent_runup_12h",
+    "breakout_distance_pct",
+    "candle_body_vs_avg",
+    "consolidation_compression",
+    "ema20_slope",
+    "ema50_slope",
+    "close_above_ema20",
+    "close_above_ema50",
+    "close_above_ema200",
+    "hour_utc",
+    "day_of_week",
+}
+FALSE_BREAKOUT_FUTURE_OR_OUTCOME_COLUMNS = {
+    "max_favorable_excursion_pct",
+    "max_adverse_excursion_pct",
+    "exit_reason",
+    "return_pct",
+    "exit_timestamp",
+    "exit_price",
+    "stop_loss_requires_taker_fallback",
+    "timeout_exit_requires_liquidity_assumption",
+}
+FALSE_BREAKOUT_FEATURE_CSV_FIELDS = [
+    "signal_timestamp",
+    *FALSE_BREAKOUT_FEATURE_COLUMNS,
+    "minutes_to_entry_fill",
+    "max_favorable_excursion_pct",
+    "max_adverse_excursion_pct",
+    "exit_reason",
+    "return_pct",
+]
+FALSE_BREAKOUT_COMPARISON_FIELDS = [
+    "comparison",
+    "feature",
+    "stop_mean",
+    "win_mean",
+    "stop_median",
+    "win_median",
+    "difference",
+    "absolute_difference",
+    "suggested_direction",
+    "simple_threshold_candidates",
+]
+FALSE_BREAKOUT_FILTER_CANDIDATE_FIELDS = [
+    "filter_name",
+    "feature",
+    "operator",
+    "threshold",
+    "threshold_high",
+    "excluded_values",
+    "uses_signal_time_features_only",
+    "kept_trade_count",
+    "removed_trade_count",
+    "removed_stop_count",
+    "removed_tp_count",
+    "removed_profitable_timeout_count",
+    "kept_return_pct",
+    "kept_profit_factor",
+    "kept_max_drawdown_pct",
+    "kept_positive_count",
+    "kept_negative_count",
+    "kept_stop_count",
+    "kept_timeout_count",
+    "kept_tp_count",
+    "filter_passed_research_gate",
+]
 
 
 @dataclass(frozen=True)
@@ -520,6 +632,16 @@ def _parse_args() -> argparse.Namespace:
         help="Path for the maker fill simulation summary JSON.",
     )
     parser.add_argument(
+        "--false-breakout-diagnostic",
+        action="store_true",
+        help="Run offline false-breakout diagnostics for an existing maker fill simulation.",
+    )
+    parser.add_argument(
+        "--save-false-breakout-summary",
+        default="logs/false_breakout_diagnostic_summary.json",
+        help="Path for the false-breakout diagnostic summary JSON.",
+    )
+    parser.add_argument(
         "--min-trades-per-split",
         type=int,
         default=MIN_RESEARCH_TRADES_PER_SPLIT,
@@ -583,6 +705,8 @@ async def main() -> None:
         maker_entry_offset_bps=args.maker_entry_offset_bps,
         maker_entry_timeout_minutes=args.maker_entry_timeout_minutes,
         save_maker_fill_summary=Path(args.save_maker_fill_summary),
+        false_breakout_diagnostic=args.false_breakout_diagnostic,
+        save_false_breakout_summary=Path(args.save_false_breakout_summary),
     )
     print(json.dumps(report, indent=2, default=str))
 
@@ -624,6 +748,8 @@ async def run_higher_timeframe_research(
     maker_entry_offset_bps: float = MAKER_FILL_DEFAULT_ENTRY_OFFSET_BPS,
     maker_entry_timeout_minutes: int = MAKER_FILL_DEFAULT_ENTRY_TIMEOUT_MINUTES,
     save_maker_fill_summary: Path | None = None,
+    false_breakout_diagnostic: bool = False,
+    save_false_breakout_summary: Path | None = None,
 ) -> dict[str, Any]:
     settings = research_settings(base_settings)
     volatility_focus = bool(volatility_focus or strategy == VOLATILITY_FOCUS_STRATEGY)
@@ -847,6 +973,22 @@ async def run_higher_timeframe_research(
         )
         summary["maker_fill_simulation"] = maker_fill_summary
         summary["maker_fill_simulation_summary_path"] = str(maker_fill_summary_path)
+    if false_breakout_diagnostic:
+        false_breakout_summary_path = save_false_breakout_summary or (
+            output_path / f"false_breakout_diagnostic_{maker_fill_parameter_set_id}_summary.json"
+        )
+        false_breakout_summary = build_and_write_false_breakout_diagnostic(
+            rows,
+            bars_by_timeframe,
+            settings,
+            data_source_reports=data_source_reports,
+            parameter_set_id=maker_fill_parameter_set_id,
+            summary_path=false_breakout_summary_path,
+            session_factory=session_factory,
+            now=current_time,
+        )
+        summary["false_breakout_diagnostic"] = false_breakout_summary
+        summary["false_breakout_diagnostic_summary_path"] = str(false_breakout_summary_path)
     write_research_outputs(rows, summary, csv_path=csv_path, summary_path=summary_path)
     if audit_mode == "reality":
         (output_path / "strategy_reality_audit_summary.json").write_text(
@@ -5832,6 +5974,642 @@ def maker_fill_order_fields(order_rows: list[dict[str, Any]]) -> list[str]:
 
 def _maker_fill_parameter_key(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def build_and_write_false_breakout_diagnostic(
+    rows: list[dict[str, Any]],
+    bars_by_timeframe: dict[str, pd.DataFrame],
+    settings: Settings,
+    *,
+    data_source_reports: dict[str, ResearchDataReport | dict[str, Any]],
+    parameter_set_id: str,
+    summary_path: Path,
+    session_factory: Any | None,
+    now: datetime,
+) -> dict[str, Any]:
+    target_row = next((row for row in rows if str(row.get("parameter_set_id")) == str(parameter_set_id)), None)
+    config = (
+        research_config_from_result_row(target_row)
+        if target_row is not None
+        else research_config_from_result_row(
+            {
+                "parameter_set_id": parameter_set_id,
+                "track_id": VOLATILITY_FOCUS_TRACK_M9,
+                "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+                "timeframe": "1H",
+                "exit_mode": EXIT_MODE_FIXED,
+                "take_profit_pct": 0.045,
+                "stop_loss_pct": 0.02,
+                "max_hold_bars": 48,
+                "breakout_lookback": 20,
+                "consolidation_lookback": 12,
+                "min_body_vs_avg": 1.2,
+                "min_recent_return_pct": 0.003,
+                "min_trend_strength": 0.0,
+                "max_atr_expansion": 3.0,
+                "min_volume_zscore": 0.25,
+            }
+        )
+    )
+    output_paths = false_breakout_output_paths(summary_path)
+    input_paths = maker_fill_input_paths(summary_path.parent, parameter_set_id)
+    maker_trades = read_csv_if_exists(input_paths["trades"])
+    maker_orders = read_csv_if_exists(input_paths["orders"])
+    signal_bars, signal_source_used = select_false_breakout_signal_bars(
+        settings,
+        maker_trades,
+        config,
+        bars_by_timeframe=bars_by_timeframe,
+        session_factory=session_factory,
+        now=now,
+    )
+    features = attach_false_breakout_signal_features(maker_trades, signal_bars, config)
+    comparisons = build_false_breakout_feature_comparisons(features)
+    filter_candidates = build_false_breakout_filter_candidates(features)
+    source_report = _coerce_data_report(
+        config.timeframe,
+        data_source_reports.get(
+            config.timeframe,
+            {
+                "source_used": signal_source_used,
+                "row_count": int(len(signal_bars)),
+                "synthetic_data_used": False,
+                "research_result_valid": not signal_bars.empty,
+            },
+        ),
+    )
+    summary = false_breakout_summary_from_outputs(
+        features,
+        filter_candidates,
+        settings,
+        config=config,
+        input_trade_count=int(len(maker_trades)),
+        orders_frame=maker_orders,
+        signal_source_used=signal_source_used,
+        signal_row_count=int(len(signal_bars)),
+        synthetic_data_used=bool(source_report.synthetic_data_used),
+        output_paths=output_paths,
+        input_paths=input_paths,
+    )
+    write_false_breakout_outputs(
+        summary,
+        features,
+        filter_candidates,
+        comparisons,
+        output_paths=output_paths,
+    )
+    return summary
+
+
+def false_breakout_output_paths(summary_path: Path) -> dict[str, Path]:
+    prefix = summary_path.stem.removesuffix("_summary")
+    return {
+        "summary": summary_path,
+        "features": summary_path.with_name(f"{prefix}_features.csv"),
+        "filter_candidates": summary_path.with_name(f"{prefix}_filter_candidates.csv"),
+        "feature_comparison": summary_path.with_name(f"{prefix}_feature_comparison.csv"),
+    }
+
+
+def maker_fill_input_paths(directory: Path, parameter_set_id: str) -> dict[str, Path]:
+    return {
+        "trades": directory / f"maker_fill_simulation_{parameter_set_id}_trades.csv",
+        "orders": directory / f"maker_fill_simulation_{parameter_set_id}_orders.csv",
+    }
+
+
+def read_csv_if_exists(path: Path) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size <= 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def select_false_breakout_signal_bars(
+    settings: Settings,
+    maker_trades: pd.DataFrame,
+    config: ResearchConfig,
+    *,
+    bars_by_timeframe: dict[str, pd.DataFrame],
+    session_factory: Any | None,
+    now: datetime,
+) -> tuple[pd.DataFrame, str]:
+    signal_timestamps = pd.Series(dtype="datetime64[ns, UTC]")
+    if not maker_trades.empty and "signal_timestamp" in maker_trades:
+        signal_timestamps = pd.to_datetime(maker_trades["signal_timestamp"], utc=True, errors="coerce").dropna()
+    if not signal_timestamps.empty:
+        lookback_hours = max(260, int(config.breakout_lookback or 20) + 220)
+        window_start = _utc_timestamp(signal_timestamps.min()) - timedelta(hours=lookback_hours)
+        window_end = _utc_timestamp(signal_timestamps.max()) + parse_timeframe_duration(_market_data_timeframe(config.timeframe))
+        limit = lower_timeframe_fill_limit(window_start, window_end, timeframe="15Min")
+        collected_15m = _load_collected_market_data(
+            settings,
+            timeframe="15Min",
+            limit=limit,
+            session_factory=session_factory,
+            start=window_start,
+            end=window_end,
+        )
+        if not collected_15m.empty:
+            derived = derive_higher_timeframe_bars(
+                collected_15m,
+                source_timeframe="15Min",
+                target_timeframe=config.timeframe,
+            )
+            if not derived.empty:
+                return derived, "collected_market_data_derived_from_15min"
+    fallback_bars = bars_by_timeframe.get(config.timeframe, pd.DataFrame())
+    if not fallback_bars.empty:
+        return fallback_bars, "research_bars_by_timeframe"
+    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"]), "no_valid_signal_timeframe_data"
+
+
+def attach_false_breakout_signal_features(
+    maker_trades: pd.DataFrame,
+    signal_bars: pd.DataFrame,
+    config: ResearchConfig,
+) -> pd.DataFrame:
+    if maker_trades.empty or "exit_scenario" not in maker_trades:
+        return pd.DataFrame(columns=FALSE_BREAKOUT_FEATURE_CSV_FIELDS)
+    conservative = maker_trades.loc[
+        maker_trades["exit_scenario"].astype(str) == "conservative_stop_accounting"
+    ].copy()
+    if conservative.empty:
+        return pd.DataFrame(columns=FALSE_BREAKOUT_FEATURE_CSV_FIELDS)
+    conservative["signal_timestamp"] = pd.to_datetime(conservative["signal_timestamp"], utc=True, errors="coerce")
+    for column in (
+        "minutes_to_entry_fill",
+        "max_favorable_excursion_pct",
+        "max_adverse_excursion_pct",
+        "return_pct",
+    ):
+        if column in conservative:
+            conservative[column] = pd.to_numeric(conservative[column], errors="coerce")
+    feature_frame = build_false_breakout_signal_feature_frame(signal_bars, config)
+    if feature_frame.empty:
+        for column in FALSE_BREAKOUT_FEATURE_COLUMNS:
+            conservative[column] = np.nan
+        return conservative[FALSE_BREAKOUT_FEATURE_CSV_FIELDS].copy()
+    merged = conservative.merge(feature_frame, on="signal_timestamp", how="left")
+    for column in FALSE_BREAKOUT_FEATURE_CSV_FIELDS:
+        if column not in merged:
+            merged[column] = np.nan
+    return merged[FALSE_BREAKOUT_FEATURE_CSV_FIELDS].copy()
+
+
+def build_false_breakout_signal_feature_frame(signal_bars: pd.DataFrame, config: ResearchConfig) -> pd.DataFrame:
+    if signal_bars.empty:
+        return pd.DataFrame(columns=["signal_timestamp", *FALSE_BREAKOUT_FEATURE_COLUMNS])
+    data = normalize_ohlcv(signal_bars)
+    if data.empty:
+        return pd.DataFrame(columns=["signal_timestamp", *FALSE_BREAKOUT_FEATURE_COLUMNS])
+    features = prepare_v3_features(data)
+    close = pd.to_numeric(features["close"], errors="coerce")
+    open_ = pd.to_numeric(features["open"], errors="coerce")
+    high = pd.to_numeric(features["high"], errors="coerce")
+    low = pd.to_numeric(features["low"], errors="coerce")
+    candle_range = (high - low).replace(0, np.nan)
+    body_low = pd.concat([open_, close], axis=1).min(axis=1)
+    body_high = pd.concat([open_, close], axis=1).max(axis=1)
+    breakout_column = f"prior_rolling_high_{int(config.breakout_lookback or 20)}"
+    compression_column = f"range_compression_{int(config.consolidation_lookback or 12)}"
+    range_column = f"range_width_{int(config.consolidation_lookback or 12)}"
+    range_width_48 = features["range_width_48"] if "range_width_48" in features else pd.Series(np.nan, index=features.index)
+    consolidation_compression = (
+        features[compression_column]
+        if compression_column in features
+        else range_width_48 / features.get(range_column, pd.Series(np.nan, index=features.index)).replace(0, np.nan)
+    )
+    out = pd.DataFrame(
+        {
+            "signal_timestamp": pd.to_datetime(features["timestamp"], utc=True, errors="coerce"),
+            "signal_open": open_,
+            "signal_high": high,
+            "signal_low": low,
+            "signal_close": close,
+            "signal_volume": pd.to_numeric(features["volume"], errors="coerce"),
+            "signal_body_pct": (close - open_).abs() / close.replace(0, np.nan),
+            "signal_range_pct": candle_range / close.replace(0, np.nan),
+            "close_position_in_candle": (close - low) / candle_range,
+            "upper_wick_ratio": (high - body_high) / candle_range,
+            "lower_wick_ratio": (body_low - low) / candle_range,
+            "volume_zscore": pd.to_numeric(features.get("volume_zscore_20"), errors="coerce"),
+            "atr_pct": pd.to_numeric(features.get("atr_14"), errors="coerce") / close.replace(0, np.nan),
+            "atr_expansion": pd.to_numeric(features.get("atr_expansion_20"), errors="coerce"),
+            "recent_return_1h": close.pct_change(1),
+            "recent_return_3h": close.pct_change(3),
+            "recent_return_6h": close.pct_change(6),
+            "recent_return_12h": close.pct_change(12),
+            "recent_runup_6h": close / close.rolling(6).min().replace(0, np.nan) - 1,
+            "recent_runup_12h": close / close.rolling(12).min().replace(0, np.nan) - 1,
+            "breakout_distance_pct": close / pd.to_numeric(features.get(breakout_column), errors="coerce").replace(0, np.nan) - 1,
+            "candle_body_vs_avg": pd.to_numeric(features.get("body_vs_avg_20"), errors="coerce"),
+            "consolidation_compression": pd.to_numeric(consolidation_compression, errors="coerce"),
+            "ema20_slope": pd.to_numeric(features.get("ema_20_slope_5"), errors="coerce"),
+            "ema50_slope": pd.to_numeric(features.get("ema_50_slope_5"), errors="coerce"),
+            "close_above_ema20": close > pd.to_numeric(features.get("ema_20"), errors="coerce"),
+            "close_above_ema50": close > pd.to_numeric(features.get("ema_50"), errors="coerce"),
+            "close_above_ema200": features.get("close_above_ema_200", pd.Series(False, index=features.index)).astype(bool),
+            "hour_utc": pd.to_datetime(features["timestamp"], utc=True, errors="coerce").dt.hour,
+            "day_of_week": pd.to_datetime(features["timestamp"], utc=True, errors="coerce").dt.dayofweek,
+        }
+    )
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def build_false_breakout_feature_comparisons(features: pd.DataFrame) -> list[dict[str, Any]]:
+    if features.empty:
+        return []
+    comparisons = [
+        (
+            "stop_loss_accounting_vs_positive_trades",
+            features["exit_reason"].astype(str) == "stop_loss_accounting",
+            pd.to_numeric(features["return_pct"], errors="coerce") > 0,
+        ),
+        (
+            "stop_loss_accounting_vs_maker_take_profit",
+            features["exit_reason"].astype(str) == "stop_loss_accounting",
+            features["exit_reason"].astype(str) == "maker_take_profit",
+        ),
+        (
+            "stop_loss_accounting_vs_profitable_timeout_exit",
+            features["exit_reason"].astype(str) == "stop_loss_accounting",
+            (features["exit_reason"].astype(str) == "timeout_exit")
+            & (pd.to_numeric(features["return_pct"], errors="coerce") > 0),
+        ),
+        (
+            "losing_timeout_exit_vs_profitable_timeout_exit",
+            (features["exit_reason"].astype(str) == "timeout_exit")
+            & (pd.to_numeric(features["return_pct"], errors="coerce") <= 0),
+            (features["exit_reason"].astype(str) == "timeout_exit")
+            & (pd.to_numeric(features["return_pct"], errors="coerce") > 0),
+        ),
+    ]
+    numeric_columns = [
+        column
+        for column in FALSE_BREAKOUT_FEATURE_CSV_FIELDS
+        if column not in {"signal_timestamp", "exit_reason"}
+        and column in features
+        and pd.api.types.is_numeric_dtype(pd.to_numeric(features[column], errors="coerce"))
+    ]
+    rows: list[dict[str, Any]] = []
+    for name, stop_mask, win_mask in comparisons:
+        stop_group = features.loc[stop_mask]
+        win_group = features.loc[win_mask]
+        for column in numeric_columns:
+            stop_values = pd.to_numeric(stop_group[column], errors="coerce").dropna()
+            win_values = pd.to_numeric(win_group[column], errors="coerce").dropna()
+            if stop_values.empty or win_values.empty:
+                continue
+            stop_mean = float(stop_values.mean())
+            win_mean = float(win_values.mean())
+            stop_median = float(stop_values.median())
+            win_median = float(win_values.median())
+            difference = win_mean - stop_mean
+            rows.append(
+                {
+                    "comparison": name,
+                    "feature": column,
+                    "stop_mean": stop_mean,
+                    "win_mean": win_mean,
+                    "stop_median": stop_median,
+                    "win_median": win_median,
+                    "difference": difference,
+                    "absolute_difference": abs(difference),
+                    "suggested_direction": "keep_higher_values" if difference > 0 else "keep_lower_values",
+                    "simple_threshold_candidates": simple_threshold_candidates(stop_values, win_values),
+                }
+            )
+    return rows
+
+
+def simple_threshold_candidates(stop_values: pd.Series, win_values: pd.Series) -> list[float]:
+    values = pd.concat([stop_values, win_values]).dropna()
+    if values.empty:
+        return []
+    candidates = {
+        float(values.quantile(0.25)),
+        float(values.quantile(0.50)),
+        float(values.quantile(0.75)),
+        float((stop_values.median() + win_values.median()) / 2),
+    }
+    return sorted(value for value in candidates if math.isfinite(value))
+
+
+def build_false_breakout_filter_candidates(features: pd.DataFrame) -> list[dict[str, Any]]:
+    if features.empty:
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in generate_false_breakout_filter_definitions(features):
+        filter_name = str(candidate.get("filter_name") or "")
+        if not filter_name or filter_name in seen:
+            continue
+        seen.add(filter_name)
+        rows.append(evaluate_false_breakout_filter_candidate(features, candidate))
+    return sorted(rows, key=false_breakout_filter_rank_key, reverse=True)
+
+
+def generate_false_breakout_filter_definitions(features: pd.DataFrame) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+
+    def add_thresholds(feature: str, operator: str, defaults: tuple[float, ...] = ()) -> None:
+        if feature not in features:
+            return
+        values = pd.to_numeric(features[feature], errors="coerce").dropna()
+        if values.empty:
+            return
+        thresholds = set(defaults)
+        for quantile in (0.25, 0.33, 0.50, 0.67, 0.75):
+            thresholds.add(float(values.quantile(quantile)))
+        for threshold in sorted(value for value in thresholds if math.isfinite(value)):
+            candidates.append(
+                {
+                    "filter_name": f"{feature} {operator} {threshold:.8g}",
+                    "feature": feature,
+                    "operator": operator,
+                    "threshold": threshold,
+                }
+            )
+
+    add_thresholds("close_position_in_candle", ">=", (0.50, 0.60, 0.70))
+    add_thresholds("upper_wick_ratio", "<=", (0.10, 0.20, 0.30))
+    add_thresholds("lower_wick_ratio", ">=", (0.10, 0.20, 0.30))
+    add_thresholds("volume_zscore", ">=", (0.0, 0.25, 0.50, 0.75, 1.0))
+    add_thresholds("atr_expansion", "<=", (1.5, 2.0, 2.5, 3.0))
+    add_thresholds("recent_runup_6h", "<=", (0.03, 0.05, 0.08, 0.10))
+    add_thresholds("recent_runup_12h", "<=", (0.04, 0.06, 0.10, 0.12))
+    add_thresholds("breakout_distance_pct", ">=", (0.0, 0.002, 0.005, 0.01))
+    add_thresholds("ema20_slope", ">", (0.0,))
+    add_thresholds("ema50_slope", ">", (0.0,))
+    add_thresholds("signal_body_pct", ">=", (0.002, 0.005, 0.01))
+    add_thresholds("signal_range_pct", "<=", (0.02, 0.03, 0.05))
+    if "candle_body_vs_avg" in features:
+        body_values = pd.to_numeric(features["candle_body_vs_avg"], errors="coerce").dropna()
+        if not body_values.empty:
+            for low_q, high_q in ((0.10, 0.90), (0.20, 0.80), (0.25, 0.75)):
+                low_value = float(body_values.quantile(low_q))
+                high_value = float(body_values.quantile(high_q))
+                if math.isfinite(low_value) and math.isfinite(high_value) and low_value <= high_value:
+                    candidates.append(
+                        {
+                            "filter_name": f"candle_body_vs_avg between {low_value:.8g} and {high_value:.8g}",
+                            "feature": "candle_body_vs_avg",
+                            "operator": "between",
+                            "threshold": low_value,
+                            "threshold_high": high_value,
+                        }
+                    )
+    for feature in ("close_above_ema20", "close_above_ema50", "close_above_ema200"):
+        if feature in features and features[feature].notna().any():
+            candidates.append(
+                {
+                    "filter_name": f"{feature} == true",
+                    "feature": feature,
+                    "operator": "==",
+                    "threshold": True,
+                }
+            )
+    for feature in ("hour_utc", "day_of_week"):
+        bad_values = false_breakout_bad_time_values(features, feature)
+        for value in bad_values:
+            candidates.append(
+                {
+                    "filter_name": f"{feature} not in [{value}]",
+                    "feature": feature,
+                    "operator": "not_in",
+                    "excluded_values": [int(value)],
+                }
+            )
+    return candidates
+
+
+def false_breakout_bad_time_values(features: pd.DataFrame, feature: str) -> list[int]:
+    if feature not in features:
+        return []
+    data = features.copy()
+    data[feature] = pd.to_numeric(data[feature], errors="coerce")
+    stop_values = data.loc[data["exit_reason"].astype(str) == "stop_loss_accounting", feature].dropna().astype(int)
+    tp_values = data.loc[data["exit_reason"].astype(str) == "maker_take_profit", feature].dropna().astype(int)
+    bad: list[int] = []
+    for value, count in stop_values.value_counts().items():
+        if count >= 2 and value not in set(tp_values.tolist()):
+            bad.append(int(value))
+    return bad[:3]
+
+
+def evaluate_false_breakout_filter_candidate(features: pd.DataFrame, candidate: dict[str, Any]) -> dict[str, Any]:
+    feature = str(candidate.get("feature") or "")
+    if feature in FALSE_BREAKOUT_FUTURE_OR_OUTCOME_COLUMNS or feature not in FALSE_BREAKOUT_FILTER_ALLOWED_FEATURES:
+        raise ValueError(f"Filter feature is not signal-time-only: {feature}")
+    mask = false_breakout_filter_mask(features, candidate)
+    kept = features.loc[mask].copy()
+    removed = features.loc[~mask].copy()
+    kept_returns = pd.to_numeric(kept.get("return_pct", pd.Series(dtype=float)), errors="coerce").fillna(0.0).tolist()
+    kept_metrics = maker_fill_trade_metrics(kept_returns)
+    kept_exit = kept.get("exit_reason", pd.Series(dtype=str)).astype(str)
+    removed_exit = removed.get("exit_reason", pd.Series(dtype=str)).astype(str)
+    removed_returns = pd.to_numeric(removed.get("return_pct", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    row = {
+        "filter_name": candidate.get("filter_name"),
+        "feature": feature,
+        "operator": candidate.get("operator"),
+        "threshold": candidate.get("threshold"),
+        "threshold_high": candidate.get("threshold_high"),
+        "excluded_values": candidate.get("excluded_values"),
+        "uses_signal_time_features_only": True,
+        "kept_trade_count": int(len(kept)),
+        "removed_trade_count": int(len(removed)),
+        "removed_stop_count": int((removed_exit == "stop_loss_accounting").sum()),
+        "removed_tp_count": int((removed_exit == "maker_take_profit").sum()),
+        "removed_profitable_timeout_count": int(((removed_exit == "timeout_exit") & (removed_returns > 0)).sum()),
+        "kept_return_pct": kept_metrics["return_pct"],
+        "kept_profit_factor": kept_metrics["profit_factor"],
+        "kept_max_drawdown_pct": kept_metrics["max_drawdown_pct"],
+        "kept_positive_count": int((pd.to_numeric(kept.get("return_pct", pd.Series(dtype=float)), errors="coerce") > 0).sum()),
+        "kept_negative_count": int((pd.to_numeric(kept.get("return_pct", pd.Series(dtype=float)), errors="coerce") < 0).sum()),
+        "kept_stop_count": int((kept_exit == "stop_loss_accounting").sum()),
+        "kept_timeout_count": int((kept_exit == "timeout_exit").sum()),
+        "kept_tp_count": int((kept_exit == "maker_take_profit").sum()),
+    }
+    row["filter_passed_research_gate"] = false_breakout_filter_metrics_pass(row)
+    return row
+
+
+def false_breakout_filter_mask(features: pd.DataFrame, candidate: dict[str, Any]) -> pd.Series:
+    feature = str(candidate.get("feature") or "")
+    operator = str(candidate.get("operator") or "")
+    if feature not in features:
+        return pd.Series(False, index=features.index)
+    values = features[feature]
+    if operator in {">=", ">", "<=", "<"}:
+        numeric = pd.to_numeric(values, errors="coerce")
+        threshold = float(candidate.get("threshold"))
+        if operator == ">=":
+            return numeric >= threshold
+        if operator == ">":
+            return numeric > threshold
+        if operator == "<=":
+            return numeric <= threshold
+        return numeric < threshold
+    if operator == "between":
+        numeric = pd.to_numeric(values, errors="coerce")
+        return (numeric >= float(candidate.get("threshold"))) & (numeric <= float(candidate.get("threshold_high")))
+    if operator == "==":
+        threshold = candidate.get("threshold")
+        if isinstance(threshold, bool):
+            return values.map(_truthy_value) == threshold
+        return values == threshold
+    if operator == "not_in":
+        excluded = set(candidate.get("excluded_values") or [])
+        return ~pd.to_numeric(values, errors="coerce").isin(excluded)
+    raise ValueError(f"Unsupported false-breakout filter operator: {operator}")
+
+
+def _truthy_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def false_breakout_filter_metrics_pass(row: dict[str, Any]) -> bool:
+    return bool(
+        int(row.get("kept_trade_count", 0) or 0) >= 10
+        and int(row.get("removed_stop_count", 0) or 0) >= 3
+        and int(row.get("removed_tp_count", 0) or 0) == 0
+        and _metric_float(row.get("kept_return_pct")) > 0
+        and _profit_factor_value(row.get("kept_profit_factor")) >= 1.05
+        and _metric_float(row.get("kept_max_drawdown_pct")) <= 0.10
+        and bool(row.get("uses_signal_time_features_only"))
+    )
+
+
+def false_breakout_filter_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        bool(row.get("filter_passed_research_gate")),
+        int(row.get("removed_tp_count", 0) or 0) == 0,
+        _metric_float(row.get("kept_return_pct")),
+        min(5.0, _profit_factor_value(row.get("kept_profit_factor"))),
+        int(row.get("removed_stop_count", 0) or 0),
+        -_metric_float(row.get("kept_max_drawdown_pct")),
+        int(row.get("kept_trade_count", 0) or 0),
+    )
+
+
+def false_breakout_summary_from_outputs(
+    features: pd.DataFrame,
+    filter_candidates: list[dict[str, Any]],
+    settings: Settings,
+    *,
+    config: ResearchConfig,
+    input_trade_count: int,
+    orders_frame: pd.DataFrame,
+    signal_source_used: str,
+    signal_row_count: int,
+    synthetic_data_used: bool,
+    output_paths: dict[str, Path],
+    input_paths: dict[str, Path],
+) -> dict[str, Any]:
+    returns = pd.to_numeric(features.get("return_pct", pd.Series(dtype=float)), errors="coerce").fillna(0.0).tolist()
+    baseline = maker_fill_trade_metrics(returns)
+    exit_reasons = features.get("exit_reason", pd.Series(dtype=str)).astype(str)
+    best_filter = filter_candidates[0] if filter_candidates else None
+    orders_placed = 0
+    if not orders_frame.empty and "orders_placed" in orders_frame:
+        orders_placed = int(pd.to_numeric(orders_frame["orders_placed"], errors="coerce").fillna(0).sum())
+    signal_open_available = "signal_open" in features and not features["signal_open"].isna().any()
+    data_ready = bool(len(features) > 0 and signal_row_count > 0 and signal_open_available)
+    research_result_valid = bool(data_ready and not synthetic_data_used)
+    false_breakout_filter_found = bool(
+        best_filter
+        and best_filter.get("filter_passed_research_gate")
+        and not synthetic_data_used
+        and orders_placed == 0
+    )
+    summary = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "parameter_set_id": config.parameter_set_id,
+        "track_id": config.track_id,
+        "strategy_name": config.strategy_name,
+        "timeframe": config.timeframe,
+        "exit_mode": config.exit_mode,
+        "research_result_valid": research_result_valid,
+        "data_ready": data_ready,
+        "synthetic_data_used": bool(synthetic_data_used),
+        "orders_placed": orders_placed,
+        "trading_enabled": bool(settings.trading_enabled),
+        "auto_trade_enabled": bool(settings.auto_trade_enabled),
+        "fallback_trading_allowed": bool(settings.allow_fallback_trading),
+        "live_tradable": False,
+        "strict_paper_forward_eligible": False,
+        "signal_feature_source_used": signal_source_used,
+        "signal_feature_row_count": int(signal_row_count),
+        "maker_fill_trades_csv_path": str(input_paths["trades"]),
+        "maker_fill_orders_csv_path": str(input_paths["orders"]),
+        "input_trade_count": int(input_trade_count),
+        "conservative_trade_count": int(len(features)),
+        "stop_loss_count": int((exit_reasons == "stop_loss_accounting").sum()),
+        "maker_take_profit_count": int((exit_reasons == "maker_take_profit").sum()),
+        "timeout_count": int((exit_reasons == "timeout_exit").sum()),
+        "baseline_return_pct": baseline["return_pct"],
+        "baseline_profit_factor": baseline["profit_factor"],
+        "baseline_max_drawdown_pct": baseline["max_drawdown_pct"],
+        "best_filter_candidate": best_filter,
+        "best_filter_kept_trade_count": int(best_filter.get("kept_trade_count", 0) if best_filter else 0),
+        "best_filter_removed_stop_count": int(best_filter.get("removed_stop_count", 0) if best_filter else 0),
+        "best_filter_removed_tp_count": int(best_filter.get("removed_tp_count", 0) if best_filter else 0),
+        "best_filter_return_pct": _metric_float(best_filter.get("kept_return_pct") if best_filter else 0.0),
+        "best_filter_profit_factor": _profit_factor_value(best_filter.get("kept_profit_factor") if best_filter else 0.0),
+        "best_filter_max_drawdown_pct": _metric_float(best_filter.get("kept_max_drawdown_pct") if best_filter else 0.0),
+        "false_breakout_filter_found": false_breakout_filter_found,
+        "recommended_next_action": (
+            "human_review_then_new_out_of_sample_paper_forward_validation_no_auto_enable"
+            if false_breakout_filter_found
+            else "no_false_breakout_filter_found_keep_research_only"
+        ),
+        "why_filter_may_be_overfit": [
+            "only_19_conservative_trades_in_original_maker_fill_sample",
+            "filter_candidates_are_single_sample_threshold_search",
+            "must_validate_on_new_out_of_sample_paper_forward_window_before_use",
+            "stop_loss_is_still_not_maker_enforceable_without_taker_fallback",
+        ],
+        "final_recommendation": (
+            "research_filter_candidate_found_requires_human_review_and_out_of_sample_paper_forward_validation_not_live_trading"
+            if false_breakout_filter_found
+            else "no_research_filter_candidate_passed_keep_candidate_rejected_not_live_tradable"
+        ),
+        "features_csv_path": str(output_paths["features"]),
+        "filter_candidates_csv_path": str(output_paths["filter_candidates"]),
+        "feature_comparison_csv_path": str(output_paths["feature_comparison"]),
+        "summary_path": str(output_paths["summary"]),
+    }
+    return _json_safe(summary)
+
+
+def write_false_breakout_outputs(
+    summary: dict[str, Any],
+    features: pd.DataFrame,
+    filter_candidates: list[dict[str, Any]],
+    comparisons: list[dict[str, Any]],
+    *,
+    output_paths: dict[str, Path],
+) -> None:
+    for path in output_paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    output_paths["summary"].write_text(json.dumps(_json_safe(summary), indent=2, allow_nan=False), encoding="utf-8")
+    write_dict_rows_csv(features.to_dict("records"), output_paths["features"], FALSE_BREAKOUT_FEATURE_CSV_FIELDS)
+    write_dict_rows_csv(filter_candidates, output_paths["filter_candidates"], FALSE_BREAKOUT_FILTER_CANDIDATE_FIELDS)
+    write_dict_rows_csv(comparisons, output_paths["feature_comparison"], FALSE_BREAKOUT_COMPARISON_FIELDS)
+
+
+def write_dict_rows_csv(rows: list[dict[str, Any]], path: Path, fieldnames: list[str]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: _csv_value(row.get(field)) for field in fieldnames})
 
 
 def volatility_focus_v7_failure_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
