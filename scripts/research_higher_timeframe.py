@@ -295,6 +295,7 @@ MIN_RESEARCH_TRADES_PER_SPLIT = 3
 MIN_RESEARCH_PROFIT_FACTOR_NET = 1.05
 MAX_SINGLE_TRADE_RETURN_SHARE = 0.60
 MAKER_FILL_DEFAULT_PARAMETER_SET_ID = "v9m_00021"
+MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID = "v9m_00021_f1_volume_zscore_1"
 MAKER_FILL_DEFAULT_ENTRY_OFFSET_BPS = 2.0
 MAKER_FILL_DEFAULT_ENTRY_TIMEOUT_MINUTES = 60
 MAKER_FILL_OFFSET_BPS_TESTS = (1.0, 2.0, 3.0, 5.0)
@@ -433,6 +434,34 @@ FALSE_BREAKOUT_FILTER_CANDIDATE_FIELDS = [
     "kept_tp_count",
     "filter_passed_research_gate",
 ]
+FILTERED_MAKER_FILL_CANDIDATES = {
+    MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID: {
+        "parameter_set_id": MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID,
+        "track_id": "M9_v8m_00086_drawdown_reduction_volume_filter",
+        "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+        "timeframe": "1H",
+        "exit_mode": EXIT_MODE_FIXED,
+        "take_profit_pct": 0.045,
+        "stop_loss_pct": 0.02,
+        "max_hold_bars": 48,
+        "breakout_lookback": 20,
+        "consolidation_lookback": 12,
+        "min_body_vs_avg": 1.2,
+        "min_recent_return_pct": 0.003,
+        "min_trend_strength": 0.0,
+        "max_atr_expansion": 3.0,
+        "min_volume_zscore": 1.0,
+        "filtered_candidate_source": "false_breakout_diagnostic",
+        "applied_filter": "volume_zscore >= 1",
+        "original_candidate_id": MAKER_FILL_DEFAULT_PARAMETER_SET_ID,
+        "filtered_candidate_id": MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID,
+        "overfit_warning": (
+            "Single-sample false-breakout filter from 19 conservative maker-fill trades; "
+            "requires human review and a new out-of-sample paper-forward validation before any use."
+        ),
+        "signal_generation_mode": "regenerate_signals_from_1h_data",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -5114,7 +5143,7 @@ def build_and_write_maker_fill_simulation(
     entry_timeout_minutes: int,
     now: datetime,
 ) -> dict[str, Any]:
-    target_row = next((row for row in rows if str(row.get("parameter_set_id")) == str(parameter_set_id)), None)
+    target_row = resolve_maker_fill_target_row(rows, parameter_set_id)
     output_paths = maker_fill_output_paths(summary_path)
     if target_row is None:
         summary = maker_fill_summary_from_result(
@@ -5251,6 +5280,16 @@ def build_and_write_maker_fill_simulation(
     return summary
 
 
+def resolve_maker_fill_target_row(rows: list[dict[str, Any]], parameter_set_id: str) -> dict[str, Any] | None:
+    target_row = next((row for row in rows if str(row.get("parameter_set_id")) == str(parameter_set_id)), None)
+    filtered_candidate = FILTERED_MAKER_FILL_CANDIDATES.get(str(parameter_set_id))
+    if filtered_candidate is not None:
+        return {**dict(target_row or {}), **filtered_candidate}
+    if target_row is not None:
+        return dict(target_row)
+    return None
+
+
 def maker_fill_output_paths(summary_path: Path) -> dict[str, Path]:
     prefix = summary_path.stem.removesuffix("_summary")
     return {
@@ -5304,6 +5343,20 @@ def research_config_from_result_row(row: dict[str, Any]) -> ResearchConfig:
             None if row.get("max_atr_percentile") in {None, ""} else float(row.get("max_atr_percentile"))
         ),
     )
+
+
+def maker_fill_filtered_candidate_metadata(parameter_set_id: str | None) -> dict[str, Any]:
+    candidate = FILTERED_MAKER_FILL_CANDIDATES.get(str(parameter_set_id or ""))
+    if candidate is None:
+        return {}
+    return {
+        "filtered_candidate_source": candidate["filtered_candidate_source"],
+        "applied_filter": candidate["applied_filter"],
+        "original_candidate_id": candidate["original_candidate_id"],
+        "filtered_candidate_id": candidate["filtered_candidate_id"],
+        "overfit_warning": candidate["overfit_warning"],
+        "signal_generation_mode": candidate["signal_generation_mode"],
+    }
 
 
 def select_maker_fill_bars(
@@ -5808,11 +5861,16 @@ def maker_fill_summary_from_result(
             target_row.get("current_taker_net_return_pct")
         )
     fill_rate_required = _metric_float(
-        target_row.get("estimated_fill_rate_required_to_remain_profitable", target_row.get("fill_rate_required_to_remain_profitable"))
+        target_row.get(
+            "estimated_fill_rate_required_to_remain_profitable",
+            target_row.get("fill_rate_required_to_remain_profitable"),
+        )
     )
+    parameter_set_id = config.parameter_set_id if config is not None else target_row.get("parameter_set_id")
+    filtered_metadata = maker_fill_filtered_candidate_metadata(parameter_set_id)
     summary = {
         "generated_at": datetime.now(UTC).isoformat(),
-        "parameter_set_id": config.parameter_set_id if config is not None else target_row.get("parameter_set_id"),
+        "parameter_set_id": parameter_set_id,
         "track_id": config.track_id if config is not None else target_row.get("track_id"),
         "strategy_name": config.strategy_name if config is not None else target_row.get("strategy_name"),
         "timeframe": config.timeframe if config is not None else target_row.get("timeframe"),
@@ -5862,6 +5920,7 @@ def maker_fill_summary_from_result(
         "trades_csv_path": str(output_paths["trades"]),
         "orders_csv_path": str(output_paths["orders"]),
         "rejections_path": str(output_paths["rejections"]),
+        **filtered_metadata,
     }
     passed, reasons = evaluate_maker_fill_simulation_pass_fail(summary)
     reasons = list(dict.fromkeys([*extra_rejection_reasons, *reasons]))
@@ -5874,6 +5933,12 @@ def maker_fill_summary_from_result(
         "stop_loss_design_without_taker_fallback_required",
         "human_review_required_before_any_paper_forward",
     ]
+    if filtered_metadata:
+        summary["next_required_validation"] = [
+            "human_review_filtered_false_breakout_candidate",
+            "new_out_of_sample_paper_forward_validation_required",
+            *summary["next_required_validation"],
+        ]
     summary["final_recommendation"] = (
         "paper_forward_validation_required_not_live_trading"
         if passed
@@ -5941,6 +6006,11 @@ def write_maker_fill_outputs(
         "maker_fill_simulation_rejection_reasons": summary.get("maker_fill_simulation_rejection_reasons"),
         "maker_only_stop_loss_enforceable": summary.get("maker_only_stop_loss_enforceable"),
         "no_market_fallback_stop_loss_note": summary.get("no_market_fallback_stop_loss_note"),
+        "filtered_candidate_source": summary.get("filtered_candidate_source"),
+        "applied_filter": summary.get("applied_filter"),
+        "original_candidate_id": summary.get("original_candidate_id"),
+        "filtered_candidate_id": summary.get("filtered_candidate_id"),
+        "overfit_warning": summary.get("overfit_warning"),
         "entry_unfilled_count": summary.get("entry_unfilled_count"),
         "missed_winner_count": summary.get("missed_winner_count"),
         "missed_loser_count": summary.get("missed_loser_count"),

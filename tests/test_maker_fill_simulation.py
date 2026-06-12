@@ -5,11 +5,16 @@ from datetime import UTC, datetime, timedelta
 import pandas as pd
 import pytest
 
+import scripts.research_higher_timeframe as rh
 from app.config import Settings
 from scripts.research_higher_timeframe import (
+    MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID,
     VOLATILITY_BREAKOUT_STRATEGY,
     ResearchConfig,
+    build_and_write_maker_fill_simulation,
     evaluate_maker_fill_simulation_pass_fail,
+    research_config_from_result_row,
+    resolve_maker_fill_target_row,
     simulate_post_only_maker_fill_scenario,
 )
 
@@ -251,3 +256,97 @@ def test_simulation_passes_only_with_required_trade_return_pf_drawdown_and_no_ma
     assert passed is True
     assert failed is False
     assert reason in failed_reasons
+
+
+def test_filtered_volume_zscore_candidate_uses_min_volume_zscore_one():
+    row = resolve_maker_fill_target_row(
+        [
+            {
+                "parameter_set_id": MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID,
+                "min_volume_zscore": 0.25,
+                "maker_vs_taker_net_gap": 0.04,
+            }
+        ],
+        MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID,
+    )
+    assert row is not None
+    config = research_config_from_result_row(row)
+
+    assert config.parameter_set_id == MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID
+    assert config.track_id == "M9_v8m_00086_drawdown_reduction_volume_filter"
+    assert config.min_volume_zscore == pytest.approx(1.0)
+    assert row["maker_vs_taker_net_gap"] == pytest.approx(0.04)
+
+
+def test_filtered_candidate_regenerates_signals_and_keeps_trading_disabled(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+    signal_timestamp = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+
+    def fake_build_strategy_research_trades(
+        config,
+        *,
+        bars,
+        settings,
+        buy_the_dip_features=None,
+        v3_features=None,
+    ):
+        captured["config"] = config
+        captured["signal_bar_count"] = len(bars)
+        return pd.DataFrame({"buy_exit_return_pct": [0.045]}), _signals(signal_timestamp)
+
+    def fake_select_maker_fill_bars(settings, signal_frame, config, *, session_factory, now):
+        fill_bars = _fill_bars(
+            [
+                (datetime(2026, 6, 1, 1, 0, tzinfo=UTC), 100.0, 105.0, 99.97, 104.5),
+            ]
+        )
+        return "1Min", fill_bars, "test_collected_market_data"
+
+    monkeypatch.setattr(rh, "build_strategy_research_trades", fake_build_strategy_research_trades)
+    monkeypatch.setattr(rh, "select_maker_fill_bars", fake_select_maker_fill_bars)
+
+    summary = build_and_write_maker_fill_simulation(
+        rows=[
+            {
+                "parameter_set_id": "v9m_00021",
+                "strategy_name": VOLATILITY_BREAKOUT_STRATEGY,
+                "timeframe": "1H",
+                "min_volume_zscore": 0.25,
+            }
+        ],
+        bars_by_timeframe={"1H": _signals(signal_timestamp)},
+        settings=_settings(),
+        data_source_reports={
+            "1H": {
+                "source_used": "collected_market_data_derived_from_15min",
+                "row_count": 4000,
+                "synthetic_data_used": False,
+                "research_result_valid": True,
+            }
+        },
+        parameter_set_id=MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID,
+        summary_path=tmp_path / "maker_fill_simulation_v9m_00021_f1_volume_zscore_1_summary.json",
+        session_factory=None,
+        maker_entry_offset_bps=2,
+        entry_timeout_minutes=60,
+        now=datetime(2026, 6, 2, tzinfo=UTC),
+    )
+    config = captured["config"]
+
+    assert isinstance(config, ResearchConfig)
+    assert config.parameter_set_id == MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID
+    assert config.min_volume_zscore == pytest.approx(1.0)
+    assert captured["signal_bar_count"] == 1
+    assert summary["signal_generation_mode"] == "regenerate_signals_from_1h_data"
+    assert summary["filtered_candidate_source"] == "false_breakout_diagnostic"
+    assert summary["applied_filter"] == "volume_zscore >= 1"
+    assert summary["original_candidate_id"] == "v9m_00021"
+    assert summary["filtered_candidate_id"] == MAKER_FILL_FILTERED_VOLUME_ZSCORE_PARAMETER_SET_ID
+    assert summary["orders_placed"] == 0
+    assert summary["trading_enabled"] is False
+    assert summary["auto_trade_enabled"] is False
+    assert summary["fallback_trading_allowed"] is False
+    assert summary["live_tradable"] is False
+    assert summary["strict_paper_forward_eligible"] is False
+    assert summary["signal_count"] == 1
+    assert summary["entry_filled_count"] == 1
