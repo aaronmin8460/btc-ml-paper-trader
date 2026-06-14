@@ -155,7 +155,10 @@ class ScalpingDecisionEngine:
                 "quant_strategy",
                 regime=regime,
                 strategy_candidates=candidate_payload,
-                metadata={"regime": regime.to_dict()},
+                metadata={
+                    "regime": regime.to_dict(),
+                    "strategy_block_reasons": _strategy_block_reasons(candidates),
+                },
             )
 
         ml_confirmation = _ml_confirmation(
@@ -450,6 +453,17 @@ def _blocked_decision(
     ml_confirmation: dict | None = None,
     metadata: dict | None = None,
 ) -> Decision:
+    decision_metadata = dict(metadata or ({"regime": regime.to_dict()} if regime else {}))
+    if strategy_candidates and "strategy_block_reasons" not in decision_metadata:
+        decision_metadata["strategy_block_reasons"] = [
+            {
+                "strategy_name": candidate.get("strategy_name"),
+                "block_reason": candidate.get("reason"),
+                "metadata": candidate.get("metadata"),
+            }
+            for candidate in strategy_candidates
+            if candidate.get("action") != "buy"
+        ]
     return Decision(
         symbol,
         "hold",
@@ -463,7 +477,7 @@ def _blocked_decision(
         regime_confidence=regime.confidence if regime else None,
         ml_confirmation=ml_confirmation,
         strategy_candidates=strategy_candidates,
-        metadata=metadata or ({"regime": regime.to_dict()} if regime else None),
+        metadata=decision_metadata or None,
     )
 
 
@@ -474,6 +488,18 @@ def _quant_strategy_block_reason(candidates: list[StrategySignal]) -> str:
     if candidates:
         return candidates[0].reason
     return "no_quant_strategy_candidate"
+
+
+def _strategy_block_reasons(candidates: list[StrategySignal]) -> list[dict]:
+    return [
+        {
+            "strategy_name": candidate.strategy_name,
+            "block_reason": candidate.reason,
+            "metadata": candidate.metadata,
+        }
+        for candidate in candidates
+        if candidate.action != "buy"
+    ]
 
 
 def _blocked_by_for_reason(reason: str) -> str:

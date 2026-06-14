@@ -9,7 +9,13 @@ from app.data.market_data import MarketDataClient
 from app.data.scalping_features import build_scalping_features
 from app.risk.risk_manager import PositionState, TradeFrequencyState
 from app.strategy.scalping_decision_engine import ScalpingDecisionEngine
-from app.strategy.strategies import MarketContext, MarketRegimeFilter, MeanReversionScalpingStrategy
+from app.strategy.strategies import (
+    MarketContext,
+    MarketRegime,
+    MarketRegimeFilter,
+    MeanReversionScalpingStrategy,
+    MomentumBreakoutStrategy,
+)
 
 
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
@@ -62,6 +68,47 @@ def _prediction(**overrides) -> dict:
     return values
 
 
+def _profile_a_settings(**overrides) -> Settings:
+    values = {
+        "max_spread_bps": 4,
+        "min_quote_imbalance": 0.05,
+        "scalping_entry_dip_pct": 0.001,
+        "scalping_buy_probability_floor": 0.56,
+        "scalping_confidence_gap_required": 0.08,
+        "min_seconds_between_trades": 0,
+    }
+    values.update(overrides)
+    return _settings(**values)
+
+
+def _mean_reversion_context() -> MarketContext:
+    return MarketContext(regime=MarketRegime("mean_reverting", 0.8, "test"))
+
+
+def _trending_context() -> MarketContext:
+    return MarketContext(regime=MarketRegime("trending", 0.8, "test"))
+
+
+def _momentum_row(**overrides) -> pd.Series:
+    values = {
+        "timestamp": NOW,
+        "close": 100.0,
+        "scalping_spread_bps": 2.0,
+        "scalping_quote_imbalance": 0.12,
+        "scalping_log_return_3": 0.0012,
+        "scalping_momentum_3": 0.0012,
+        "scalping_log_return_5": 0.0010,
+        "scalping_momentum_5": 0.0010,
+        "trend_strength_20": 1.0,
+        "scalping_high_breakout_5": 0.0008,
+        "scalping_volume_zscore_10": 0.5,
+        "scalping_volatility_10": 0.001,
+        "macd_hist": 0.001,
+    }
+    values.update(overrides)
+    return pd.Series(values)
+
+
 def test_mean_reversion_strategy_is_deterministic_for_fixed_inputs():
     settings = _settings()
     row = _feature_row()
@@ -86,6 +133,174 @@ def test_mean_reversion_strategy_is_deterministic_for_fixed_inputs():
     assert first == second
     assert first.action == "buy"
     assert first.strategy_name == "mean_reversion_scalping"
+
+
+def test_weak_mean_reversion_dip_is_rejected():
+    settings = _profile_a_settings()
+    row = _feature_row(
+        scalping_log_return_3=-0.0002,
+        scalping_momentum_3=-0.0002,
+        scalping_high_breakout_5=-0.0002,
+        scalping_low_breakout_5=-0.0002,
+        scalping_ema_5_distance=-0.0002,
+        scalping_vwap_distance=-0.0002,
+        scalping_rsi_3=35,
+    )
+
+    signal = MeanReversionScalpingStrategy(settings).generate_signal(
+        feature_row=row,
+        prediction=_prediction(),
+        position=PositionState(),
+        quote=None,
+        market_context=_mean_reversion_context(),
+    )
+
+    assert signal.action == "hold"
+    assert signal.reason == "mean_reversion_dip_too_weak"
+    assert signal.metadata["block_reason"] == "mean_reversion_dip_too_weak"
+
+
+def test_weak_mean_reversion_quote_imbalance_is_rejected():
+    settings = _profile_a_settings()
+    row = _feature_row(scalping_quote_imbalance=0.0)
+
+    signal = MeanReversionScalpingStrategy(settings).generate_signal(
+        feature_row=row,
+        prediction=_prediction(),
+        position=PositionState(),
+        quote=None,
+        market_context=_mean_reversion_context(),
+    )
+
+    assert signal.action == "hold"
+    assert signal.reason == "mean_reversion_quote_imbalance_too_weak"
+
+
+def test_valid_mean_reversion_can_produce_candidate():
+    settings = _profile_a_settings()
+    row = _feature_row(
+        scalping_quote_imbalance=0.12,
+        scalping_log_return_3=-0.0012,
+        scalping_momentum_3=-0.0012,
+        scalping_high_breakout_5=-0.0012,
+        scalping_low_breakout_5=-0.0012,
+        scalping_ema_5_distance=-0.0012,
+        scalping_vwap_distance=-0.0012,
+    )
+
+    signal = MeanReversionScalpingStrategy(settings).generate_signal(
+        feature_row=row,
+        prediction=_prediction(),
+        position=PositionState(),
+        quote=None,
+        market_context=_mean_reversion_context(),
+    )
+
+    assert signal.action == "buy"
+    assert signal.reason == "mean_reversion_buy_candidate"
+
+
+def test_weak_momentum_volume_is_rejected():
+    settings = _profile_a_settings()
+    row = _momentum_row(scalping_volume_zscore_10=-0.1)
+
+    signal = MomentumBreakoutStrategy(settings).generate_signal(
+        feature_row=row,
+        prediction=_prediction(),
+        position=PositionState(),
+        quote=None,
+        market_context=_trending_context(),
+    )
+
+    assert signal.action == "hold"
+    assert signal.reason == "momentum_volume_too_weak"
+
+
+def test_weak_momentum_breakout_is_rejected():
+    settings = _profile_a_settings()
+    row = _momentum_row(scalping_high_breakout_5=0.0001, trend_strength_20=1.0)
+
+    signal = MomentumBreakoutStrategy(settings).generate_signal(
+        feature_row=row,
+        prediction=_prediction(),
+        position=PositionState(),
+        quote=None,
+        market_context=_trending_context(),
+    )
+
+    assert signal.action == "hold"
+    assert signal.reason == "momentum_breakout_too_weak"
+
+
+def test_valid_momentum_can_produce_candidate():
+    settings = _profile_a_settings()
+    row = _momentum_row()
+
+    signal = MomentumBreakoutStrategy(settings).generate_signal(
+        feature_row=row,
+        prediction=_prediction(),
+        position=PositionState(),
+        quote=None,
+        market_context=_trending_context(),
+    )
+
+    assert signal.action == "buy"
+    assert signal.reason == "momentum_breakout_buy_candidate"
+
+
+def test_strict_filters_do_not_break_scalping_decision_flow():
+    settings = _profile_a_settings()
+    row = _feature_row(
+        scalping_quote_imbalance=0.12,
+        scalping_log_return_3=-0.0012,
+        scalping_momentum_3=-0.0012,
+        scalping_high_breakout_5=-0.0012,
+        scalping_low_breakout_5=-0.0012,
+        scalping_ema_5_distance=-0.0012,
+        scalping_vwap_distance=-0.0012,
+    )
+
+    decision = ScalpingDecisionEngine(settings).decide(
+        prediction=_prediction(buy_probability=0.70, sell_probability=0.20),
+        feature_row=row,
+        position=PositionState(),
+        trading_enabled=True,
+        now=NOW,
+    )
+
+    assert decision.action == "buy"
+    assert decision.reason == "scalping_entry_approved"
+    assert decision.strategy_name == "mean_reversion_scalping"
+
+
+def test_strategy_block_reasons_are_added_to_decision_metadata():
+    settings = _profile_a_settings()
+    row = _feature_row(
+        scalping_log_return_3=-0.0002,
+        scalping_momentum_3=-0.0002,
+        scalping_high_breakout_5=-0.0002,
+        scalping_low_breakout_5=-0.0002,
+        scalping_ema_5_distance=-0.0002,
+        scalping_vwap_distance=-0.0002,
+    )
+
+    decision = ScalpingDecisionEngine(settings).decide(
+        prediction=_prediction(buy_probability=0.70, sell_probability=0.20),
+        feature_row=row,
+        position=PositionState(),
+        trading_enabled=True,
+        now=NOW,
+    )
+
+    assert decision.action == "hold"
+    assert decision.blocked_by == "quant_strategy"
+    assert decision.reason == "mean_reversion_dip_too_weak"
+    assert decision.metadata is not None
+    reasons = {
+        item["block_reason"]
+        for item in decision.metadata["strategy_block_reasons"]
+    }
+    assert "mean_reversion_dip_too_weak" in reasons
 
 
 def test_strategy_signal_does_not_change_when_future_bars_change():

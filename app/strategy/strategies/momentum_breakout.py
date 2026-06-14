@@ -15,6 +15,11 @@ from app.strategy.strategies.base import (
 )
 
 
+EXTREMELY_STRONG_TREND = 1.5
+MIN_MOMENTUM_SHORT_RETURN = 0.0008
+MIN_MOMENTUM_BREAKOUT = 0.0005
+
+
 class MomentumBreakoutStrategy:
     name = "momentum_breakout"
 
@@ -41,11 +46,15 @@ class MomentumBreakoutStrategy:
         if spread is None:
             return hold_signal(self.name, "spread_unavailable")
         if spread > self.settings.max_spread_bps:
-            return hold_signal(self.name, "spread_too_wide", metadata={"spread_bps": spread})
+            return hold_signal(self.name, "momentum_spread_too_wide", metadata={"spread_bps": spread})
         if imbalance is None:
             return hold_signal(self.name, "quote_imbalance_unavailable")
-        if imbalance < max(self.settings.min_quote_imbalance, -0.05):
-            return hold_signal(self.name, "quote_imbalance_not_supportive", metadata={"quote_imbalance": imbalance})
+        if imbalance < self.settings.min_quote_imbalance:
+            return hold_signal(
+                self.name,
+                "momentum_quote_imbalance_too_weak",
+                metadata={"quote_imbalance": imbalance},
+            )
 
         regime = getattr(context.regime, "regime", None)
         if regime != "trending":
@@ -59,18 +68,33 @@ class MomentumBreakoutStrategy:
         volatility = first_finite(feature_row, "scalping_volatility_10", "scalping_volatility_5", "atr_14", "volatility_20", default=0.0) or 0.0
         breakout = first_finite(feature_row, "scalping_high_breakout_5", "high_breakout_5", default=0.0) or 0.0
 
-        momentum_ok = short_return > 0 and longer_return >= -0.001
-        breakout_ok = breakout > 0 or trend_strength > 0.8 or macd > 0
-        volume_ok = volume_zscore >= -0.5
-        volatility_ok = volatility < 0.02
-        if not momentum_ok:
-            return hold_signal(self.name, "momentum_not_positive", metadata={"short_return": short_return})
-        if not breakout_ok:
-            return hold_signal(self.name, "breakout_not_confirmed", metadata={"breakout": breakout})
-        if not volume_ok:
-            return hold_signal(self.name, "volume_not_supportive", metadata={"volume_zscore": volume_zscore})
-        if not volatility_ok:
+        extremely_strong_trend = trend_strength >= EXTREMELY_STRONG_TREND
+        volatility_limit = min(0.02, max(0.0, float(self.settings.regime_no_trade_volatility_threshold)))
+        if volatility >= volatility_limit:
             return hold_signal(self.name, "volatility_too_high", metadata={"volatility": volatility})
+        if volume_zscore < 0:
+            return hold_signal(self.name, "momentum_volume_too_weak", metadata={"volume_zscore": volume_zscore})
+        if not extremely_strong_trend and short_return < MIN_MOMENTUM_SHORT_RETURN:
+            return hold_signal(
+                self.name,
+                "momentum_short_return_too_weak",
+                metadata={"short_return": short_return, "required_short_return": MIN_MOMENTUM_SHORT_RETURN},
+            )
+        if not extremely_strong_trend and breakout <= MIN_MOMENTUM_BREAKOUT:
+            return hold_signal(
+                self.name,
+                "momentum_breakout_too_weak",
+                metadata={"breakout": breakout, "required_breakout": MIN_MOMENTUM_BREAKOUT},
+            )
+        momentum_ok = short_return >= MIN_MOMENTUM_SHORT_RETURN or extremely_strong_trend
+        breakout_ok = breakout > MIN_MOMENTUM_BREAKOUT or extremely_strong_trend
+        volume_ok = volume_zscore >= 0
+        if not momentum_ok:
+            return hold_signal(self.name, "momentum_short_return_too_weak", metadata={"short_return": short_return})
+        if not breakout_ok:
+            return hold_signal(self.name, "momentum_breakout_too_weak", metadata={"breakout": breakout})
+        if not volume_ok:
+            return hold_signal(self.name, "momentum_volume_too_weak", metadata={"volume_zscore": volume_zscore})
 
         momentum_score = clamp(max(short_return, longer_return, trend_strength / 10, macd * 100) / 0.004)
         breakout_score = clamp(max(0.0, breakout) / 0.003)

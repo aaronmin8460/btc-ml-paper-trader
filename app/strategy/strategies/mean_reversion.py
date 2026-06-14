@@ -41,11 +41,15 @@ class MeanReversionScalpingStrategy:
         if spread is None:
             return hold_signal(self.name, "spread_unavailable")
         if spread > self.settings.max_spread_bps:
-            return hold_signal(self.name, "spread_too_wide", metadata={"spread_bps": spread})
+            return hold_signal(self.name, "mean_reversion_spread_too_wide", metadata={"spread_bps": spread})
         if imbalance is None:
             return hold_signal(self.name, "quote_imbalance_unavailable")
         if imbalance < self.settings.min_quote_imbalance:
-            return hold_signal(self.name, "quote_imbalance_too_weak", metadata={"quote_imbalance": imbalance})
+            return hold_signal(
+                self.name,
+                "mean_reversion_quote_imbalance_too_weak",
+                metadata={"quote_imbalance": imbalance},
+            )
 
         regime = getattr(context.regime, "regime", None)
         if regime not in {"mean_reverting", "ranging"}:
@@ -60,18 +64,36 @@ class MeanReversionScalpingStrategy:
         high_breakout = first_finite(feature_row, "scalping_high_breakout_5", "high_breakout_5", default=0.0) or 0.0
         volatility = first_finite(feature_row, "scalping_volatility_10", "scalping_volatility_5", "atr_14", "volatility_20", default=0.0) or 0.0
 
-        stretched_down = (
-            rsi <= 45
-            or (bb_position is not None and bb_position <= 0.35)
-            or ema_distance <= -self.settings.scalping_entry_dip_pct
-            or vwap_distance <= -self.settings.scalping_entry_dip_pct
-            or short_return <= -self.settings.scalping_entry_dip_pct
-            or low_breakout <= -self.settings.scalping_entry_dip_pct
-            or high_breakout <= -self.settings.scalping_entry_dip_pct
+        dip_threshold = max(0.0, float(self.settings.scalping_entry_dip_pct))
+        stretched_down = any(
+            value <= -dip_threshold
+            for value in (
+                ema_distance,
+                vwap_distance,
+                short_return,
+                low_breakout,
+                high_breakout,
+            )
         )
+        volatility_limit = min(0.02, max(0.0, float(self.settings.regime_no_trade_volatility_threshold)))
         crash_like = short_return <= -0.01 or volatility >= 0.02
+        if volatility >= volatility_limit:
+            return hold_signal(self.name, "volatility_too_high", metadata={"volatility": volatility})
         if not stretched_down:
-            return hold_signal(self.name, "mean_reversion_stretch_absent", metadata={"rsi": rsi})
+            return hold_signal(
+                self.name,
+                "mean_reversion_dip_too_weak",
+                metadata={
+                    "rsi": rsi,
+                    "bb_close_position": bb_position,
+                    "ema_distance": ema_distance,
+                    "vwap_distance": vwap_distance,
+                    "short_return": short_return,
+                    "low_breakout": low_breakout,
+                    "high_breakout": high_breakout,
+                    "required_dip_pct": dip_threshold,
+                },
+            )
         if crash_like:
             return hold_signal(
                 self.name,

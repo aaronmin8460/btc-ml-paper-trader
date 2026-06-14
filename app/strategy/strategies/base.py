@@ -52,13 +52,15 @@ class QuantStrategy(Protocol):
 
 
 def hold_signal(strategy_name: str, reason: str, *, metadata: dict[str, Any] | None = None) -> StrategySignal:
+    payload = dict(metadata or {})
+    payload.setdefault("block_reason", reason)
     return StrategySignal(
         action="hold",
         score=0.0,
         confidence=0.0,
         reason=reason,
         strategy_name=strategy_name,
-        metadata=metadata or {},
+        metadata=payload,
     )
 
 

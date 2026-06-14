@@ -111,6 +111,22 @@ TRADING_ENABLED=false AUTO_TRADE_ENABLED=false python scripts/run_once.py
 
 With `TRADING_ENABLED=false`, the bot fetches or synthesizes BTC/USD data, produces a signal, and does not submit a paper order.
 
+## Local Profile A testing
+
+`profiles/profile_a_true_micro_scalping.env.example` is a local paper-testing profile for tightly scoped BTC/USD micro scalping diagnostics. It uses a small `$10` order size, capped exposure, IOC limit orders, conservative trade frequency, and aligned execution-vs-label settings: `SCALPING_TAKE_PROFIT_PCT` matches `SCALPING_LABEL_TAKE_PROFIT_PCT`, and `SCALPING_STOP_LOSS_PCT` matches `SCALPING_LABEL_STOP_LOSS_PCT`.
+
+Do not overwrite your current `.env`. To test the profile in the current terminal session:
+
+```bash
+source .venv/bin/activate
+set -a
+source profiles/profile_a_true_micro_scalping.env.example
+set +a
+python scripts/run_once.py
+```
+
+This remains paper-only and local. It does not require AWS, does not enable live trading, and does not guarantee profit.
+
 ## Quant strategy backtests and reports
 
 Run the BTC/USD paper scalping backtest:
@@ -131,6 +147,45 @@ Blocked-signal counts are under `metrics.blocked_signal_metrics`. `blocked_by` n
 To compare `MeanReversionScalpingStrategy` and `MomentumBreakoutStrategy`, look at both the strategy-level section and the regime-level section. Mean reversion should mostly appear in `mean_reverting` or `ranging` regimes; momentum breakout should mostly appear in `trending` regimes. A strategy with few signals, few trades, high cancellation, high drawdown, or poor net returns after fees and spread is not strong evidence for paper auto-trading.
 
 Backtests are historical simulations with simplifying assumptions and limited data. They can reveal broken labels, excessive costs, over-filtering, or unsafe trade selection, but they do not guarantee future results. Keep `TRADING_ENABLED=false` and `AUTO_TRADE_ENABLED=false` unless you are intentionally running paper-only automation with all safety guards intact.
+
+## Local strategy health diagnostics
+
+Inspect recent local SQLite trading activity before changing strategy logic:
+
+```bash
+source .venv/bin/activate
+python -m app.reports.strategy_health --db data/trading.db --hours 48
+```
+
+The report prints terminal tables and writes `reports/strategy_health_YYYYMMDD_HHMMSS.json`. It auto-detects available SQLite tables and columns, warns when optional strategy fields are missing, and does not change trading thresholds, runtime settings, order submission, deployment, or live trading behavior.
+
+## Local config health diagnostics
+
+Check whether the current local scalping execution settings line up with ML label settings before changing strategy logic:
+
+```bash
+source .venv/bin/activate
+python -m app.reports.config_health
+```
+
+For machine-readable output:
+
+```bash
+python -m app.reports.config_health --json
+```
+
+This only reads local config and prints PASS/WARN diagnostics. It does not require AWS and does not change trading behavior.
+
+## Local scalping replay
+
+Run a lightweight candle-by-candle replay against local SQLite BTC/USD 1-minute data:
+
+```bash
+source .venv/bin/activate
+python -m app.reports.scalping_replay --db data/trading.db --hours 72
+```
+
+The replay uses current config values, existing scalping feature logic where practical, and the existing scalping decision engine for local entry decisions. It simulates one long-only position at a time, applies TP/SL/trailing/max-hold exits, prints quick trade-quality metrics, and writes `reports/scalping_replay_YYYYMMDD_HHMMSS.json`. It is a lightweight local validation tool for Profile A, not a production backtesting engine.
 
 ## Parameter sweeps and paper-forward checks
 
