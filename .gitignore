@@ -24,3 +24,4 @@ frontend/*.tsbuildinfo
 *.pyc
 
 .DS_Store
+reports/*.json
