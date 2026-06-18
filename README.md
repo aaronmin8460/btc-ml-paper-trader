@@ -159,6 +159,17 @@ python -m app.reports.strategy_health --db data/trading.db --hours 48
 
 The report prints terminal tables and writes `reports/strategy_health_YYYYMMDD_HHMMSS.json`. It auto-detects available SQLite tables and columns, warns when optional strategy fields are missing, and does not change trading thresholds, runtime settings, order submission, deployment, or live trading behavior.
 
+## Local market quality diagnostics
+
+Inspect Profile A BTC/USD spread, quote imbalance, and data-age quality before changing strategy thresholds:
+
+```bash
+source .venv/bin/activate
+python -m app.reports.market_quality --db data/trading.db --hours 48
+```
+
+The report prints terminal tables and writes `reports/market_quality_YYYYMMDD_HHMMSS.json`. It reads local SQLite signal and market-data rows only. It does not loosen thresholds, add strategies, enable live trading, change position size, require AWS, or submit orders.
+
 ## Local config health diagnostics
 
 Check whether the current local scalping execution settings line up with ML label settings before changing strategy logic:
